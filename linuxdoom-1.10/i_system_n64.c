@@ -101,6 +101,12 @@ int I_GetTime(void)
     return (int)(((now_ms - basetime_ms) * TICRATE) / 1000);
 }
 
+// Microsecond wall clock for sub-tic interpolation (uncapped framerate).
+uint64_t I_GetTimeUS(void)
+{
+    return get_ticks_us();
+}
+
 void I_Init(void)
 {
     I_InitSound();

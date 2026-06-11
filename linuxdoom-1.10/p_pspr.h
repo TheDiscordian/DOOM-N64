@@ -71,6 +71,9 @@ typedef struct
     int		tics;
     fixed_t	sx;
     fixed_t	sy;
+    // Interpolation: previous-tic sprite offsets, lerped by fractionaltic.
+    fixed_t	oldsx;
+    fixed_t	oldsy;
 
 } pspdef_t;
 

@@ -140,6 +140,10 @@ void D_CheckNetGame (void);
 void D_ProcessEvents (void);
 void G_BuildTiccmd (ticcmd_t* cmd);
 void D_DoAdvanceDemo (void);
+
+// Uncapped framerate interpolation state (defined in r_main.c).
+extern boolean	r_interpolate;
+extern fixed_t	fractionaltic;
 #ifdef N64
 void G_BuildTiccmdN64Local(ticcmd_t* cmd, int playernum, const n64_local_input_t* input);
 #endif
@@ -844,9 +848,61 @@ void D_DoomLoop (void)
 	}
 	else
 	{
-	    TryRunTics (); // will run at least one tic
+	    // Uncapped framerate: in single-player, render interpolated frames
+	    // between the 35 Hz tics so motion is smooth at the ~60 Hz display
+	    // rate instead of juddering on the 35->60 cadence.
+	    boolean uncapped_ok =
+		   !singletics
+		&& !netgame
+		&& !demoplayback
+		&& !demorecording
+		&& !D_LocalMultiplayerEnabled()
+		&& !paused
+		&& !menuactive
+		&& gamestate == GS_LEVEL;
+
+	    r_interpolate = uncapped_ok;
+	    tryruntics_nonblocking = uncapped_ok;
+
+	    TryRunTics (); // non-blocking when uncapped; runs a tic only when due
+
+	    if (uncapped_ok)
+	    {
+		// Anchor sub-tic phase to the tic the renderer actually has
+		// loaded (gametic). TryRunTics is non-blocking, so sampling a
+		// free-running wall-clock phase can wrap backward for one frame
+		// when a tic boundary lands in the sample window -- that is the
+		// periodic rotation hiccup. Re-anchor phase 0 to the latest tic
+		// boundary whenever gametic advances, and clamp to one tic.
+		static int		interp_anchor_tic = -1;
+		static unsigned long long interp_anchor_us = 0;
+		unsigned long long	now_us = I_GetTimeUS();
+		unsigned long long	into_tic_us =
+		    ((now_us * TICRATE) % 1000000ULL) / TICRATE;
+		unsigned long long	dt_us;
+
+		if (gametic != interp_anchor_tic)
+		{
+		    interp_anchor_tic = gametic;
+		    interp_anchor_us  =
+			now_us > into_tic_us ? now_us - into_tic_us : 0;
+		}
+
+		dt_us = now_us > interp_anchor_us ? now_us - interp_anchor_us : 0;
+
+		if (dt_us >= 1000000ULL / TICRATE)
+		    fractionaltic = FRACUNIT;
+		else
+		    fractionaltic =
+			(fixed_t)((dt_us * TICRATE * FRACUNIT) / 1000000ULL);
+	    }
+	    else
+	    {
+		r_interpolate = false;
+		fractionaltic = 0;
+	    }
 	}
-		
+
 	S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
 
 	// Update display, next frame, with current state.

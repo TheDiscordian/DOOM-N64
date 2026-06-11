@@ -90,6 +90,8 @@ typedef struct player_s
     //  including viewpoint bobbing during movement.
     // Focal origin above r.z
     fixed_t		viewz;
+    // Interpolation: previous-tic viewz, lerped by fractionaltic at render.
+    fixed_t		oldviewz;
     // Base height above floor for viewz.
     fixed_t		viewheight;
     // Bob/squat speed.

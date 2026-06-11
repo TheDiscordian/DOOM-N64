@@ -478,10 +478,34 @@ void R_ProjectSprite (mobj_t* thing)
     
     angle_t		ang;
     fixed_t		iscale;
-    
+
+    fixed_t		interp_x;
+    fixed_t		interp_y;
+    fixed_t		interp_z;
+    angle_t		interp_angle;
+
+    // Interpolate the thing's position/angle to the sub-tic frame.
+    if (r_interpolate)
+    {
+	int adiff;
+	interp_x = thing->oldx + FixedMul(thing->x - thing->oldx, fractionaltic);
+	interp_y = thing->oldy + FixedMul(thing->y - thing->oldy, fractionaltic);
+	interp_z = thing->oldz + FixedMul(thing->z - thing->oldz, fractionaltic);
+	adiff = (int)(thing->angle - thing->oldangle);
+	interp_angle = thing->oldangle
+		     + (angle_t)(((long long)adiff * fractionaltic) >> FRACBITS);
+    }
+    else
+    {
+	interp_x = thing->x;
+	interp_y = thing->y;
+	interp_z = thing->z;
+	interp_angle = thing->angle;
+    }
+
     // transform the origin point
-    tr_x = thing->x - viewx;
-    tr_y = thing->y - viewy;
+    tr_x = interp_x - viewx;
+    tr_y = interp_y - viewy;
 	
     gxt = FixedMul(tr_x,viewcos); 
     gyt = -FixedMul(tr_y,viewsin);
@@ -519,8 +543,8 @@ void R_ProjectSprite (mobj_t* thing)
     if (sprframe->rotate)
     {
 	// choose a different rotation based on player view
-	ang = R_PointToAngle (thing->x, thing->y);
-	rot = (ang-thing->angle+(unsigned)(ANG45/2)*9)>>29;
+	ang = R_PointToAngle (interp_x, interp_y);
+	rot = (ang-interp_angle+(unsigned)(ANG45/2)*9)>>29;
 	lump = sprframe->lump[rot];
 	flip = (boolean)sprframe->flip[rot];
     }
@@ -550,10 +574,10 @@ void R_ProjectSprite (mobj_t* thing)
     vis = R_NewVisSprite ();
     vis->mobjflags = thing->flags;
     vis->scale = xscale<<detailshift;
-    vis->gx = thing->x;
-    vis->gy = thing->y;
-    vis->gz = thing->z;
-    vis->gzt = thing->z + spritetopoffset[lump];
+    vis->gx = interp_x;
+    vis->gy = interp_y;
+    vis->gz = interp_z;
+    vis->gzt = interp_z + spritetopoffset[lump];
     vis->texturemid = vis->gzt - viewz;
     vis->x1 = x1 < 0 ? 0 : x1;
     vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;	
@@ -654,7 +678,22 @@ void R_DrawPSprite (pspdef_t* psp)
     boolean		flip;
     vissprite_t*	vis;
     vissprite_t		avis;
-    
+    fixed_t		draw_sx;
+    fixed_t		draw_sy;
+
+    // Interpolate the weapon sprite offsets to the sub-tic frame so the
+    // weapon bob stays smooth with the interpolated world.
+    if (r_interpolate)
+    {
+	draw_sx = psp->oldsx + FixedMul(psp->sx - psp->oldsx, fractionaltic);
+	draw_sy = psp->oldsy + FixedMul(psp->sy - psp->oldsy, fractionaltic);
+    }
+    else
+    {
+	draw_sx = psp->sx;
+	draw_sy = psp->sy;
+    }
+
     // decide which patch to use
 #ifdef RANGECHECK
     if ( (unsigned)psp->state->sprite >= numsprites)
@@ -673,7 +712,7 @@ void R_DrawPSprite (pspdef_t* psp)
     flip = (boolean)sprframe->flip[0];
     
     // calculate edges of the shape
-    tx = psp->sx-160*FRACUNIT;
+    tx = draw_sx-160*FRACUNIT;
 	
     tx -= spriteoffset[lump];	
     x1 = (centerxfrac + FixedMul (tx,pspritescale) ) >>FRACBITS;
@@ -692,7 +731,7 @@ void R_DrawPSprite (pspdef_t* psp)
     // store information in a vissprite
     vis = &avis;
     vis->mobjflags = 0;
-    vis->texturemid = (BASEYCENTER<<FRACBITS)+FRACUNIT/2-(psp->sy-spritetopoffset[lump]);
+    vis->texturemid = (BASEYCENTER<<FRACBITS)+FRACUNIT/2-(draw_sy-spritetopoffset[lump]);
     vis->x1 = x1 < 0 ? 0 : x1;
     vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;	
     vis->scale = pspritescale<<detailshift;

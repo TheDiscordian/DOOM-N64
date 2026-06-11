@@ -237,7 +237,22 @@ void P_PlayerThink (player_t* player)
 {
     ticcmd_t*		cmd;
     weapontype_t	newweapon;
-	
+    int			pspi;
+
+    // Interpolation: P_PlayerThink runs before the thinkers and applies input
+    // to the camera mobj, so snapshot the previous-tic camera/weapon state
+    // here before angle/momentum/viewz/psprite changes.
+    player->mo->oldx     = player->mo->x;
+    player->mo->oldy     = player->mo->y;
+    player->mo->oldz     = player->mo->z;
+    player->mo->oldangle = player->mo->angle;
+    player->oldviewz     = player->viewz;
+    for (pspi = 0; pspi < NUMPSPRITES; pspi++)
+    {
+	player->psprites[pspi].oldsx = player->psprites[pspi].sx;
+	player->psprites[pspi].oldsy = player->psprites[pspi].sy;
+    }
+
     // fixme: do this in the cheat code
     if (player->cheats & CF_NOCLIP)
 	player->mo->flags |= MF_NOCLIP;

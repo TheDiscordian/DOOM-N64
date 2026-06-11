@@ -71,8 +71,9 @@ int		nodeforplayer[MAXPLAYERS];
 int             maketic;
 int		lastnettic;
 int		skiptics;
-int		ticdup;		
+int		ticdup;
 int		maxsend;	// BACKUPTICS/(2*ticdup)-1
+boolean		tryruntics_nonblocking = false;	// uncapped render: don't wait for tics
 static int      d_local_player_count = 1;
 
 
@@ -765,7 +766,13 @@ void TryRunTics (void)
 	}
     }
     availabletics = lowtic - gametic/ticdup;
-    
+
+    // Uncapped/interpolated render: if no new tic is ready, return without
+    // running or waiting so the caller can draw an interpolated frame. The
+    // tic boundary has not moved, so a later call will pick up the new tic.
+    if (tryruntics_nonblocking && availabletics < 1)
+	return;
+
     // decide how many tics to run
     if (realtics < availabletics-1)
 	counts = realtics+1;

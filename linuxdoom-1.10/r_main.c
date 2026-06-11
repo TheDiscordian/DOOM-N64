@@ -76,6 +76,11 @@ fixed_t			viewx;
 fixed_t			viewy;
 fixed_t			viewz;
 
+// Uncapped framerate: when r_interpolate is set, the view and sprites are
+// lerped between the previous and current tic by fractionaltic [0, FRACUNIT].
+boolean			r_interpolate = false;
+fixed_t			fractionaltic = 0;
+
 angle_t			viewangle;
 
 fixed_t			viewcos;
@@ -870,13 +875,36 @@ void R_SetupFrame (player_t* player)
     int		i;
     
     viewplayer = player;
-    viewx = player->mo->x;
-    viewy = player->mo->y;
-    viewangle = player->mo->angle + viewangleoffset;
+
+    // Interpolate the camera between tics so the view moves at display rate
+    // instead of snapping to 35 Hz tic boundaries.
+    if (r_interpolate)
+    {
+	mobj_t*	mo = player->mo;
+	int	adiff;
+
+	viewx = mo->oldx + FixedMul(mo->x - mo->oldx, fractionaltic);
+	viewy = mo->oldy + FixedMul(mo->y - mo->oldy, fractionaltic);
+	viewz = player->oldviewz
+	      + FixedMul(player->viewz - player->oldviewz, fractionaltic);
+
+	// Short-arc angle delta via unsigned-sub + signed cast; multiply in
+	// 64 bits since a 180 deg delta << fractionaltic overflows 32 bits.
+	adiff = (int)(mo->angle - mo->oldangle);
+	viewangle = mo->oldangle
+		  + (angle_t)(((long long)adiff * fractionaltic) >> FRACBITS)
+		  + viewangleoffset;
+    }
+    else
+    {
+	viewx = player->mo->x;
+	viewy = player->mo->y;
+	viewangle = player->mo->angle + viewangleoffset;
+	viewz = player->viewz;
+    }
+
     extralight = player->extralight;
 
-    viewz = player->viewz;
-    
     viewsin = finesine[viewangle>>ANGLETOFINESHIFT];
     viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
 	

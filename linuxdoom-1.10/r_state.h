@@ -104,6 +104,10 @@ extern fixed_t		viewx;
 extern fixed_t		viewy;
 extern fixed_t		viewz;
 
+// Uncapped framerate interpolation state.
+extern boolean		r_interpolate;
+extern fixed_t		fractionaltic;
+
 extern angle_t		viewangle;
 extern player_t*	viewplayer;
 

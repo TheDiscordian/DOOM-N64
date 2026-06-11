@@ -123,6 +123,16 @@ EV_Teleport
 
 		thing->angle = m->angle;
 		thing->momx = thing->momy = thing->momz = 0;
+
+		// Interpolation: snap old* to the destination so the renderer
+		// doesn't lerp the thing across the teleport gap.
+		thing->oldx     = thing->x;
+		thing->oldy     = thing->y;
+		thing->oldz     = thing->z;
+		thing->oldangle = thing->angle;
+		if (thing->player)
+		    thing->player->oldviewz = thing->player->viewz;
+
 		return 1;
 	    }	
 	}

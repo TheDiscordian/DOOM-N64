@@ -44,6 +44,9 @@ byte*	I_ZoneBase (int *size);
 // returns current time in tics.
 int I_GetTime (void);
 
+// Microsecond wall clock for sub-tic interpolation (uncapped framerate).
+unsigned long long I_GetTimeUS (void);
+
 
 //
 // Called by D_DoomLoop,

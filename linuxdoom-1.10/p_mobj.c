@@ -415,6 +415,17 @@ P_NightmareRespawn (mobj_t* mobj)
 //
 void P_MobjThinker (mobj_t* mobj)
 {
+    // Interpolation: snapshot pre-tic state so the renderer can lerp from
+    // (old*, now) on sub-tic frames. Player mobjs are snapshotted in
+    // P_PlayerThink(), which runs before thinkers and applies input.
+    if (mobj->player == NULL)
+    {
+	mobj->oldx     = mobj->x;
+	mobj->oldy     = mobj->y;
+	mobj->oldz     = mobj->z;
+	mobj->oldangle = mobj->angle;
+    }
+
     // momentum movement
     if (mobj->momx
 	|| mobj->momy
@@ -529,6 +540,13 @@ P_SpawnMobj
 
     mobj->thinker.function.acp1 = (actionf_p1)P_MobjThinker;
 	
+    // Interpolation: seed old* with the spawn position so the first render
+    // after spawn doesn't lerp from a stale (0,0,0).
+    mobj->oldx     = mobj->x;
+    mobj->oldy     = mobj->y;
+    mobj->oldz     = mobj->z;
+    mobj->oldangle = mobj->angle;
+
     P_AddThinker (&mobj->thinker);
 
     return mobj;

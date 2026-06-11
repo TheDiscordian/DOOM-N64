@@ -134,6 +134,7 @@ extern  boolean	menuactive;	// Menu overlayed?
 
 extern  int	alwaysRun;	// Default movement: 1 = run, 0 = walk
 extern  int	controlScheme;	// N64 controls: 0 = original, 1 = alt
+extern  boolean	tryruntics_nonblocking;	// uncapped render: TryRunTics won't wait
 extern  boolean	paused;		// Game Pause?
 
 

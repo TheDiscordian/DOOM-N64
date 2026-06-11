@@ -281,8 +281,17 @@ typedef struct mobj_s
     mapthing_t		spawnpoint;	
 
     // Thing being chased/attacked for tracers.
-    struct mobj_s*	tracer;	
-    
+    struct mobj_s*	tracer;
+
+    // Interpolation (uncapped framerate): pre-tic state. The renderer lerps
+    // between (old*, current) by fractionaltic. Snapped each tic before the
+    // thing moves, and re-snapped on spawn/teleport to avoid lerping across
+    // a discontinuity.
+    fixed_t		oldx;
+    fixed_t		oldy;
+    fixed_t		oldz;
+    angle_t		oldangle;
+
 } mobj_t;
 
 
