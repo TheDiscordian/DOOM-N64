@@ -848,12 +848,14 @@ void D_DoomLoop (void)
 	}
 	else
 	{
-	    // Uncapped framerate: in single-player, render interpolated frames
-	    // between the 35 Hz tics so motion is smooth at the ~60 Hz display
-	    // rate instead of juddering on the 35->60 cadence.
-	    boolean uncapped_ok =
-		   frame_interpolation
-		&& !singletics
+	    // Render uncapped (every vsync) in single-player. Even with
+	    // interpolation OFF this matters: at the 35 Hz render rate a slow
+	    // frame lets the sim catch up two tics in one rendered frame, which
+	    // shows as a doubled-frame skip. Rendering every vsync means one tic
+	    // spans ~1.7 frames, so no tic is ever skipped. Interpolation (the
+	    // sub-tic lerp) is the separate, optional smoothing on top.
+	    boolean render_uncapped =
+		   !singletics
 		&& !netgame
 		&& !demoplayback
 		&& !demorecording
@@ -861,13 +863,14 @@ void D_DoomLoop (void)
 		&& !paused
 		&& !menuactive
 		&& gamestate == GS_LEVEL;
+	    boolean interpolate = render_uncapped && frame_interpolation;
 
-	    r_interpolate = uncapped_ok;
-	    tryruntics_nonblocking = uncapped_ok;
+	    r_interpolate = interpolate;
+	    tryruntics_nonblocking = render_uncapped;
 
 	    TryRunTics (); // non-blocking when uncapped; runs a tic only when due
 
-	    if (uncapped_ok)
+	    if (interpolate)
 	    {
 		// Anchor sub-tic phase to the tic the renderer actually has
 		// loaded (gametic). TryRunTics is non-blocking, so sampling a
@@ -1760,6 +1763,9 @@ void D_DoomMain (void)
 
     printf ("M_LoadDefaults: Load system defaults.\n");
     M_LoadDefaults ();              // load before initing other systems
+#ifdef N64
+    I_N64LoadSettings ();           // override with values saved to cart EEPROM
+#endif
 
     printf ("Z_Init: Init zone memory allocation daemon. \n");
     Z_Init ();

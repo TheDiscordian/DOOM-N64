@@ -1933,6 +1933,9 @@ void M_Drawer (void)
 void M_ClearMenus (void)
 {
     menuactive = 0;
+#ifdef N64
+    I_N64SaveSettings ();   // persist option changes to cart EEPROM on menu close
+#endif
     // if (!netgame && usergame && paused)
     //       sendpause = true;
 }

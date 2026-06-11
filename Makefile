@@ -32,6 +32,7 @@ include $(N64_INST)/include/n64.mk
 endif
 
 N64_ROM_TITLE = "DOOM N64 WIP"
+N64_ROM_SAVETYPE = eeprom4k	# cart EEPROM for persisted settings (not the Controller Pak)
 
 CFLAGS += -I$(DOOM_SRC)
 CFLAGS += -IDOOM_N64_Port_Example/src

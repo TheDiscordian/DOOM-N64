@@ -107,6 +107,75 @@ uint64_t I_GetTimeUS(void)
     return get_ticks_us();
 }
 
+// --- Settings persistence to cartridge EEPROM (game cart, not Controller Pak) ---
+// Game saves use the Controller Pak; settings live in the cart's EEPROM so they
+// persist without an accessory. Requires N64_ROM_SAVETYPE=eeprom4k in the build.
+
+extern int alwaysRun, controlScheme, frame_interpolation;
+extern int showMessages, detailLevel;
+extern int snd_SfxVolume, snd_MusicVolume, mouseSensitivity;
+
+#define N64_SETTINGS_MAGIC   0x444E3631u	/* 'DN61' */
+#define N64_SETTINGS_VERSION 1
+
+typedef struct
+{
+    uint32_t	magic;
+    uint8_t	version;
+    int8_t	always_run;
+    int8_t	control_scheme;
+    int8_t	frame_interp;
+    int8_t	show_messages;
+    int8_t	detail_level;
+    int8_t	sfx_volume;
+    int8_t	music_volume;
+    int8_t	mouse_sens;
+    uint8_t	reserved[3];
+} n64_settings_t;
+
+void I_N64LoadSettings(void)
+{
+    n64_settings_t s;
+
+    if (eeprom_present() == EEPROM_NONE)
+        return;
+
+    eeprom_read_bytes(&s, 0, sizeof(s));
+    if (s.magic != N64_SETTINGS_MAGIC || s.version != N64_SETTINGS_VERSION)
+        return;			// nothing saved yet; keep compiled defaults
+
+    alwaysRun           = s.always_run;
+    controlScheme       = s.control_scheme;
+    frame_interpolation = s.frame_interp;
+    showMessages        = s.show_messages;
+    detailLevel         = s.detail_level;
+    snd_SfxVolume       = s.sfx_volume;
+    snd_MusicVolume     = s.music_volume;
+    mouseSensitivity    = s.mouse_sens;
+}
+
+void I_N64SaveSettings(void)
+{
+    n64_settings_t s;
+
+    if (eeprom_present() == EEPROM_NONE)
+        return;
+
+    memset(&s, 0, sizeof(s));
+    s.magic          = N64_SETTINGS_MAGIC;
+    s.version        = N64_SETTINGS_VERSION;
+    s.always_run     = (int8_t)alwaysRun;
+    s.control_scheme = (int8_t)controlScheme;
+    s.frame_interp   = (int8_t)frame_interpolation;
+    s.show_messages  = (int8_t)showMessages;
+    s.detail_level   = (int8_t)detailLevel;
+    s.sfx_volume     = (int8_t)snd_SfxVolume;
+    s.music_volume   = (int8_t)snd_MusicVolume;
+    s.mouse_sens     = (int8_t)mouseSensitivity;
+
+    eeprom_write_bytes(&s, 0, sizeof(s));
+}
+
 void I_Init(void)
 {
     I_InitSound();
