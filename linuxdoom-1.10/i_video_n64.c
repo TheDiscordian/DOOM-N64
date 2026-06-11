@@ -679,6 +679,14 @@ void I_FinishUpdate(void)
     rdpq_tex_blit(&doom_screen8, 0, 0, NULL);
     rdpq_detach_show();
 
+    // doom_screen8 IS screens[0]; the blit above reads it asynchronously on
+    // the RDP. Wait for that read to finish before the next frame's CPU
+    // rendering overwrites the same buffer -- otherwise, at high (uncapped)
+    // frame rates the CPU races ahead and the RDP samples a half-updated
+    // framebuffer, which shows up as flicker on static elements like the
+    // status-bar numbers.
+    rspq_wait();
+
     if (menuactive && gamestate == GS_LEVEL)
         last_menu_present_ms = get_ticks_ms();
 }

@@ -852,7 +852,8 @@ void D_DoomLoop (void)
 	    // between the 35 Hz tics so motion is smooth at the ~60 Hz display
 	    // rate instead of juddering on the 35->60 cadence.
 	    boolean uncapped_ok =
-		   !singletics
+		   frame_interpolation
+		&& !singletics
 		&& !netgame
 		&& !demoplayback
 		&& !demorecording

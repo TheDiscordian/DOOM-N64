@@ -199,6 +199,7 @@ void M_MusicVol(int choice);
 void M_ChangeDetail(int choice);
 void M_ChangeMovement(int choice);
 void M_ChangeControls(int choice);
+void M_ChangeFramerate(int choice);
 void M_SizeDisplay(int choice);
 void M_StartGame(int choice);
 void M_Sound(int choice);
@@ -347,6 +348,7 @@ enum
     detail,
     movement,
     controls,
+    framerate,
     scrnsize,
     option_empty1,
     mousesens,
@@ -364,6 +366,7 @@ menuitem_t OptionsMenu[]=
     {1,"",	M_ChangeDetail,'g'},
     {1,"",	M_ChangeMovement,'r'},
     {1,"",	M_ChangeControls,'c'},
+    {1,"",	M_ChangeFramerate,'f'},
     {2,"",	M_SizeDisplay,'s'},
     {-1,"",0},
     {2,"",	M_ChangeSensitivity,'m'},
@@ -377,9 +380,9 @@ menu_t  OptionsDef =
     &MainDef,
     OptionsMenu,
     M_DrawOptions,
-    60,34,
+    60,27,
     0,
-    13			// compact line height so all 10 rows clear the status bar
+    12			// compact line height so all 11 rows clear the status bar
 };
 
 //
@@ -979,7 +982,7 @@ void M_DrawOptions(void)
     int lx = OptionsDef.x;
     int vx = OptionsDef.x + 150;		// value column
 
-    V_DrawPatchDirect (108,15,0,W_CacheLumpName("M_OPTTTL",PU_CACHE));
+    V_DrawPatchDirect (108,9,0,W_CacheLumpName("M_OPTTTL",PU_CACHE));
 
     M_WriteTextScaled(lx, OptionsDef.y+lh*endgame, "END GAME", OPT_SNUM, OPT_SDEN);
 
@@ -994,6 +997,9 @@ void M_DrawOptions(void)
 
     M_WriteTextScaled(lx, OptionsDef.y+lh*controls, "CONTROLS", OPT_SNUM, OPT_SDEN);
     M_WriteTextScaled(vx, OptionsDef.y+lh*controls, controlScheme ? "ALT" : "ORIG", OPT_SNUM, OPT_SDEN);
+
+    M_WriteTextScaled(lx, OptionsDef.y+lh*framerate, "FRAMERATE", OPT_SNUM, OPT_SDEN);
+    M_WriteTextScaled(vx, OptionsDef.y+lh*framerate, frame_interpolation ? "SMOOTH" : "CAPPED", OPT_SNUM, OPT_SDEN);
 
     M_WriteTextScaled(lx, OptionsDef.y+lh*scrnsize, "SCREEN SIZE", OPT_SNUM, OPT_SDEN);
     M_DrawThermo(lx, OptionsDef.y+lh*(scrnsize+1), 9, screenSize);
@@ -1046,6 +1052,16 @@ void M_ChangeControls(int choice)
 {
     choice = 0;
     controlScheme = 1 - controlScheme;
+}
+
+
+//
+//      Toggle uncapped (interpolated) vs capped framerate
+//
+void M_ChangeFramerate(int choice)
+{
+    choice = 0;
+    frame_interpolation = 1 - frame_interpolation;
 }
 
 

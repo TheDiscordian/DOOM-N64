@@ -251,6 +251,7 @@ default_t	defaults[] =
     {"show_messages",&showMessages, 1},
     {"always_run",&alwaysRun, 0},
     {"control_scheme",&controlScheme, 0},
+    {"frame_interpolation",&frame_interpolation, 1},
 
 
 #if defined(NORMALUNIX) || defined(N64)

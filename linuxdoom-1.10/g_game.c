@@ -327,6 +327,7 @@ fixed_t		sidemove[2] = {0x18, 0x28};
 fixed_t		angleturn[3] = {640, 1280, 320};	// + slow turn
 int		alwaysRun = 0;		// default movement: 1 = run, 0 = walk
 int		controlScheme = 0;	// N64 controls: 0 = original, 1 = alt
+int		frame_interpolation = 1;	// 1 = uncapped/smooth, 0 = capped
 
 #define SLOWTURNTICS	6 
  
