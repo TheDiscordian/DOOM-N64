@@ -274,10 +274,15 @@ void N64Bench_DisplayEnd(void)
     if (!loop_open)
         return;
     // All in raw ticks (no divide); HUD = display wall minus the in-view
-    // render phases and the present.
+    // render phases and the present. BSP_WALK+SEG_RASTER together replace the
+    // old single BSP phase. The RDP renderer's emit phases (PLANE_EMIT/
+    // MASKED_EMIT) are nested inside PLANES/MASKED and DL_BUILD/RDP_BUSY are ~0
+    // in this stage, so they are not subtracted here (doing so would
+    // double-count once they carry real time).
     display_tk = (uint32_t)(get_ticks() - display_start_ticks);
-    inside_tk = cur_phase_tk[BPH_BSP] + cur_phase_tk[BPH_PLANES]
-              + cur_phase_tk[BPH_MASKED] + cur_phase_tk[BPH_PRESENT];
+    inside_tk = cur_phase_tk[BPH_BSP_WALK] + cur_phase_tk[BPH_SEG_RASTER]
+              + cur_phase_tk[BPH_PLANES] + cur_phase_tk[BPH_MASKED]
+              + cur_phase_tk[BPH_PRESENT];
     cur_phase_tk[BPH_HUD] = (display_tk > inside_tk) ? (display_tk - inside_tk) : 0;
 }
 
@@ -422,7 +427,9 @@ static unsigned long N64Bench_Percentile(int pct)
 
 static const char* const bench_phase_name[BPH_COUNT] =
 {
-    "gametic", "bsp_segs", "planes", "masked", "hud", "present", "audio"
+    "gametic", "bsp_walk", "seg_rast", "planes", "masked",
+    "plnemit", "mskemit", "dlbuild", "rdpbusy",
+    "hud", "present", "audio"
 };
 
 // p95 of a uint32 field over the retained (non-outlier) frames, via the same
@@ -620,27 +627,30 @@ static void N64Bench_ReportPhases(void)
     for (i = 0; i < (unsigned long)worst_count; i++)
     {
         bench_frame_t* f = &bench_frames[worst_idx[i]];
+        // Sum every phase for the leftover (mirrors the per-frame loop above);
+        // the RDP renderer's emit phases are ~0 in this stage so they do not
+        // perturb the figure.
+        unsigned long acc = 0;
+        for (p = 0; p < BPH_COUNT; p++) acc += f->phase_us[p];
         debugf("BENCH_WORST rank=%lu frame=%lu total_us=%lu "
-               "gametic=%lu bsp=%lu planes=%lu masked=%lu hud=%lu "
-               "present=%lu audio=%lu leftover=%lu "
+               "gametic=%lu bsp_walk=%lu seg_rast=%lu planes=%lu masked=%lu "
+               "plnemit=%lu mskemit=%lu dlbuild=%lu rdpbusy=%lu "
+               "hud=%lu present=%lu audio=%lu leftover=%lu "
                "viss=%u ds=%u vp=%u tic=%u\n",
                i + 1, worst_idx[i], (unsigned long)f->total_us,
                (unsigned long)f->phase_us[BPH_GAMETIC],
-               (unsigned long)f->phase_us[BPH_BSP],
+               (unsigned long)f->phase_us[BPH_BSP_WALK],
+               (unsigned long)f->phase_us[BPH_SEG_RASTER],
                (unsigned long)f->phase_us[BPH_PLANES],
                (unsigned long)f->phase_us[BPH_MASKED],
+               (unsigned long)f->phase_us[BPH_PLANE_EMIT],
+               (unsigned long)f->phase_us[BPH_MASKED_EMIT],
+               (unsigned long)f->phase_us[BPH_DL_BUILD],
+               (unsigned long)f->phase_us[BPH_RDP_BUSY],
                (unsigned long)f->phase_us[BPH_HUD],
                (unsigned long)f->phase_us[BPH_PRESENT],
                (unsigned long)f->phase_us[BPH_AUDIO],
-               (unsigned long)(
-                   f->total_us > (f->phase_us[BPH_GAMETIC]+f->phase_us[BPH_BSP]
-                       +f->phase_us[BPH_PLANES]+f->phase_us[BPH_MASKED]
-                       +f->phase_us[BPH_HUD]+f->phase_us[BPH_PRESENT]
-                       +f->phase_us[BPH_AUDIO])
-                   ? f->total_us - (f->phase_us[BPH_GAMETIC]+f->phase_us[BPH_BSP]
-                       +f->phase_us[BPH_PLANES]+f->phase_us[BPH_MASKED]
-                       +f->phase_us[BPH_HUD]+f->phase_us[BPH_PRESENT]
-                       +f->phase_us[BPH_AUDIO]) : 0),
+               (unsigned long)(f->total_us > acc ? f->total_us - acc : 0),
                f->vissprites, f->drawsegs, f->visplanes, f->tics_ran);
     }
 

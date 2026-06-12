@@ -114,6 +114,7 @@ uint64_t I_GetTimeUS(void)
 extern int alwaysRun, controlScheme, frame_interpolation, splitOrientation;
 extern int showMessages, detailLevel;
 extern int snd_SfxVolume, snd_MusicVolume, mouseSensitivity;
+extern int widescreen, n64_use_rdp_renderer;
 
 #define N64_SETTINGS_MAGIC   0x444E3631u	/* 'DN61' */
 #define N64_SETTINGS_VERSION 1
@@ -132,7 +133,7 @@ typedef struct
     int8_t	mouse_sens;
     int8_t	split_orient;	// added in reserved space; old saves read 0 (horizontal)
     int8_t	widescreen;	// added in reserved space; old saves read 0 (4:3)
-    uint8_t	reserved[1];
+    int8_t	use_rdp_renderer;	// added in reserved space; old saves read 0 (software)
 } n64_settings_t;
 
 void I_N64LoadSettings(void)
@@ -156,6 +157,7 @@ void I_N64LoadSettings(void)
     mouseSensitivity    = s.mouse_sens;
     splitOrientation    = s.split_orient;
     widescreen          = s.widescreen;
+    n64_use_rdp_renderer = s.use_rdp_renderer;
 }
 
 void I_N64SaveSettings(void)
@@ -178,6 +180,7 @@ void I_N64SaveSettings(void)
     s.mouse_sens     = (int8_t)mouseSensitivity;
     s.split_orient   = (int8_t)splitOrientation;
     s.widescreen     = (int8_t)widescreen;
+    s.use_rdp_renderer = (int8_t)n64_use_rdp_renderer;
 
     eeprom_write_bytes(&s, 0, sizeof(s));
 }

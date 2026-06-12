@@ -39,6 +39,10 @@ rcsid[] = "$Id: r_segs.c,v 1.3 1997/01/29 20:10:19 b1 Exp $";
 #include "r_local.h"
 #include "r_sky.h"
 
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
+
 
 // OPTIMIZE: closed two sided lines as single sided
 
@@ -259,6 +263,15 @@ void R_RenderSegLoop (void)
     fixed_t		l_pixhigh = pixhigh;
     fixed_t		l_pixlow = pixlow;
 
+#ifdef N64_BENCH
+    // SEG_RASTER attributes the per-column wall fill below (the rasterization
+    // the RDP renderer offloads) separately from the BSP walk/clip/scale math
+    // that surrounds it. Bracketed once per seg around the whole column loop
+    // (not per column) so the two CP0 reads stay negligible. The enclosing
+    // phase is BSP_WALK; switch to SEG_RASTER and back so it nests cleanly.
+    N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_SEG_RASTER);
+#endif
+
     for ( ; l_rw_x < l_rw_stopx ; l_rw_x++)
     {
 	int		cc = l_ceilingclip[l_rw_x];
@@ -412,6 +425,11 @@ void R_RenderSegLoop (void)
 	l_topfrac += l_topstep;
 	l_bottomfrac += l_bottomstep;
     }
+
+#ifdef N64_BENCH
+    // Close SEG_RASTER, reopen BSP_WALK for the rest of the walk.
+    N64Bench_PhaseSwitch(BPH_SEG_RASTER, BPH_BSP_WALK);
+#endif
 
     // write back the accumulators the caller / next seg reads
     rw_x = l_rw_x;

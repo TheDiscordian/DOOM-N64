@@ -30,12 +30,25 @@ void N64Bench_FrameEnd(void);
 // current frame's slot. Counts are latched at FrameEnd (or explicit setters).
 //
 // Phase indices for the per-frame breakdown.
+//
+// The old BPH_BSP lumped two distinct costs: the CPU BSP walk / 1-D occlusion
+// clip / scale math (KEPT on the CPU forever) and the per-column wall fill
+// inside R_RenderSegLoop (the rasterization the RDP renderer offloads). They
+// are split into BSP_WALK and SEG_RASTER so the offload target is measured
+// directly. PLANE_EMIT/MASKED_EMIT/DL_BUILD/RDP_BUSY are the RDP renderer's
+// future phases (display-list emit, list build/flush, and the async RDP busy
+// window); they measure ~0 until the RDP path lands the work in them.
 typedef enum
 {
     BPH_GAMETIC = 0,   // TryRunTics (sim) in the uncapped path
-    BPH_BSP,           // R_RenderBSPNode (BSP walk + seg rendering)
-    BPH_PLANES,        // R_DrawPlanes
+    BPH_BSP_WALK,      // R_RenderBSPNode minus the per-column wall fill (walk/clip/scale)
+    BPH_SEG_RASTER,    // R_RenderSegLoop column-fill loop (the wall raster the RDP offloads)
+    BPH_PLANES,        // R_DrawPlanes (software span fill)
     BPH_MASKED,        // R_DrawMasked (sprite sort + sprites + masked segs + psprites)
+    BPH_PLANE_EMIT,    // RDP renderer: plane span emit (~0 until planes move to RDP)
+    BPH_MASKED_EMIT,   // RDP renderer: sprite/masked emit (~0 until sprites move to RDP)
+    BPH_DL_BUILD,      // RDP renderer: DL_Flush list build/upload (~0 until DL exists)
+    BPH_RDP_BUSY,      // RDP renderer: async RDP busy window read at frame top (~0 until RDP draws the world)
     BPH_HUD,           // D_Display work outside the 3D view (status bar/HUD/border/menu)
     BPH_PRESENT,       // I_FinishUpdate (page flip / buffer-busy spin)
     BPH_AUDIO,         // S_UpdateSounds + I_SubmitSound (post-display)

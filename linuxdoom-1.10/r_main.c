@@ -984,8 +984,15 @@ void R_SetupFrame (player_t* player)
 // R_RenderView
 //
 void R_RenderPlayerView (player_t* player)
-{	
+{
     R_SetupFrame (player);
+
+    // RDP renderer dispatch (kill-switch). n64_use_rdp_renderer selects the
+    // RDP-rasterized path over the software colfunc/spanfunc fill. The RDP
+    // path is built up stage by stage; in this stage it is not yet wired, so
+    // both settings render through the unchanged software path below and the
+    // visible result is identical regardless of the flag.
+    (void)n64_use_rdp_renderer;
 
     // Clear buffers.
     R_ClearClipSegs ();
@@ -996,9 +1003,12 @@ void R_RenderPlayerView (player_t* player)
     // check for new console commands.
     NetUpdate ();
 
-    // The head node is the last node output.
+    // The head node is the last node output. The phase open across the BSP
+    // walk is BSP_WALK; R_RenderSegLoop switches to SEG_RASTER around its
+    // per-column fill and back, so the wall raster cost is attributed
+    // separately (the RDP renderer offloads SEG_RASTER, keeps BSP_WALK).
 #ifdef N64_BENCH
-    N64Bench_PhaseBegin(BPH_BSP);
+    N64Bench_PhaseBegin(BPH_BSP_WALK);
     R_RenderBSPNode (numnodes-1);
 #else
     R_RenderBSPNode (numnodes-1);
@@ -1011,8 +1021,12 @@ void R_RenderPlayerView (player_t* player)
 	NetUpdate ();
 
 #ifdef N64_BENCH
-    N64Bench_PhaseSwitch(BPH_BSP, BPH_PLANES);   // one read closes bsp, opens planes
+    N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_PLANES);   // one read closes bsp walk, opens planes
     R_DrawPlanes ();
+    // PLANE_EMIT brackets the RDP renderer's plane-span emit, which will live
+    // inside R_DrawPlanes once planes move to the RDP. ~0 in this stage.
+    N64Bench_PhaseBegin(BPH_PLANE_EMIT);
+    N64Bench_PhaseEnd(BPH_PLANE_EMIT);
 #else
     R_DrawPlanes ();
 #endif
@@ -1024,6 +1038,10 @@ void R_RenderPlayerView (player_t* player)
     N64Bench_PhaseSwitch(BPH_PLANES, BPH_MASKED);
     R_DrawMasked ();
     N64Bench_PhaseEnd(BPH_MASKED);
+    // MASKED_EMIT brackets the RDP renderer's sprite/masked emit, which will
+    // live inside R_DrawMasked once sprites move to the RDP. ~0 in this stage.
+    N64Bench_PhaseBegin(BPH_MASKED_EMIT);
+    N64Bench_PhaseEnd(BPH_MASKED_EMIT);
     // Latch per-frame work counts while the pools are still full (before the
     // next frame's R_Clear* resets them). vissprites/drawsegs are end-pointer
     // minus base; visplanes is the realloc-grown pool's used span.

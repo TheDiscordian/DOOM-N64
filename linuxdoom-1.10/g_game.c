@@ -336,6 +336,7 @@ int		controlScheme = 0;	// N64 controls: 0 = original, 1 = alt
 int		frame_interpolation = 1;	// 1 = uncapped/smooth, 0 = capped
 int		splitOrientation = 0;		// 2p split: 0 = horizontal, 1 = vertical
 int		widescreen = 0;		// aspect: 0 = 4:3, 1 = 16:9 (Hor+)
+int		n64_use_rdp_renderer = 0;	// renderer: 0 = software, 1 = RDP (kill-switch)
 
 #define SLOWTURNTICS	6 
  

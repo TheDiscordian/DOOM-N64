@@ -201,6 +201,7 @@ void M_ChangeMovement(int choice);
 void M_ChangeControls(int choice);
 void M_ChangeFramerate(int choice);
 void M_ChangeAspect(int choice);
+void M_ChangeRenderer(int choice);
 void M_SizeDisplay(int choice);
 void M_StartGame(int choice);
 void M_Sound(int choice);
@@ -362,6 +363,7 @@ enum
     movement,
     controls,
     aspect,
+    renderer,
     framerate,
     scrnsize,
     option_empty1,
@@ -381,6 +383,7 @@ menuitem_t OptionsMenu[]=
     {1,"",	M_ChangeMovement,'r'},
     {1,"",	M_ChangeControls,'c'},
     {1,"",	M_ChangeAspect,'a'},
+    {1,"",	M_ChangeRenderer,'p'},
     {1,"",	M_ChangeFramerate,'f'},
     {2,"",	M_SizeDisplay,'s'},
     {-1,"",0},
@@ -397,7 +400,7 @@ menu_t  OptionsDef =
     M_DrawOptions,
     60,23,
     0,
-    12			// compact line height so all 12 rows clear the status bar
+    11			// compact line height so all 13 rows clear the status bar
 };
 
 //
@@ -1016,6 +1019,9 @@ void M_DrawOptions(void)
     M_WriteTextScaled(lx, OptionsDef.y+lh*aspect, "ASPECT", OPT_SNUM, OPT_SDEN);
     M_WriteTextScaled(vx, OptionsDef.y+lh*aspect, widescreen ? "16:9" : "4:3", OPT_SNUM, OPT_SDEN);
 
+    M_WriteTextScaled(lx, OptionsDef.y+lh*renderer, "RENDERER", OPT_SNUM, OPT_SDEN);
+    M_WriteTextScaled(vx, OptionsDef.y+lh*renderer, n64_use_rdp_renderer ? "RDP" : "SOFT", OPT_SNUM, OPT_SDEN);
+
     // Context-sensitive row: FRAMERATE in 1p/3-4p, SPLIT in 2p (FRAMERATE
     // then lives on the mouse-sens row below).
     {
@@ -1119,6 +1125,18 @@ void M_ChangeAspect(int choice)
     choice = 0;
     widescreen = 1 - widescreen;
     R_SetViewSize (screenblocks, detailLevel);	// rebuild projection tables
+}
+
+
+//
+//	Toggle the renderer between software and RDP (kill-switch). The RDP
+//	path is built up stage by stage; until it is wired the toggle has no
+//	visible effect, but the choice persists to EEPROM on menu close.
+//
+void M_ChangeRenderer(int choice)
+{
+    choice = 0;
+    n64_use_rdp_renderer = 1 - n64_use_rdp_renderer;
 }
 
 

@@ -743,9 +743,18 @@ void D_Display (void)
 	}
 
 
+#ifdef N64_BENCH
+    // DL_BUILD brackets the RDP renderer's display-list flush (DL_Flush:
+    // per-texture upload + triangle/rect emit into the rspq stream), which
+    // lands here after the player loop and before the HUD overlay once the
+    // world moves to the RDP. ~0 in this stage (no display list yet).
+    N64Bench_PhaseBegin(BPH_DL_BUILD);
+    N64Bench_PhaseEnd(BPH_DL_BUILD);
+#endif
+
     if (gamestate == GS_LEVEL && gametic && splitplayers < 2)
 	HU_Drawer ();
-    
+
     // clean up border stuff
     if (gamestate != oldgamestate && gamestate != GS_LEVEL)
 	I_SetPalette (W_CacheLumpName ("PLAYPAL",PU_CACHE));
@@ -869,6 +878,12 @@ void D_DoomLoop (void)
 
 #ifdef N64_BENCH
 	N64Bench_LoopBegin();   // brackets the whole iteration (sim+audio+display)
+	// RDP_BUSY brackets the async-RDP busy window read at frame top. Once the
+	// world renders on the RDP, the RDP-done timestamp (via detach_cb) is read
+	// here non-serializing so a too-slow RDP surfaces as rising counted time
+	// (Q9). ~0 in this stage (RDP draws only the present blit, as today).
+	N64Bench_PhaseBegin(BPH_RDP_BUSY);
+	N64Bench_PhaseEnd(BPH_RDP_BUSY);
 #endif
 
 	// process one or more tics
