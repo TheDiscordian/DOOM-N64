@@ -1232,6 +1232,21 @@ void I_FinishUpdate(void)
         //     RDP fill drawn earlier survives there; non-key overlay pixels in
         //     the box (e.g. HUD intruding into these columns -- scanned safe)
         //     blit normally.
+        //
+        //     LOAD-BEARING: rdpq_set_mode_copy(true) raises
+        //     SOM_ALPHACOMPARE_THRESHOLD, which discards a texel only when
+        //     texel_alpha < BLEND-COLOUR alpha -- it does NOT imply a nonzero
+        //     threshold by itself, and neither libdragon init nor any other
+        //     code in this port ever sets the blend colour. With the power-on
+        //     blend alpha of 0 the compare passes EVERYTHING (0 < 0 is false),
+        //     so the "keyed" box was blitted fully opaque and the suppressed
+        //     key-index columns rendered as solid key-colour rectangles
+        //     (salmon under key 255, magenta under key 251) instead of being
+        //     punched out. Threshold alpha=1 discards exactly the alpha=0 key
+        //     entry: an RGBA16 TLUT texel expands its 1-bit alpha to 0 or 255,
+        //     so key (0 < 1) is discarded and opaque art (255 < 1 false) is
+        //     kept, bit-exact.
+        rdpq_set_blend_color(RGBA32(0, 0, 0, 1));
         rdpq_set_mode_copy(true);
         rdpq_mode_tlut(TLUT_RGBA16);
         rdpq_set_scissor(kx0, ky0, bx1, by1);
