@@ -140,7 +140,12 @@ echo "[bench] launching ares (timeout ${TIMEOUT}s)" >&2
 # and can return the RUNNER's own group, which would make cleanup kill itself.
 # stdbuf -oL: ares stdout is block-buffered through a pipe; line-buffer it so
 # the post-result phase report survives the teardown kill.
-setsid stdbuf -oL "$ARES" --system "Nintendo 64" "$RUN_ROM" >"$ARES_LOG" 2>&1 &
+# --setting DebugServer/Enabled=false: every ares instance otherwise binds the
+# same GDB port ([::1]:9123); with concurrent runs only the first wins the bind.
+# Bench runs never attach a debugger, so disable it per-invocation (CLI override
+# only -- the user's own ares config is untouched).
+setsid stdbuf -oL "$ARES" --setting DebugServer/Enabled=false \
+    --system "Nintendo 64" "$RUN_ROM" >"$ARES_LOG" 2>&1 &
 LAUNCH_PID=$!
 ARES_PGID="$LAUNCH_PID"
 
