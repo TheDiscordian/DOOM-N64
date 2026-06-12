@@ -955,7 +955,19 @@ void D_DoomLoop (void)
 	    }
 	}
 
-	S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
+	// move positional sounds and expire finished channels: vanilla ran
+	// this once per tic (frames were tic-locked); under the uncapped
+	// renderer it would otherwise run every vsync. gametic advances every
+	// tic even while paused/in menu (TryRunTics blocks there), so gating
+	// on gametic preserves vanilla pause channel-expiry behaviour.
+	{
+	    static int s_sounds_lasttic = -1;
+	    if (gametic != s_sounds_lasttic)
+	    {
+		s_sounds_lasttic = gametic;
+		S_UpdateSounds (players[consoleplayer].mo);
+	    }
+	}
 
 	// Update display, next frame, with current state.
 #ifdef N64_BENCH
