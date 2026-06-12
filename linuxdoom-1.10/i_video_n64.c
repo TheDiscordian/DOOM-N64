@@ -970,13 +970,29 @@ void I_FinishUpdate(void)
         }
     }
 
-    // Overlay blit. With the flag on, COPY mode's transparency=true enables
-    // alpha-compare so the alpha-0 key index is discarded (the view-window
-    // world drawn above shows through); with the flag off, transparency=false
-    // keeps the present byte-identical to before. COPY-mode alpha-compare is
-    // valid here because the present target is the 16bpp display fb
+    // Present blit. COPY-mode alpha-compare (transparency=true) keys out the
+    // alpha-0 reserved index so the RDP-drawn world shows through the view
+    // window. That key-out is valid only once the view is backed by RDP
+    // geometry AND the view region no longer holds opaque world art in the
+    // blitted CI8 buffer -- otherwise any world texel that legitimately equals
+    // the key index (DESIGN s5: opaque world art may contain the key) would be
+    // wrongly discarded and reveal the empty 16bpp fb behind it.
+    //
+    // In Stage 1 NEITHER condition holds: the view is still 100% software-
+    // rendered into the SAME unified CI8 buffer this blit reads (no separate
+    // overlay surface yet), and no RDP world geometry is drawn behind it. So
+    // alpha-compare here could only punch holes in opaque world art over an
+    // empty fb. It is therefore kept OFF this stage regardless of the flag,
+    // which makes the flag-ON present byte-identical to flag-OFF -- the
+    // strongest form of the Stage-1 "visually identical to baseline" gate.
+    // The transparent-key mechanism is still exercised and proven harmless by
+    // the KEY_CLEAR fill (the software path overwrites the key-cleared view, so
+    // no key pixel survives) and the TLUT alpha=0 packing (I_SetPalette). The
+    // view-region key-out goes live in Stage 2, when the first RDP seg is drawn
+    // behind the view and its suppressed colfunc columns hold the key index.
+    // COPY-mode alpha-compare is valid on the 16bpp display fb when re-enabled
     // (rdpq_mode.h:328-330,335).
-    rdpq_set_mode_copy(rdp_on);
+    rdpq_set_mode_copy(false);
     rdpq_mode_tlut(TLUT_RGBA16);
     // Palette area of TMEM (upper half) is only ever written by this blit path,
     // and a CI8 blit only loads texels into the lower half, so the TLUT
