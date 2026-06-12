@@ -256,6 +256,15 @@ wipe_StartScreen
 {
     wipe_scr_start = screens[2];
     I_ReadScreen(wipe_scr_start);
+#ifdef N64
+    // RDP renderer: the captured (previously presented) CI8 screen carries
+    // the routed seg's key-suppressed pixels -- the RDP wall behind them
+    // exists only in the 16bpp display fb, which the melt never reads.
+    // Scrub them, or every melt present repaints them OUTSIDE any keyed box
+    // and the opaque blit shows them as bright key colour for the whole
+    // wipe (stale-key sparkle). No-op with the renderer flag off.
+    I_N64WipeScrubKey(wipe_scr_start);
+#endif
     return 0;
 }
 
@@ -271,6 +280,11 @@ wipe_EndScreen
     // The end screen is the frame just rendered into the draw buffer
     // (screens[0]); I_ReadScreen returns the previously presented buffer.
     memcpy(wipe_scr_end, screens[0], width * height);
+    // RDP renderer: same scrub as the start screen -- the freshly rendered
+    // end frame contains its own routed seg's key-suppressed pixels, which
+    // the melt would otherwise reveal as key colour as it slides the start
+    // screen away (the second half of the stale-key sparkle).
+    I_N64WipeScrubKey(wipe_scr_end);
 #else
     I_ReadScreen(wipe_scr_end);
 #endif

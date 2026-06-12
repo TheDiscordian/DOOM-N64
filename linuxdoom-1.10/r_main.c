@@ -996,26 +996,17 @@ void R_RenderPlayerView (player_t* player)
     // software-rendered into the CI8 buffer, so the visible result is identical
     // regardless of the flag.
     //
-    // Stage-1 scaffolding: with the flag on, key-clear the 3D-view region of
-    // the CI8 buffer to the transparency-key index BEFORE the software renderer
-    // fills it. The software path then overwrites every view pixel, so the
-    // present's alpha-compare keys out nothing and the output stays identical.
-    // This proves the key-clear + transparent-key compositing is harmless
-    // before any world geometry moves to the RDP. The clear lands in its own
-    // named bench phase (KEY_CLEAR) so its cost is visible. Removed in the
-    // final stage when view-window CI8 writes become event-driven erase-to-key.
-#ifdef N64
-    if (n64_use_rdp_renderer)
-    {
-#ifdef N64_BENCH
-        N64Bench_PhaseBegin(BPH_KEY_CLEAR);
-#endif
-        I_N64KeyClearView();
-#ifdef N64_BENCH
-        N64Bench_PhaseEnd(BPH_KEY_CLEAR);
-#endif
-    }
-#endif
+    // Erase-to-key is EVENT-DRIVEN (Stage-2 stale-key fix): the seg loop
+    // writes the key index into exactly the routed seg's suppressed column
+    // spans (R_FillColumnKey, r_segs.c), so key pixels can only exist where
+    // an emitted record covers them and the keyed present blit punches them
+    // out. The Stage-1 full-view pre-clear (I_N64KeyClearView) is retired:
+    // it relied on "software covers every view pixel", which vanilla does
+    // not guarantee -- rare per-column coverage gaps kept key pixels OUTSIDE
+    // the keyed box and the present blitted them opaque as the key colour
+    // (the 28-px stale-key sparkle, trace DL_KEYSCAN p=1659). Gap pixels now
+    // keep stale buffer content, byte-identical to the flag-off software
+    // path. The KEY_CLEAR bench phase stays in the enum (reads 0).
 
     // Clear buffers.
     R_ClearClipSegs ();

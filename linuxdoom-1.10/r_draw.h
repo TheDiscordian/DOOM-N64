@@ -46,6 +46,12 @@ extern byte*		dc_source;
 void 	R_DrawColumn (void);
 void 	R_DrawColumnLow (void);
 
+#ifdef N64
+// RDP renderer: fill [dc_yl..dc_yh] at dc_x with the transparency-key index
+// (event-driven erase-to-key for the routed seg's suppressed columns).
+void	R_FillColumnKey (void);
+#endif
+
 // The Spectre/Invisibility effect.
 void 	R_DrawFuzzColumn (void);
 void 	R_DrawFuzzColumnLow (void);

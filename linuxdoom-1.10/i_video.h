@@ -88,10 +88,12 @@ extern int n64_rdp_key_index;
 // which changes the key index's alpha bit).
 void I_N64MarkPaletteDirty(void);
 
-// Key-clear the 3D-view region of the CI8 draw buffer to the transparency-key
-// index (Stage-1 scaffolding; no-op until the key is reserved). Called at the
-// view-render entry when the RDP renderer is on.
-void I_N64KeyClearView(void);
+// Scrub transparency-key pixels out of a wipe-captured CI8 screen (replace
+// each with the pixel above; top row falls back to palette 0). The wipe
+// captures recycle buffers that contain the routed seg's key-suppressed
+// pixels; unscrubbed, melt presents repaint them outside any keyed box and
+// they show as opaque key colour (stale-key sparkle). No-op flag-off.
+void I_N64WipeScrubKey(byte* scr);
 #endif
 
 

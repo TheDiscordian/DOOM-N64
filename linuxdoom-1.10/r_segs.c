@@ -408,6 +408,12 @@ void R_RenderSegLoop (void)
 	    {
 		DL_RouteCapture(l_rw_x, yl, yh, l_rw_scale, texturecolumn,
 				(const void* const*)l_walllights);
+		// Event-driven erase-to-key: write the key index into exactly
+		// this suppressed span (dc_x/dc_yl/dc_yh are already set
+		// above). Replaces the Stage-1 full-view key clear, whose
+		// reliance on total software view coverage leaked key pixels
+		// at rare per-column coverage gaps (stale-key sparkle).
+		R_FillColumnKey ();
 	    }
 	    else
 #endif

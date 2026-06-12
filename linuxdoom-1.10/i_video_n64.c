@@ -1016,64 +1016,48 @@ void I_N64ScanTransparencyKey(void)
     I_Error("I_N64ScanTransparencyKey: no free palette index for transparency key");
 }
 
-// Temporary Stage-1 scaffolding: fill the 3D-view region of the CI8 draw buffer
-// with the transparency-key index, in batched 64-bit stores. With the flag on,
-// the software renderer then overwrites every view pixel, so nothing is keyed
-// out yet -- this only proves the mechanism is harmless before world geometry
-// moves to the RDP. Removed in the final stage (event-driven erase-to-key).
-void I_N64KeyClearView(void)
-{
-    byte* base;
-    int key;
-    uint64_t pattern;
-    int x0, x1, y0, y1;
-    int y;
+// (The Stage-1 full-view key clear, I_N64KeyClearView, is retired: erase-to-
+// key is event-driven at the seg loop's suppressed columns -- R_FillColumnKey,
+// r_segs.c -- so the key index can only exist where an emitted record covers
+// it. See R_RenderPlayerView for the rationale and the stale-key sparkle
+// trace evidence.)
 
-    if (n64_rdp_key_index < 0)
-        return;
-    if (!screens[0])
+// Scrub transparency-key pixels out of a wipe-captured CI8 screen. The wipe
+// captures recycle presented/draw-buffer content that contains the routed
+// seg's key-suppressed pixels (the RDP fill behind them lives only in the
+// 16bpp display fb, which the CI8 melt never reads). Melt presents then
+// repaint those key pixels OUTSIDE any keyed box -- with no world records the
+// present is a single opaque blit -- so they rendered as bright key-colour
+// blotches for the duration of the melt (the 606-px stale-key sparkle:
+// trace WIPE_TRACE start keypx=606 == DL_KEYSCAN p=3310 OUT=606). Replace
+// each key pixel with the pixel above it (top row falls back to palette 0):
+// the suppressed wall region melts as a smear of the art above it instead of
+// the key colour. Safe by construction: the key index was reserved from the
+// UI raw bytes + the colormap-output closure of world art
+// (I_N64ScanTransparencyKey), so during level play no legitimate screen byte
+// can equal it -- only suppression holes are ever touched. Flag-off: no-op.
+void I_N64WipeScrubKey(byte* scr)
+{
+    int x, y;
+    int key;
+
+    if (n64_use_rdp_renderer == 0 || n64_rdp_key_index < 0 || !scr)
         return;
 
     key = n64_rdp_key_index;
-    pattern = (uint64_t)((uint8_t)key);
-    pattern |= pattern << 8;
-    pattern |= pattern << 16;
-    pattern |= pattern << 32;
 
-    // 3D-view window in CI8 screen coordinates (see R_InitBuffer).
-    x0 = viewwindowx;
-    y0 = viewwindowy;
-    x1 = viewwindowx + scaledviewwidth;
-    y1 = viewwindowy + viewheight;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > SCREENWIDTH)  x1 = SCREENWIDTH;
-    if (y1 > SCREENHEIGHT) y1 = SCREENHEIGHT;
-    if (x1 <= x0 || y1 <= y0)
-        return;
+    for (x = 0; x < SCREENWIDTH; x++)
+        if (scr[x] == key)
+            scr[x] = 0;
 
-    base = screens[0] + y0 * SCREENWIDTH;
-
-    for (y = y0; y < y1; y++)
+    for (y = 1; y < SCREENHEIGHT; y++)
     {
-        byte* row = base + x0;
-        byte* end = base + x1;
+        byte* row  = scr + y * SCREENWIDTH;
+        byte* prev = row - SCREENWIDTH;
 
-        // Align the run to 8 bytes, then store 64 bits at a time (the same
-        // uncached-RDRAM batching the span renderer uses, r_draw.c:731-784).
-        while (((uintptr_t)row & 7) && row < end)
-            *row++ = (byte)key;
-
-        while (row + 8 <= end)
-        {
-            *(uint64_t*)row = pattern;
-            row += 8;
-        }
-
-        while (row < end)
-            *row++ = (byte)key;
-
-        base += SCREENWIDTH;
+        for (x = 0; x < SCREENWIDTH; x++)
+            if (row[x] == key)
+                row[x] = prev[x];
     }
 }
 
