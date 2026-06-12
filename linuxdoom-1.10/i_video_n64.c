@@ -13,6 +13,7 @@
 #include "i_video.h"
 #include "v_video.h"
 #include "r_defs.h"
+#include "r_state.h"
 #include "m_swap.h"
 #include "w_wad.h"
 #include "z_zone.h"
@@ -798,16 +799,94 @@ static void I_N64MarkPatchIndices(int lumpnum, boolean used[256])
     }
 }
 
+// Mark every palette index a single raw flat lump touches. A flat is a bare
+// 64x64 byte array of palette indices (no patch header) -- so every byte in a
+// 4096-byte lump is a used index. Lumps that are not exactly flat-sized are
+// skipped (animated-flat markers, oversized custom flats are rare in the
+// shareware set and erring toward "skip" only ever frees MORE indices).
+static void I_N64MarkFlatIndices(int lumpnum, boolean used[256])
+{
+    const byte* data;
+    int len;
+    int i;
+
+    len = W_LumpLength(lumpnum);
+    if (len != 64 * 64)
+        return;
+
+    data = (const byte*)W_CacheLumpNum(lumpnum, PU_CACHE);
+    if (!data)
+        return;
+
+    for (i = 0; i < len; i++)
+        used[data[i]] = true;
+}
+
+// Mark the indices used by all WORLD art -- wall-texture patches (the lumps
+// PNAMES references), sprites, and flats. Used so the reserved transparency key
+// can be chosen PROVABLY absent from opaque world art, which closes the design's
+// "Key index leaks through opaque world art" hazard (DESIGN sec5 / risk table):
+// with the key absent from every world texel, the present blit's alpha-compare
+// can never punch a hole in software-rendered world pixels even if it touched
+// them. Belt-and-suspenders with the present seam's bbox-scissored keying.
+static void I_N64MarkWorldArtIndices(boolean used[256])
+{
+    int flat_start, flat_end;
+    int lump;
+
+    // Wall-texture patches: every lump named in PNAMES (patch format).
+    {
+        const byte* names = (const byte*)W_CacheLumpName("PNAMES", PU_CACHE);
+        if (names)
+        {
+            int nummappatches = LONG(*((const int*)names));
+            const char* name_p = (const char*)names + 4;
+            int i;
+            char nm[9];
+            nm[8] = 0;
+            for (i = 0; i < nummappatches; i++)
+            {
+                int pl;
+                strncpy(nm, name_p + i * 8, 8);
+                pl = W_CheckNumForName(nm);
+                if (pl >= 0)
+                    I_N64MarkPatchIndices(pl, used);
+            }
+        }
+    }
+
+    // Sprites: patch format, [firstspritelump, lastspritelump].
+    for (lump = firstspritelump; lump <= lastspritelump; lump++)
+        I_N64MarkPatchIndices(lump, used);
+
+    // Flats: raw 64x64, the lumps between F_START and F_END.
+    flat_start = W_CheckNumForName("F_START");
+    flat_end   = W_CheckNumForName("F_END");
+    if (flat_start >= 0 && flat_end > flat_start)
+    {
+        for (lump = flat_start + 1; lump < flat_end; lump++)
+            I_N64MarkFlatIndices(lump, used);
+    }
+}
+
 // Pick the transparency-key palette index (RDP renderer, Stage 1+). Scans every
 // UI/status-bar/font/menu patch lump drawn OUTSIDE the 3D view (the ST*, M_*,
-// and WI* graphic families), marks the palette indices they use, and reserves
-// the highest index none of them touch. Reserving a HIGH index matches the
-// design's expectation that UI art rarely touches the top of PLAYPAL. Asserts
-// if every index is in use. Called once at startup, after the WAD is loaded.
+// and WI* graphic families) AND all world art (wall patches, sprites, flats),
+// marks the palette indices they use, and reserves the highest index unused by
+// BOTH sets -- so the key is provably absent from opaque world art and the
+// present blit's alpha-compare can never punch a hole in software-rendered
+// world pixels. If no index is free of both (palette-saturated WAD), fall back
+// to the highest index free of UI art only (the original Stage-1 behaviour) so
+// the renderer stays functional; the present seam's bbox-scissored keying still
+// confines any residual exposure to the routed seg's box. Reserving a HIGH index
+// matches the design's expectation that UI art rarely touches the top of
+// PLAYPAL. Asserts only if even the UI-only set leaves no index free. Called
+// once at startup, after the WAD is loaded.
 void I_N64ScanTransparencyKey(void)
 {
     static const char* const ui_prefixes[] = { "ST", "M_", "WI" };
-    boolean used[256];
+    boolean ui_used[256];
+    boolean all_used[256];
     int lump;
     int p;
     int idx;
@@ -815,7 +894,7 @@ void I_N64ScanTransparencyKey(void)
     if (n64_rdp_key_index >= 0)
         return;                             // already chosen
 
-    memset(used, 0, sizeof(used));
+    memset(ui_used, 0, sizeof(ui_used));
 
     for (lump = 0; lump < numlumps; lump++)
     {
@@ -826,19 +905,38 @@ void I_N64ScanTransparencyKey(void)
             size_t plen = strlen(ui_prefixes[p]);
             if (strncmp(name, ui_prefixes[p], plen) == 0)
             {
-                I_N64MarkPatchIndices(lump, used);
+                I_N64MarkPatchIndices(lump, ui_used);
                 break;
             }
         }
     }
 
-    // Prefer the highest free index (UI art rarely uses the top of PLAYPAL).
+    // all_used = ui_used + world art.
+    memcpy(all_used, ui_used, sizeof(all_used));
+    I_N64MarkWorldArtIndices(all_used);
+
+    // Prefer the highest index unused by BOTH UI and world art (provably hole-
+    // free); fall back to UI-only if the palette is saturated by world art.
     for (idx = 255; idx >= 0; idx--)
     {
-        if (!used[idx])
+        if (!all_used[idx])
         {
             n64_rdp_key_index = idx;
-            N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d\n", idx);
+            N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d "
+                       "(UI+world-art free)\n", idx);
+            I_N64MarkPaletteDirty();
+            return;
+        }
+    }
+
+    for (idx = 255; idx >= 0; idx--)
+    {
+        if (!ui_used[idx])
+        {
+            n64_rdp_key_index = idx;
+            N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d "
+                       "(UI-free; world art saturates the palette -- present "
+                       "seam bbox-keying confines residual exposure)\n", idx);
             // If the flag is already on at boot (persisted in EEPROM), the
             // master TLUT may have been packed before the key was known, so
             // apply the key's alpha=0 now and mark dirty for the next present.
@@ -848,8 +946,7 @@ void I_N64ScanTransparencyKey(void)
     }
 
     // Fallback: every UI patch uses every palette index (effectively
-    // impossible for DOOM art). Reserve 255 anyway so the renderer stays
-    // functional; the assert documents the invariant.
+    // impossible for DOOM art). The assert documents the invariant.
     I_Error("I_N64ScanTransparencyKey: no free palette index for transparency key");
 }
 
@@ -1009,38 +1106,107 @@ void I_FinishUpdate(void)
         }
     }
 
-    // Present blit. COPY-mode alpha-compare (transparency=true) keys out the
-    // alpha-0 reserved index so the RDP-drawn world shows through the view
-    // window. Enabled ONLY when the RDP actually drew world geometry this frame
-    // (Stage 2: the routed seg). Then the routed seg's suppressed-colfunc
-    // columns hold the key index (from KEY_CLEAR), get keyed out, and reveal the
-    // RDP fill drawn underneath; every other view pixel is still real software-
-    // rendered colour and is blitted normally. When no world geometry was drawn
-    // (flag off, or no eligible seg, or a paced menu frame), alpha-compare stays
-    // OFF so the present is byte-identical to the software path -- opaque art
-    // that happens to contain the key index is never punched out.
-    // COPY-mode alpha-compare is valid on the 16bpp display fb
-    // (rdpq_mode.h:328-330,335).
-    rdpq_set_mode_copy(world_drawn ? true : false);
-    rdpq_mode_tlut(TLUT_RGBA16);
-    // Palette area of TMEM (upper half) is only ever written by this blit path
-    // (or the world pass above), and a CI8 blit only loads texels into the lower
-    // half, so the TLUT persists across frames and is re-uploaded only when it
-    // changed.
+    // Present blit. The CI8 overlay covers the entire 320x200 display and is
+    // blitted over the RDP-drawn world in COPY mode (~4x fill, valid on the
+    // 16bpp display fb).
+    //
+    // CRITICAL (gate-round fix): alpha-compare (transparency=true) keys out the
+    // alpha-0 reserved index. It MUST run ONLY over the routed seg's pixels --
+    // the suppressed-colfunc region that holds the key index (from KEY_CLEAR)
+    // and must be discarded so the RDP fill shows through. Running it over the
+    // WHOLE screen (the previous Stage-2 code) subjected every software-rendered
+    // world pixel to alpha-compare, so any opaque world texel that legitimately
+    // equals the key index (high PLAYPAL reds in fire/blood/explosions are
+    // plausible) would be wrongly discarded -> a flickering hole revealing the
+    // uncleared 16bpp fb. The design forbids alpha-compare over opaque world art
+    // (DESIGN sec5 / risk table "Key index leaks through opaque world art":
+    // "alpha-compare is OFF for opaque walls/flats, ON only for masked draws").
+    //
+    // Fix: when world geometry drew, blit the routed seg's screen-space bounding
+    // box with alpha-compare ON (keyed) and the rest of the screen with
+    // alpha-compare OFF (opaque), so software world art outside the box is never
+    // keyed. The opaque remainder is the up-to-4 rectangular bands around the
+    // box. When NOTHING drew (flag off / no eligible seg / paced menu frame) the
+    // whole screen is a single opaque blit, byte-identical to the software path.
     if (n64_palette_dirty)
     {
         uint16_t* slot = doom_tlut_up[n64_draw_idx];
 
         memcpy(slot, doom_tlut_master, sizeof(doom_tlut_master));
         data_cache_hit_writeback(slot, sizeof(doom_tlut_master));
+        // The TLUT load must happen inside a mode where the upper TMEM half is
+        // addressable; set COPY mode + TLUT first, then upload.
+        rdpq_set_mode_copy(false);
+        rdpq_mode_tlut(TLUT_RGBA16);
         rdpq_tex_upload_tlut(slot, 0, 256);
         n64_palette_dirty = false;
     }
-    // The CI8 source covers the entire 320x200 display, so attach (no clear)
-    // is sufficient -- the blit overwrites every pixel (except, with the flag
-    // on and world geometry drawn, the alpha-0 key pixels keyed out by
-    // alpha-compare).
-    rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+
+    {
+    int kx0, ky0, kx1, ky1;
+    boolean keyed = (world_drawn && DL_KeyedSpan(&kx0, &ky0, &kx1, &ky1));
+
+    if (!keyed)
+    {
+        // No keyed region: one opaque full-screen blit (software-path identical
+        // when the flag is off). The CI8 source covers the whole display, so
+        // attach-without-clear is sufficient -- every pixel is overwritten.
+        rdpq_set_mode_copy(false);
+        rdpq_mode_tlut(TLUT_RGBA16);
+        rdpq_set_scissor(0, 0, SCREENWIDTH, SCREENHEIGHT);
+        rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+    }
+    else
+    {
+        // exclusive box edges for the opaque bands
+        int bx1 = kx1 + 1;      // one past the box's right column
+        int by1 = ky1 + 1;      // one past the box's bottom row
+
+        // (1) Keyed box: alpha-compare ON discards the key-index pixels so the
+        //     RDP fill drawn earlier survives there; non-key overlay pixels in
+        //     the box (e.g. HUD intruding into these columns -- scanned safe)
+        //     blit normally.
+        rdpq_set_mode_copy(true);
+        rdpq_mode_tlut(TLUT_RGBA16);
+        rdpq_set_scissor(kx0, ky0, bx1, by1);
+        rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+
+        // (2) Opaque remainder: the up-to-4 bands around the box, alpha-compare
+        //     OFF, so software-rendered world art outside the box is blitted
+        //     unconditionally (never keyed). Together the bands + box tile the
+        //     whole 320x200 surface exactly once with no overlap.
+        rdpq_set_mode_copy(false);
+        rdpq_mode_tlut(TLUT_RGBA16);
+
+        // top band: full width, rows [0, ky0)
+        if (ky0 > 0)
+        {
+            rdpq_set_scissor(0, 0, SCREENWIDTH, ky0);
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+        }
+        // bottom band: full width, rows [by1, SCREENHEIGHT)
+        if (by1 < SCREENHEIGHT)
+        {
+            rdpq_set_scissor(0, by1, SCREENWIDTH, SCREENHEIGHT);
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+        }
+        // left band: columns [0, kx0), box rows only
+        if (kx0 > 0)
+        {
+            rdpq_set_scissor(0, ky0, kx0, by1);
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+        }
+        // right band: columns [bx1, SCREENWIDTH), box rows only
+        if (bx1 < SCREENWIDTH)
+        {
+            rdpq_set_scissor(bx1, ky0, SCREENWIDTH, by1);
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+        }
+
+        // Restore full-screen scissor for any later RDP work this stream.
+        rdpq_set_scissor(0, 0, SCREENWIDTH, SCREENHEIGHT);
+    }
+    }
     }
 
     // Detach with a completion callback instead of a global rspq_wait(): the

@@ -678,9 +678,17 @@ void D_Display (void)
 	    // RDP renderer: reset the per-frame emit arena + routed-seg latch
 	    // ONCE before the player render(s). The world pass is drained later
 	    // by DL_Flush at the present seam (i_video_n64.c). DL_BeginFrame also
-	    // derives this frame's free-W constant k. No-op work-wise when the
-	    // flag is off (the seg loop never routes), but cheap to call always.
-	    DL_BeginFrame();
+	    // derives this frame's free-W constant k and bakes the PRIM LUT.
+	    //
+	    // GATED on the kill-switch: with the flag OFF the seg loop never
+	    // routes (DL_WallSegAvailable() is false), so the arena/latch/k/LUT are
+	    // never read this frame -- calling DL_BeginFrame anyway would leak a
+	    // per-frame float divide + arena reset (+ a one-time LUT bake) into the
+	    // software path that the Stage-1 baseline did not have, drifting the
+	    // flag-OFF bench off byte-identical. Skipping it when the flag is off
+	    // keeps the kill-switch path bit-for-bit the pre-RDP software path.
+	    if (n64_use_rdp_renderer)
+		DL_BeginFrame();
 #if DEBUG
 	    D_N64UpdateDebugFps();
 #endif

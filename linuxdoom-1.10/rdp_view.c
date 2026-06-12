@@ -278,6 +278,63 @@ int DL_Count(void)
     return dl_wall_count;
 }
 
+int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
+{
+    int i;
+    int xlo = SCREENWIDTH;
+    int ylo = SCREENHEIGHT;
+    int xhi = -1;
+    int yhi = -1;
+
+    if (dl_wall_count <= 0)
+        return 0;
+
+    // The routed seg's emitted records cover a screen-space bounding box; that
+    // box is exactly the region whose CPU colfunc was suppressed (it holds the
+    // key index and must be keyed out so the RDP fill shows through). Every
+    // pixel OUTSIDE the box holds real software-rendered world art, which must
+    // NOT be subjected to alpha-compare -- opaque art may legitimately contain
+    // the key index without being keyed (DESIGN sec5 / risk table "Key index
+    // leaks through opaque world art"). The present blit scissors the keyed
+    // COPY pass to this box so software world art elsewhere is blitted opaque.
+    //
+    // Tight bounding box (not full-screen columns): the routed seg is a single-
+    // sided midtexture wall that fills its own [yl,yh] span solidly -- floors
+    // and ceilings are marked at rows ABOVE/BELOW the wall, i.e. outside the
+    // record's screen Y -- so the box's keyed surface is the wall itself, not
+    // arbitrary world fill. Y edges step linearly per record; min(ytop)/
+    // max(ybot) over all records bound them.
+    for (i = 0; i < dl_wall_count; i++)
+    {
+        const rdp_wall_t* w = &dl_walls[i];
+        int a = w->x1;
+        int b = w->x2;
+        float yt = (w->ytop_l < w->ytop_r) ? w->ytop_l : w->ytop_r;
+        float yb = (w->ybot_l > w->ybot_r) ? w->ybot_l : w->ybot_r;
+        int ti = (int)yt;               // floor toward the top edge
+        int bi = (int)(yb + 0.999f);    // ceil toward the bottom edge
+
+        if (a < xlo) xlo = a;
+        if (b > xhi) xhi = b;
+        if (ti < ylo) ylo = ti;
+        if (bi > yhi) yhi = bi;
+    }
+
+    if (xhi < xlo || yhi < ylo)
+        return 0;
+
+    if (xlo < 0) xlo = 0;
+    if (ylo < 0) ylo = 0;
+    if (xhi > SCREENWIDTH - 1)  xhi = SCREENWIDTH - 1;
+    if (yhi > SCREENHEIGHT - 1) yhi = SCREENHEIGHT - 1;
+
+    *x0 = xlo;
+    *y0 = ylo;
+    *x1 = xhi;
+    *y1 = yhi;
+    return 1;
+}
+
 int DL_WallSegAvailable(void)
 {
     if (!n64_use_rdp_renderer)

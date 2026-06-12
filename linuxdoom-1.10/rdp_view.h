@@ -70,6 +70,16 @@ void DL_Flush(void);
 // was found). Lets the present seam skip the flush plumbing when empty.
 int DL_Count(void);
 
+// The inclusive screen-space bounding box [*x0,*y0]..[*x1,*y1] covered by this
+// frame's emitted world records (the routed seg's suppressed-colfunc pixels).
+// Returns nonzero and fills the box when at least one record was emitted, else
+// 0. The present seam keys out (alpha-compare) ONLY this box in the overlay
+// COPY blit, so software-rendered world art outside it is never subjected to
+// alpha-compare -- opaque art may legitimately contain the key index without
+// being punched out (DESIGN sec5 / risk table "Key index leaks through opaque
+// world art").
+int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1);
+
 // --- Stage-2 single-seg selection / A/B toggle ----------------------------
 // The routed seg is the FIRST single-sided seg with a midtexture encountered in
 // R_RenderSegLoop each frame (deterministic under the virtual tic clock). The
