@@ -44,6 +44,12 @@ CFLAGS += -DN64_BENCH=1
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)
 endif
+# BENCH_FORCE_RDP=1: the flag-ON A/B run. Pins n64_use_rdp_renderer=1 at startup
+# (d_main.c) so the RDP-renderer run is reproducible from committed source
+# instead of a throwaway harness patch. Default (unset) is the flag-OFF run.
+ifeq ($(BENCH_FORCE_RDP),1)
+CFLAGS += -DBENCH_FORCE_RDP=1
+endif
 endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)

@@ -11,6 +11,7 @@
 
 #ifdef N64_BENCH
 
+#include <stdint.h>     // uint64_t in the virtual-clock API below
 #include "d_ticcmd.h"
 
 // Wired into D_DoomMain: forces autostart of the bench scenario and selects
@@ -19,6 +20,13 @@ void N64Bench_Init(void);
 
 // True while the bench is collecting samples (D_DoomLoop forces uncapped path).
 int  N64Bench_Active(void);
+
+// Deterministic virtual tic clock. N64Bench_VirtualTick() is called once per
+// D_DoomLoop iteration (before the tic-production pass); I_GetTime() reads
+// N64Bench_VirtualTimeMs() while the bench is active so the tic cadence is host-
+// independent and the scripted playthrough is byte-identical run to run.
+void     N64Bench_VirtualTick(void);
+uint64_t N64Bench_VirtualTimeMs(void);
 
 // Called from D_DoomLoop around D_Display to time one rendered frame.
 void N64Bench_FrameBegin(void);

@@ -17,6 +17,9 @@
 #include "i_system.h"
 #include "n64_debug.h"
 #include "z_zone.h"
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
 
 int mb_used = 4;
 
@@ -94,6 +97,15 @@ int I_GetTime(void)
     static uint64_t basetime_ms;
     uint64_t now_ms;
 
+#ifdef N64_BENCH
+    // While the bench runs, the tic clock is a deterministic virtual clock
+    // (host-independent), so the scripted playthrough is byte-identical run to
+    // run and NetUpdate's newtics cannot burst on host jitter. The wall-clock
+    // base is bypassed entirely; the virtual clock starts at 0 by construction.
+    if (N64Bench_Active())
+        return (int)((N64Bench_VirtualTimeMs() * TICRATE) / 1000);
+#endif
+
     now_ms = get_ticks_ms();
     if (!basetime_ms)
         basetime_ms = now_ms;
@@ -117,7 +129,14 @@ extern int snd_SfxVolume, snd_MusicVolume, mouseSensitivity;
 extern int widescreen, n64_use_rdp_renderer;
 
 #define N64_SETTINGS_MAGIC   0x444E3631u	/* 'DN61' */
-#define N64_SETTINGS_VERSION 1
+// Bump to 2: Stage 0 repurposed the struct's last reserved byte into
+// use_rdp_renderer. A version-1 save was written WITHOUT that field, so loading
+// it under the new layout would read a stale reserved byte as the RDP-renderer
+// flag (silently enabling the RDP path from a pre-RDP save). The version gate
+// must invalidate any version-1 save so it falls back to compiled defaults --
+// correct shipping behaviour, not just bench hygiene. (Harmless today only
+// because no valid save has ever been written, but a real forward-compat trap.)
+#define N64_SETTINGS_VERSION 2
 
 typedef struct
 {

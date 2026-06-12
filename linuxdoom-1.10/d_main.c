@@ -832,6 +832,12 @@ void D_Display (void)
     {
 	do
 	{
+#ifdef N64_BENCH
+	    // The bench tic clock is a virtual frame counter, not the host wall
+	    // clock; advance it each spin so this melt loop (which busy-waits on
+	    // I_GetTime advancing) always makes progress instead of deadlocking.
+	    N64Bench_VirtualTick();
+#endif
 	    nowtime = I_GetTime ();
 	    tics = nowtime - wipestart;
 	} while (!tics);
@@ -885,6 +891,10 @@ void D_DoomLoop (void)
 	I_StartFrame ();
 
 #ifdef N64_BENCH
+	N64Bench_VirtualTick(); // advance the deterministic virtual tic clock
+	                        // (read by I_GetTime) BEFORE the tic-production
+	                        // pass, so newtics has a fixed host-independent
+	                        // cadence and the scripted playthrough never forks.
 	N64Bench_LoopBegin();   // brackets the whole iteration (sim+audio+display)
 	// RDP_BUSY brackets the async-RDP busy window read at frame top. Once the
 	// world renders on the RDP, the RDP-done timestamp (via detach_cb) is read
@@ -2123,6 +2133,29 @@ void D_DoomMain (void)
     startepisode = 1;
     startmap = 1;
     autostart = true;
+
+    // Pin every scenario-defining setting to a canonical value, AFTER
+    // I_N64LoadSettings, so the bench scene is identical regardless of any EEPROM
+    // save state (compiled out of shipping builds). Today the load already no-ops
+    // on a blank/old-version EEPROM, but this makes the guarantee structural: a
+    // future seeded save can never silently widen the FOV, flip the renderer, or
+    // change the view size out from under the A/B comparison.
+    widescreen           = 0;   // 4:3 -- wider FOV would change drawseg counts
+    frame_interpolation  = 1;   // uncapped+interpolated shipping path (bench also forces this)
+    detailLevel          = 0;   // high detail
+    screenblocks         = 10;  // full 4:3 view, status bar visible (shipping default)
+    setblocks            = 10;
+    setsizeneeded        = true;
+    // RDP toggle: OFF by default (flag-off A run). The flag-ON run is selected at
+    // BUILD time with -DBENCH_FORCE_RDP, so the on-run is reproducible from
+    // committed source instead of a throwaway harness patch (the old stage1-on
+    // log printed "BENCH_FORCE_RDP" but no such symbol existed in the tree).
+#ifdef BENCH_FORCE_RDP
+    n64_use_rdp_renderer = 1;
+    debugf("BENCH: BENCH_FORCE_RDP -> n64_use_rdp_renderer=1\n");
+#else
+    n64_use_rdp_renderer = 0;
+#endif
 #ifdef N64_BENCH_MP
     // MP bench: scripted local split-screen with N64_BENCH_MP players.
     D_SetLocalPlayerCount(N64_BENCH_MP);

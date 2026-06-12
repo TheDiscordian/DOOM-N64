@@ -26,6 +26,29 @@ extern void M_WriteTextScaled(int x, int y, char* string, int num, int den);
 // Discard the first second of rendered frames (level load / cache warm-up).
 #define BENCH_WARMUP_GAMETICS (35 * 1)
 
+// Deterministic virtual tic clock. The shipping tic clock (I_GetTime ->
+// get_ticks_ms) is host wall-clock, so NetUpdate's newtics = elapsed-since-last
+// is lumpy under host jitter: a run that hitches produces tics in 0/2 bursts
+// instead of 1/1, which phase-shifts the scripted input vs the simulation that
+// consumes it and forks the playthrough (a different player path -> a death and
+// level reload in one build, none in another). That is exactly what made
+// drawsegs jump 8->11 and inserted a ~1.2s reload frame between two builds that
+// are byte-identical in the flag-off path. Fix: while the bench is active,
+// I_GetTime() reads this virtual clock instead. It advances a FIXED amount per
+// render-loop iteration so the sim consumes exactly one tic every
+// BENCH_FRAMES_PER_TIC rendered frames, identical on any host. The uncapped+
+// interpolated render path is still fully exercised (multiple rendered frames
+// per tic); only the *tic cadence* is pinned. Sub-tic interpolation phase still
+// reads the wall clock (I_GetTimeUS) -- that only reshuffles which interpolated
+// camera each render frame samples (cosmetic mean-drawseg jitter), never the
+// simulation, so it cannot fork the playthrough.
+#define BENCH_FRAMES_PER_TIC  2
+// Virtual ms per render-loop iteration: TICRATE*ms/1000 must clear one tic every
+// BENCH_FRAMES_PER_TIC iterations. ms_per_tic = 1000/TICRATE; per iter = that /
+// BENCH_FRAMES_PER_TIC. Computed in N64Bench_VirtualTimeMs from an iteration
+// counter so it is exact integer-deterministic (no float, no host clock).
+static uint64_t         bench_virtual_iter;   // render-loop iterations elapsed
+
 // Per-frame cost histogram for a RAM-cheap p95. 64 us per bucket * 4096 =
 // 0..262 ms range, which comfortably brackets N64 frame costs (~14-50 ms).
 #define BENCH_HIST_BUCKETS  4096
@@ -155,9 +178,11 @@ void N64Bench_Init(void)
     cur_vissprites = cur_drawsegs = cur_visplanes = 0;
     outlier_frames = 0;
     outlier_max_us = 0;
+    bench_virtual_iter = 0;
 
-    debugf("BENCH: init, scenario=E1M1 uncapped, target=%d gametics\n",
-           BENCH_GAMETICS);
+    debugf("BENCH: init, scenario=E1M1 uncapped, target=%d gametics, "
+           "frames_per_tic=%d (deterministic virtual tic clock)\n",
+           BENCH_GAMETICS, BENCH_FRAMES_PER_TIC);
 }
 
 int N64Bench_Active(void)
@@ -165,6 +190,36 @@ int N64Bench_Active(void)
     // Forces the uncapped single-player render path in D_DoomLoop. Stays true
     // through DONE so input keeps flowing (idle) and the overlay holds.
     return bench_started;
+}
+
+// Per-render-frame heartbeat: advance the deterministic virtual clock by one
+// "frame" worth of time. Called once per D_DoomLoop iteration AND once per inner
+// present (screen wipe), so any loop that spins waiting on I_GetTime() to
+// advance still terminates -- the clock is driven by frames presented, never by
+// the host wall clock.
+void N64Bench_VirtualTick(void)
+{
+    if (bench_started)
+        bench_virtual_iter++;
+}
+
+// Deterministic replacement for the wall-clock ms used by I_GetTime() while the
+// bench is active. The virtual clock advances ONE frame per N64Bench_VirtualTick
+// and BENCH_FRAMES_PER_TIC frames map to one 35 Hz tic, so NetUpdate's newtics
+// has a fixed host-independent cadence and the scripted playthrough is identical
+// run to run (no spurious death/level-reload fork). Integer math only: no host
+// clock, no float.
+//
+// Crucially this must ALSO be strictly monotonic across the inner spin loops
+// (the screen-wipe melt busy-waits on I_GetTime advancing): every present bumps
+// the frame counter via N64Bench_VirtualTick, so the wipe always makes progress
+// and the level transition can never deadlock the bench.
+uint64_t N64Bench_VirtualTimeMs(void)
+{
+    // ms = frames * 1000 / (TICRATE * FRAMES_PER_TIC). I_GetTime() recomputes
+    // tic = ms*TICRATE/1000 = frames / FRAMES_PER_TIC.
+    return (bench_virtual_iter * 1000ULL) /
+           ((uint64_t)TICRATE * BENCH_FRAMES_PER_TIC);
 }
 
 void N64Bench_FrameBegin(void)
@@ -189,6 +244,16 @@ void N64Bench_FrameEnd(void)
 
     if (bench_phase != BENCH_RUNNING)
         return;                 // warm-up frames not counted
+
+    // Level-reload (death/respawn) frames are not render frames. The per-phase
+    // path (LoopEnd) already excludes them via BENCH_OUTLIER_US, but the
+    // BENCH_RESULT avg_us/min_us/max_us/histogram are a SEPARATE accumulator
+    // that did not -- so one ~1.2 s reload frame alone inflated avg_us by
+    // ~400 us (+2.3 pts of the bogus "+8%") and pinned max_us at ~1.1 s.
+    // Apply the same exclusion here so BENCH_RESULT and the phase report agree
+    // on which frames are real render frames.
+    if (us >= BENCH_OUTLIER_US)
+        return;
 
     rendered_frames++;
     sum_us += us;

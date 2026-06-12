@@ -106,6 +106,30 @@ if [ -z "$RUN_ROM" ]; then
 fi
 [ -f "$RUN_ROM" ] || fail "ROM not found: $RUN_ROM"
 
+# --- guarantee a blank, deterministic save state for this run ----------------
+# ares (AutoSaveMemory: true) writes the cart save next to the ROM when its
+# Paths/Saves is empty -- which is the case in this repo's config -- so the
+# per-run mktemp workdir already gives each run a fresh, blank EEPROM. But a
+# DIFFERENT ares config with a NON-EMPTY Saves path keys the save by ROM
+# basename: every run uses bench.z64, so one run's save would persist into the
+# next and silently drift the A/B scenario (e.g. a saved widescreen/RDP toggle
+# re-applied on the next launch). Make the guarantee config-independent: scrub
+# any pre-existing save for this ROM, in BOTH locations, before launch.
+ROM_BASE="${RUN_ROM%.z64}"          # workdir/bench
+ARES_SAVES_DIR="$(awk '/^  Saves$/{getline; if ($1=="Path") {sub(/^  Path /,""); print; }}' \
+                  "${HOME}/.local/share/ares/settings.bml" 2>/dev/null | head -1)"
+for sav in "${ROM_BASE}".eeprom "${ROM_BASE}".sav "${ROM_BASE}".srm "${ROM_BASE}".flash; do
+    rm -f "$sav" 2>/dev/null
+done
+if [ -n "$ARES_SAVES_DIR" ] && [ -d "$ARES_SAVES_DIR" ]; then
+    rm -f "${ARES_SAVES_DIR%/}/bench".eeprom \
+          "${ARES_SAVES_DIR%/}/bench".sav \
+          "${ARES_SAVES_DIR%/}/bench".srm \
+          "${ARES_SAVES_DIR%/}/bench".flash 2>/dev/null
+    echo "[bench] cleared stale saves in $ARES_SAVES_DIR" >&2
+fi
+echo "[bench] save state: blank EEPROM guaranteed (workdir is fresh per run)" >&2
+
 # --- launch ares in its own process group, stdout -> log ---------------------
 echo "[bench] launching ares (timeout ${TIMEOUT}s)" >&2
 # setsid makes the launched process a new session+group leader, so its PID is
