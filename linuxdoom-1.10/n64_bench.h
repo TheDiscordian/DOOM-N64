@@ -49,6 +49,7 @@ typedef enum
     BPH_MASKED_EMIT,   // RDP renderer: sprite/masked emit (~0 until sprites move to RDP)
     BPH_DL_BUILD,      // RDP renderer: DL_Flush list build/upload (~0 until DL exists)
     BPH_RDP_BUSY,      // RDP renderer: async RDP busy window read at frame top (~0 until RDP draws the world)
+    BPH_KEY_CLEAR,     // RDP renderer: temporary view-window key-clear (~0 unless the flag is on)
     BPH_HUD,           // D_Display work outside the 3D view (status bar/HUD/border/menu)
     BPH_PRESENT,       // I_FinishUpdate (page flip / buffer-busy spin)
     BPH_AUDIO,         // S_UpdateSounds + I_SubmitSound (post-display)

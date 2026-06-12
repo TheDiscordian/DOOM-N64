@@ -871,6 +871,14 @@ void D_DoomLoop (void)
 	
     I_InitGraphics ();
 
+#ifdef N64
+    // RDP renderer (Stage 1+): reserve the transparency-key palette index by
+    // scanning the UI/status-bar/font/menu patch lumps. The WAD is fully loaded
+    // by now (W_InitMultipleFiles ran in D_DoomMain), so the scan sees every
+    // UI graphic. Run once, before the first present packs the TLUT.
+    I_N64ScanTransparencyKey ();
+#endif
+
     while (1)
     {
 	// frame syncronous IO operations

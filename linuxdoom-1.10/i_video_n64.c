@@ -12,6 +12,10 @@
 #include "i_system.h"
 #include "i_video.h"
 #include "v_video.h"
+#include "r_defs.h"
+#include "m_swap.h"
+#include "w_wad.h"
+#include "z_zone.h"
 #include "n64_debug.h"
 
 // Rebase hooks for code that caches a screens[0]-derived pointer across frames.
@@ -30,6 +34,15 @@ static volatile boolean doom_screen8_rdp_busy[N64_CI8_BUFFERS];
 static surface_t* doom_screen8_disp[N64_CI8_BUFFERS]; // framebuffer to show per buffer
 static int n64_draw_idx;                 // CI8 buffer the CPU draws into (== screens[0])
 static boolean n64_palette_dirty;        // TLUT needs re-upload
+
+// Transparent-key overlay model (RDP renderer, Stage 1+). One palette index is
+// reserved as the transparency key: its TLUT entry is forced to alpha=0 (every
+// other entry stays alpha=1), so the present blit's COPY-mode alpha-compare
+// discards key-index pixels in the 3D-view window and reveals the RDP-drawn
+// world underneath. The index is chosen at startup so no UI/HUD/status/font/
+// menu patch drawn outside the 3D view uses it (I_N64ScanTransparencyKey). -1
+// until the scan runs; the scan asserts if no index is free.
+int n64_rdp_key_index = -1;
 boolean n64_present_copy_forward;        // wipe: copy presented frame into next draw buffer
 static byte* n64_aux_screens[3];
 static boolean n64_aux_screen_owned[3];
@@ -725,11 +738,184 @@ static void I_N64BufferDone(void* arg)
     doom_screen8_rdp_busy[idx] = false;
 }
 
+// Mark every palette index a single patch lump touches. The lump is decoded as
+// a patch (column posts); a malformed lump (bogus width/height/offset) is
+// skipped rather than trusted, so a non-patch lump that happens to match a UI
+// name prefix can never corrupt the scan.
+static void I_N64MarkPatchIndices(int lumpnum, boolean used[256])
+{
+    patch_t* patch;
+    int lumplen;
+    int w;
+    int col;
+
+    lumplen = W_LumpLength(lumpnum);
+    if (lumplen < 8)
+        return;
+
+    patch = (patch_t*)W_CacheLumpNum(lumpnum, PU_CACHE);
+    if (!patch)
+        return;
+
+    w = SHORT(patch->width);
+    if (w <= 0 || w > 4096 || SHORT(patch->height) <= 0 || SHORT(patch->height) > 4096)
+        return;
+    // columnofs[] must fit inside the lump (header is 8 bytes + w longs).
+    if ((size_t)lumplen < 8 + (size_t)w * 4)
+        return;
+
+    for (col = 0; col < w; col++)
+    {
+        int ofs = LONG(patch->columnofs[col]);
+        column_t* column;
+
+        if (ofs < 0 || ofs >= lumplen)
+            return;                         // corrupt: abandon this lump
+
+        column = (column_t*)((byte*)patch + ofs);
+
+        while (column->topdelta != 0xff)
+        {
+            byte* source = (byte*)column + 3;
+            int count = column->length;
+            int i;
+
+            // Post body must stay inside the lump.
+            if ((byte*)source + count > (byte*)patch + lumplen)
+                return;
+
+            for (i = 0; i < count; i++)
+                used[source[i]] = true;
+
+            column = (column_t*)((byte*)column + column->length + 4);
+            if ((byte*)column >= (byte*)patch + lumplen)
+                return;
+        }
+    }
+}
+
+// Pick the transparency-key palette index (RDP renderer, Stage 1+). Scans every
+// UI/status-bar/font/menu patch lump drawn OUTSIDE the 3D view (the ST*, M_*,
+// and WI* graphic families), marks the palette indices they use, and reserves
+// the highest index none of them touch. Reserving a HIGH index matches the
+// design's expectation that UI art rarely touches the top of PLAYPAL. Asserts
+// if every index is in use. Called once at startup, after the WAD is loaded.
+void I_N64ScanTransparencyKey(void)
+{
+    static const char* const ui_prefixes[] = { "ST", "M_", "WI" };
+    boolean used[256];
+    int lump;
+    int p;
+    int idx;
+
+    if (n64_rdp_key_index >= 0)
+        return;                             // already chosen
+
+    memset(used, 0, sizeof(used));
+
+    for (lump = 0; lump < numlumps; lump++)
+    {
+        const char* name = lumpinfo[lump].name;
+
+        for (p = 0; p < (int)(sizeof(ui_prefixes) / sizeof(ui_prefixes[0])); p++)
+        {
+            size_t plen = strlen(ui_prefixes[p]);
+            if (strncmp(name, ui_prefixes[p], plen) == 0)
+            {
+                I_N64MarkPatchIndices(lump, used);
+                break;
+            }
+        }
+    }
+
+    // Prefer the highest free index (UI art rarely uses the top of PLAYPAL).
+    for (idx = 255; idx >= 0; idx--)
+    {
+        if (!used[idx])
+        {
+            n64_rdp_key_index = idx;
+            N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d\n", idx);
+            // If the flag is already on at boot (persisted in EEPROM), the
+            // master TLUT may have been packed before the key was known, so
+            // apply the key's alpha=0 now and mark dirty for the next present.
+            I_N64MarkPaletteDirty();
+            return;
+        }
+    }
+
+    // Fallback: every UI patch uses every palette index (effectively
+    // impossible for DOOM art). Reserve 255 anyway so the renderer stays
+    // functional; the assert documents the invariant.
+    I_Error("I_N64ScanTransparencyKey: no free palette index for transparency key");
+}
+
+// Temporary Stage-1 scaffolding: fill the 3D-view region of the CI8 draw buffer
+// with the transparency-key index, in batched 64-bit stores. With the flag on,
+// the software renderer then overwrites every view pixel, so nothing is keyed
+// out yet -- this only proves the mechanism is harmless before world geometry
+// moves to the RDP. Removed in the final stage (event-driven erase-to-key).
+void I_N64KeyClearView(void)
+{
+    byte* base;
+    int key;
+    uint64_t pattern;
+    int x0, x1, y0, y1;
+    int y;
+
+    if (n64_rdp_key_index < 0)
+        return;
+    if (!screens[0])
+        return;
+
+    key = n64_rdp_key_index;
+    pattern = (uint64_t)((uint8_t)key);
+    pattern |= pattern << 8;
+    pattern |= pattern << 16;
+    pattern |= pattern << 32;
+
+    // 3D-view window in CI8 screen coordinates (see R_InitBuffer).
+    x0 = viewwindowx;
+    y0 = viewwindowy;
+    x1 = viewwindowx + scaledviewwidth;
+    y1 = viewwindowy + viewheight;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > SCREENWIDTH)  x1 = SCREENWIDTH;
+    if (y1 > SCREENHEIGHT) y1 = SCREENHEIGHT;
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    base = screens[0] + y0 * SCREENWIDTH;
+
+    for (y = y0; y < y1; y++)
+    {
+        byte* row = base + x0;
+        byte* end = base + x1;
+
+        // Align the run to 8 bytes, then store 64 bits at a time (the same
+        // uncached-RDRAM batching the span renderer uses, r_draw.c:731-784).
+        while (((uintptr_t)row & 7) && row < end)
+            *row++ = (byte)key;
+
+        while (row + 8 <= end)
+        {
+            *(uint64_t*)row = pattern;
+            row += 8;
+        }
+
+        while (row < end)
+            *row++ = (byte)key;
+
+        base += SCREENWIDTH;
+    }
+}
+
 void I_FinishUpdate(void)
 {
     surface_t* disp;
     uint64_t now_ms;
     int next_idx;
+    boolean rdp_on;
 
     if (!video_initialized)
         return;
@@ -749,8 +935,48 @@ void I_FinishUpdate(void)
     if (!disp)
         return;
 
+    rdp_on = (n64_use_rdp_renderer != 0);
+
     rdpq_attach(disp, NULL);
-    rdpq_set_mode_copy(false);
+
+    // World-render seam (RDP renderer). When the flag is on, the world pass
+    // draws the 3D view directly into the 16bpp display fb, scissored to the
+    // view window, BEFORE the overlay blit and in the SAME rspq stream -- this
+    // is the seam later stages emit walls/planes/sprites into. It sits AFTER
+    // the menu present-pacing early-return above so a paced menu frame never
+    // drains a half-built world list. In Stage 1 the view is still 100%
+    // software-rendered into the CI8 buffer, so the world pass has nothing to
+    // draw: the plumbing exists (attach + standard mode + view scissor) but
+    // emits no geometry. rdpq_attach already set a full-screen scissor, so we
+    // reset it back to full screen before the overlay blit below.
+    if (rdp_on)
+    {
+        int vx0 = viewwindowx;
+        int vy0 = viewwindowy;
+        int vx1 = viewwindowx + scaledviewwidth;
+        int vy1 = viewwindowy + viewheight;
+
+        if (vx0 < 0) vx0 = 0;
+        if (vy0 < 0) vy0 = 0;
+        if (vx1 > SCREENWIDTH)  vx1 = SCREENWIDTH;
+        if (vy1 > SCREENHEIGHT) vy1 = SCREENHEIGHT;
+
+        if (vx1 > vx0 && vy1 > vy0)
+        {
+            rdpq_set_mode_standard();
+            rdpq_set_scissor(vx0, vy0, vx1, vy1);
+            // (Stage 1: nothing to draw -- the software path filled the view.)
+            rdpq_set_scissor(0, 0, SCREENWIDTH, SCREENHEIGHT);
+        }
+    }
+
+    // Overlay blit. With the flag on, COPY mode's transparency=true enables
+    // alpha-compare so the alpha-0 key index is discarded (the view-window
+    // world drawn above shows through); with the flag off, transparency=false
+    // keeps the present byte-identical to before. COPY-mode alpha-compare is
+    // valid here because the present target is the 16bpp display fb
+    // (rdpq_mode.h:328-330,335).
+    rdpq_set_mode_copy(rdp_on);
     rdpq_mode_tlut(TLUT_RGBA16);
     // Palette area of TMEM (upper half) is only ever written by this blit path,
     // and a CI8 blit only loads texels into the lower half, so the TLUT
@@ -765,7 +991,8 @@ void I_FinishUpdate(void)
         n64_palette_dirty = false;
     }
     // The CI8 source covers the entire 320x200 display, so attach (no clear)
-    // is sufficient -- the blit overwrites every pixel.
+    // is sufficient -- the blit overwrites every pixel (except, with the flag
+    // on, the alpha-0 key pixels keyed out by alpha-compare).
     rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
 
     // Detach with a completion callback instead of a global rspq_wait(): the
@@ -805,6 +1032,7 @@ void I_ReadScreen(byte* scr)
 void I_SetPalette(byte* palette)
 {
     int i;
+    int key = (n64_use_rdp_renderer != 0) ? n64_rdp_key_index : -1;
 
     for (i = 0; i < 256; i++)
     {
@@ -812,14 +1040,41 @@ void I_SetPalette(byte* palette)
         uint8_t g = gammatable[usegamma][palette[1]];
         uint8_t b = gammatable[usegamma][palette[2]];
 
+        // Alpha bit is 1 for every entry (opaque) so the present blit writes it.
+        // EXCEPTION: with the RDP renderer on, the reserved transparency-key
+        // index gets alpha=0 in EVERY palette variant (damage/pickup/invuln
+        // swaps preserve the key), so the present's COPY-mode alpha-compare
+        // discards it and the world drawn in the 16bpp fb shows through. With
+        // the flag off, every entry keeps alpha=1 -- byte-identical to before.
+        uint16_t alpha = (i == key) ? 0 : 1;
+
         doom_tlut_master[i] = (uint16_t)(((r >> 3) << 11) |
                                          ((g >> 3) << 6) |
                                          ((b >> 3) << 1) |
-                                         1);
+                                         alpha);
 
         palette += 3;
     }
 
+    n64_palette_dirty = true;
+}
+
+// The renderer toggle changes the key index's TLUT alpha bit (see I_SetPalette),
+// so the menu must re-upload the TLUT after flipping the flag. I_SetPalette is
+// not necessarily called again before the next present (a static scene with no
+// flash), so patch the key entry's alpha directly in the already-packed master
+// here, then mark dirty so the present re-uploads it. Cheap: one entry + one
+// 256-entry upload.
+void I_N64MarkPaletteDirty(void)
+{
+    if (n64_rdp_key_index >= 0)
+    {
+        uint16_t* e = &doom_tlut_master[n64_rdp_key_index];
+        if (n64_use_rdp_renderer != 0)
+            *e &= ~(uint16_t)1;     // key: alpha = 0 (keyed out by alpha-compare)
+        else
+            *e |= (uint16_t)1;      // restore opaque (byte-identical to before)
+    }
     n64_palette_dirty = true;
 }
 

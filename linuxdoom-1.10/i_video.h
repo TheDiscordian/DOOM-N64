@@ -77,6 +77,21 @@ void I_N64GetLocalInputState(int player_index, n64_local_input_t* out_state);
 void I_N64SplitScreenBeginFrame(int player_count);
 void I_N64SplitScreenEndFrame(void);
 int I_N64GetActiveGameplayPort(void);
+
+// RDP renderer (Stage 1+). Reserve the transparency-key palette index by
+// scanning the UI/status-bar/font/menu patch lumps; call once at startup after
+// the WAD is loaded. n64_rdp_key_index holds the result (-1 until scanned).
+void I_N64ScanTransparencyKey(void);
+extern int n64_rdp_key_index;
+
+// Force a TLUT re-upload on the next present (used by the renderer toggle,
+// which changes the key index's alpha bit).
+void I_N64MarkPaletteDirty(void);
+
+// Key-clear the 3D-view region of the CI8 draw buffer to the transparency-key
+// index (Stage-1 scaffolding; no-op until the key is reserved). Called at the
+// view-render entry when the RDP renderer is on.
+void I_N64KeyClearView(void);
 #endif
 
 

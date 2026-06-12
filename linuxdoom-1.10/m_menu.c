@@ -1137,6 +1137,10 @@ void M_ChangeRenderer(int choice)
 {
     choice = 0;
     n64_use_rdp_renderer = 1 - n64_use_rdp_renderer;
+    // The flag changes the transparency-key index's TLUT alpha bit, so the
+    // present must re-upload the palette with the new key alpha (and the
+    // present blit switches between COPY-transparency on/off).
+    I_N64MarkPaletteDirty();
 }
 
 

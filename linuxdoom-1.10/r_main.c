@@ -41,6 +41,9 @@ static const char rcsid[] = "$Id: r_main.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
 #include "r_sky.h"
 
 #include "doomstat.h"
+#ifdef N64
+#include "i_video.h"
+#endif
 
 #ifdef N64_BENCH
 #include "n64_bench.h"
@@ -988,11 +991,31 @@ void R_RenderPlayerView (player_t* player)
     R_SetupFrame (player);
 
     // RDP renderer dispatch (kill-switch). n64_use_rdp_renderer selects the
-    // RDP-rasterized path over the software colfunc/spanfunc fill. The RDP
-    // path is built up stage by stage; in this stage it is not yet wired, so
-    // both settings render through the unchanged software path below and the
-    // visible result is identical regardless of the flag.
-    (void)n64_use_rdp_renderer;
+    // RDP-rasterized path over the software colfunc/spanfunc fill. The world
+    // pass is built up stage by stage; in this stage the view is still 100%
+    // software-rendered into the CI8 buffer, so the visible result is identical
+    // regardless of the flag.
+    //
+    // Stage-1 scaffolding: with the flag on, key-clear the 3D-view region of
+    // the CI8 buffer to the transparency-key index BEFORE the software renderer
+    // fills it. The software path then overwrites every view pixel, so the
+    // present's alpha-compare keys out nothing and the output stays identical.
+    // This proves the key-clear + transparent-key compositing is harmless
+    // before any world geometry moves to the RDP. The clear lands in its own
+    // named bench phase (KEY_CLEAR) so its cost is visible. Removed in the
+    // final stage when view-window CI8 writes become event-driven erase-to-key.
+#ifdef N64
+    if (n64_use_rdp_renderer)
+    {
+#ifdef N64_BENCH
+        N64Bench_PhaseBegin(BPH_KEY_CLEAR);
+#endif
+        I_N64KeyClearView();
+#ifdef N64_BENCH
+        N64Bench_PhaseEnd(BPH_KEY_CLEAR);
+#endif
+    }
+#endif
 
     // Clear buffers.
     R_ClearClipSegs ();

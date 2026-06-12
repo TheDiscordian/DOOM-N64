@@ -274,15 +274,18 @@ void N64Bench_DisplayEnd(void)
     if (!loop_open)
         return;
     // All in raw ticks (no divide); HUD = display wall minus the in-view
-    // render phases and the present. BSP_WALK+SEG_RASTER together replace the
-    // old single BSP phase. The RDP renderer's emit phases (PLANE_EMIT/
-    // MASKED_EMIT) are nested inside PLANES/MASKED and DL_BUILD/RDP_BUSY are ~0
-    // in this stage, so they are not subtracted here (doing so would
-    // double-count once they carry real time).
+    // render phases, the key-clear, and the present. BSP_WALK+SEG_RASTER
+    // together replace the old single BSP phase. KEY_CLEAR is a standalone
+    // bracket at the view-render entry (not nested in another subtracted
+    // phase), so it is subtracted here -- otherwise its cost would leak into
+    // HUD. The RDP renderer's emit phases (PLANE_EMIT/MASKED_EMIT) are nested
+    // inside PLANES/MASKED and DL_BUILD/RDP_BUSY are ~0 in this stage, so they
+    // are not subtracted here (doing so would double-count once they carry
+    // real time).
     display_tk = (uint32_t)(get_ticks() - display_start_ticks);
     inside_tk = cur_phase_tk[BPH_BSP_WALK] + cur_phase_tk[BPH_SEG_RASTER]
               + cur_phase_tk[BPH_PLANES] + cur_phase_tk[BPH_MASKED]
-              + cur_phase_tk[BPH_PRESENT];
+              + cur_phase_tk[BPH_KEY_CLEAR] + cur_phase_tk[BPH_PRESENT];
     cur_phase_tk[BPH_HUD] = (display_tk > inside_tk) ? (display_tk - inside_tk) : 0;
 }
 
@@ -428,7 +431,7 @@ static unsigned long N64Bench_Percentile(int pct)
 static const char* const bench_phase_name[BPH_COUNT] =
 {
     "gametic", "bsp_walk", "seg_rast", "planes", "masked",
-    "plnemit", "mskemit", "dlbuild", "rdpbusy",
+    "plnemit", "mskemit", "dlbuild", "rdpbusy", "keyclr",
     "hud", "present", "audio"
 };
 
@@ -634,7 +637,7 @@ static void N64Bench_ReportPhases(void)
         for (p = 0; p < BPH_COUNT; p++) acc += f->phase_us[p];
         debugf("BENCH_WORST rank=%lu frame=%lu total_us=%lu "
                "gametic=%lu bsp_walk=%lu seg_rast=%lu planes=%lu masked=%lu "
-               "plnemit=%lu mskemit=%lu dlbuild=%lu rdpbusy=%lu "
+               "plnemit=%lu mskemit=%lu dlbuild=%lu rdpbusy=%lu keyclr=%lu "
                "hud=%lu present=%lu audio=%lu leftover=%lu "
                "viss=%u ds=%u vp=%u tic=%u\n",
                i + 1, worst_idx[i], (unsigned long)f->total_us,
@@ -647,6 +650,7 @@ static void N64Bench_ReportPhases(void)
                (unsigned long)f->phase_us[BPH_MASKED_EMIT],
                (unsigned long)f->phase_us[BPH_DL_BUILD],
                (unsigned long)f->phase_us[BPH_RDP_BUSY],
+               (unsigned long)f->phase_us[BPH_KEY_CLEAR],
                (unsigned long)f->phase_us[BPH_HUD],
                (unsigned long)f->phase_us[BPH_PRESENT],
                (unsigned long)f->phase_us[BPH_AUDIO],
