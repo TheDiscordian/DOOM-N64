@@ -869,24 +869,69 @@ static void I_N64MarkWorldArtIndices(boolean used[256])
     }
 }
 
+// Expand a raw world-art index set into the set of bytes those indices can
+// actually put ON SCREEN. Every world pixel write goes through a colormap
+// (`*dest = colormap[source[...]]`, r_draw.c) -- walls, flats, sprites AND the
+// CPU-drawn psprites -- so the framebuffer byte is COLORMAP[level][raw], for
+// any of the lump's maps (32 light levels + the invuln inverse map + the spare
+// 34th). The raw lump byte itself never reaches the framebuffer. A key chosen
+// "absent from raw world art" can therefore still collide on screen: e.g. raw
+// index 16 (bright red, blood/fireballs/imp art) maps to 255 at light levels
+// 11..13, so a key of 255 punched holes in software-drawn sprites inside the
+// keyed box. The key must be absent from the colormap OUTPUT closure.
+static void I_N64MarkColormapOutputs(const boolean raw_used[256],
+                                     boolean out_used[256])
+{
+    const byte* cmap;
+    int lumpnum, nmaps, l, i;
+
+    lumpnum = W_CheckNumForName("COLORMAP");
+    cmap = (lumpnum >= 0) ? (const byte*)W_CacheLumpNum(lumpnum, PU_CACHE)
+                          : NULL;
+    if (!cmap)
+    {
+        // No COLORMAP (cannot happen for a valid IWAD): conservatively treat
+        // every raw index as its own output so the caller still gets a set.
+        for (i = 0; i < 256; i++)
+            if (raw_used[i])
+                out_used[i] = true;
+        return;
+    }
+
+    nmaps = W_LumpLength(lumpnum) / 256;
+    for (i = 0; i < 256; i++)
+    {
+        if (!raw_used[i])
+            continue;
+        for (l = 0; l < nmaps; l++)
+            out_used[cmap[l * 256 + i]] = true;
+    }
+}
+
 // Pick the transparency-key palette index (RDP renderer, Stage 1+). Scans every
 // UI/status-bar/font/menu patch lump drawn OUTSIDE the 3D view (the ST*, M_*,
 // and WI* graphic families) AND all world art (wall patches, sprites, flats),
-// marks the palette indices they use, and reserves the highest index unused by
-// BOTH sets -- so the key is provably absent from opaque world art and the
-// present blit's alpha-compare can never punch a hole in software-rendered
-// world pixels. If no index is free of both (palette-saturated WAD), fall back
-// to the highest index free of UI art only (the original Stage-1 behaviour) so
-// the renderer stays functional; the present seam's bbox-scissored keying still
-// confines any residual exposure to the routed seg's box. Reserving a HIGH index
-// matches the design's expectation that UI art rarely touches the top of
-// PLAYPAL. Asserts only if even the UI-only set leaves no index free. Called
-// once at startup, after the WAD is loaded.
+// and reserves the highest index absent from BOTH (a) the raw UI bytes (UI is
+// drawn un-colormapped, so its lump bytes ARE its screen bytes) and (b) the
+// COLORMAP-OUTPUT closure of the world-art bytes (world pixels reach the screen
+// only through a colormap -- see I_N64MarkColormapOutputs; scanning raw world
+// bytes alone is provably wrong, the gate-round key 255 collided with the
+// colormapped red ramp and punched sprite pixels). With the key absent from
+// every byte the screen can hold inside the view, the present blit's
+// alpha-compare can never punch a hole in software-rendered pixels.
+// Belt-and-suspenders with the present seam's bbox-scissored keying. If no
+// index survives the closure (palette-saturated WAD), fall back to raw-world +
+// UI, then UI-only, in that order -- functional but with documented residual
+// risk confined to the keyed box. Reserving a HIGH index matches the design's
+// expectation that UI art rarely touches the top of PLAYPAL. Asserts only if
+// even the UI-only set leaves no index free. Called once at startup, after the
+// WAD is loaded.
 void I_N64ScanTransparencyKey(void)
 {
     static const char* const ui_prefixes[] = { "ST", "M_", "WI" };
     boolean ui_used[256];
-    boolean all_used[256];
+    boolean world_raw[256];
+    boolean used[256];
     int lump;
     int p;
     int idx;
@@ -911,19 +956,40 @@ void I_N64ScanTransparencyKey(void)
         }
     }
 
-    // all_used = ui_used + world art.
-    memcpy(all_used, ui_used, sizeof(all_used));
-    I_N64MarkWorldArtIndices(all_used);
+    memset(world_raw, 0, sizeof(world_raw));
+    I_N64MarkWorldArtIndices(world_raw);
 
-    // Prefer the highest index unused by BOTH UI and world art (provably hole-
-    // free); fall back to UI-only if the palette is saturated by world art.
+    // used = raw UI bytes + colormap-output closure of raw world bytes: the
+    // complete set of bytes a level-play screen can contain.
+    memcpy(used, ui_used, sizeof(used));
+    I_N64MarkColormapOutputs(world_raw, used);
+
     for (idx = 255; idx >= 0; idx--)
     {
-        if (!all_used[idx])
+        if (!used[idx])
         {
             n64_rdp_key_index = idx;
             N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d "
-                       "(UI+world-art free)\n", idx);
+                       "(UI + world colormap-output free)\n", idx);
+            I_N64MarkPaletteDirty();
+            return;
+        }
+    }
+
+    // Fallback 1: raw world + UI (the pre-closure criterion). Reachable only
+    // on a WAD whose art saturates the colormap output space.
+    memcpy(used, ui_used, sizeof(used));
+    for (idx = 0; idx < 256; idx++)
+        if (world_raw[idx])
+            used[idx] = true;
+    for (idx = 255; idx >= 0; idx--)
+    {
+        if (!used[idx])
+        {
+            n64_rdp_key_index = idx;
+            N64_DEBUGF("I_N64ScanTransparencyKey: reserved key index %d "
+                       "(raw-world+UI free only; colormap outputs saturate -- "
+                       "bbox keying confines residual exposure)\n", idx);
             I_N64MarkPaletteDirty();
             return;
         }

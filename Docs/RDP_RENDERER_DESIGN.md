@@ -527,7 +527,15 @@ byte-for-byte.
 palette index is reserved as the **transparency key**. At startup, after PLAYPAL load, scan the
 UI/status-bar/font/menu patch lumps actually drawn *outside* the 3D view and pick an index none of
 them use (**assert if none free**; likely candidates sit near the end of PLAYPAL — the high indices
-that DOOM's UI art rarely touches). The TLUT builder (`I_SetPalette`, the per-entry RGBA5551 pack at
+that DOOM's UI art rarely touches). **Key-selection domain (CORRECTED, Stage-2 fix round): the scan
+must test the bytes the SCREEN can hold, not the raw lump bytes.** World art (walls, flats, sprites
+**and the CPU-drawn psprites**) reaches the framebuffer only through a colormap
+(`*dest = colormap[source[...]]`), so the relevant world set is the **COLORMAP-output closure** of
+the raw world bytes over all 34 maps (32 light levels + invuln inverse + spare); UI art is drawn
+un-colormapped, so its raw bytes stand. DOOM1 counter-example that shipped: index 255 is absent
+from every raw world lump but `COLORMAP[11..13][16]` (the bright-red blood/fireball ramp) **outputs
+255**, so a key of 255 alpha-punched software-drawn sprite pixels inside the keyed box. The correct
+DOOM1 key under the closure is 251. The TLUT builder (`I_SetPalette`, the per-entry RGBA5551 pack at
 `i_video_n64.c:815-818`) sets **alpha=0** for the key index in EVERY uploaded palette variant — so
 damage/pickup/invuln palette swaps preserve the key — while every other entry keeps alpha=1. The
 present blit runs `rdpq_set_mode_copy(true)`, whose alpha-compare discards the alpha-0 key pixels
