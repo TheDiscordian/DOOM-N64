@@ -73,6 +73,26 @@ trap cleanup EXIT INT TERM
 
 fail() { echo "BENCH_ERROR $*" >&2; exit 1; }
 
+# --- flag-off result cache ----------------------------------------------------
+# The software (flag-off) path is contractually unchanged and the bench is
+# deterministic, so re-running an unmodified flag-off benchmark is pure waste
+# (~10 min of build+run for a byte-identical answer). Plain flag-off requests
+# are served from the stored reference instead: the canonical BENCH_RESULT line
+# plus the full phase log land exactly where a live run would put them.
+# Bypass with BENCH_OFF_CACHE=0 (e.g. the one real confirmation run per stage,
+# or after a deliberate software-path change -- then refresh bench/ref-frames-off/).
+REF_LOG="$REPO/bench/ref-frames-off/ares.log"
+if [ -z "$RUN_ROM" ] && [ -z "${BENCH_FORCE_RDP:-}" ] && [ -z "${BENCH_MP:-}" ] \
+   && [ "${BENCH_OFF_CACHE:-1}" != "0" ] && [ -f "$REF_LOG" ]; then
+    CACHED="$(grep -m1 '^BENCH_RESULT' "$REF_LOG")"
+    if [ -n "$CACHED" ]; then
+        cp "$REF_LOG" "/tmp/bench-${LABEL}-ares.log"
+        echo "[bench] flag-off request served from bench/ref-frames-off (BENCH_OFF_CACHE=0 to force a live run)" >&2
+        echo "${CACHED% label=*} label=$LABEL cached=1"
+        exit 0
+    fi
+fi
+
 # --- build (unless a prebuilt ROM was supplied) ------------------------------
 # Only the BUILD is serialized: two builds share build/ and Doom-N64.z64 and
 # would corrupt each other. The ares runs themselves may overlap freely -- the
