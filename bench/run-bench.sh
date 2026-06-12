@@ -142,37 +142,6 @@ setsid stdbuf -oL "$ARES" --system "Nintendo 64" "$RUN_ROM" >"$ARES_LOG" 2>&1 &
 LAUNCH_PID=$!
 ARES_PGID="$LAUNCH_PID"
 
-# Query OUR ares window (pgid-matched -- never another run's or the user's).
-# Prints: <address> <workspace-name> <x>,<y> <w>x<h>
-our_window() {
-    hyprctl clients -j 2>/dev/null | python3 -c "
-import json,sys,subprocess
-pids={int(p) for p in subprocess.run(['pgrep','-g','$ARES_PGID'],capture_output=True,text=True).stdout.split()}
-for c in json.load(sys.stdin):
-    if c.get('pid') in pids:
-        x,y=c['at']; w,h=c['size']
-        print(c['address'], c['workspace']['name'], f'{x},{y}', f'{w}x{h}'); break
-" 2>/dev/null
-}
-
-# Agent emulator windows stay off the user's visible workspace: move ours to
-# the special:doombench workspace as soon as it maps. ARES_VISIBLE=1 opts out.
-hide_window() {
-    [ -z "${ARES_VISIBLE:-}" ] || return 0
-    command -v hyprctl >/dev/null 2>&1 || return 0
-    local i win
-    for i in $(seq 1 30); do
-        win="$(our_window)"
-        if [ -n "$win" ]; then
-            hyprctl dispatch movetoworkspacesilent "special:doombench,address:${win%% *}" >/dev/null 2>&1
-            echo "[bench] ares window hidden (special:doombench)" >&2
-            return 0
-        fi
-        sleep 0.5
-    done
-}
-hide_window &
-
 # --- wait for the BENCH_RESULT line (or hard timeout) ------------------------
 # Fail fast instead of burning the whole TIMEOUT:
 #  - a crashed ROM prints its assert/exception to the ISViewer log immediately
@@ -213,25 +182,16 @@ done
 
 # --- screenshot fallback (the overlay is frozen, so timing is forgiving) ------
 if [ -z "$RESULT" ] && command -v grim >/dev/null 2>&1 && command -v hyprctl >/dev/null 2>&1; then
-    WIN="$(our_window)"
-    if [ -n "$WIN" ]; then
-        WS="$(echo "$WIN" | awk '{print $2}')"
-        SUMMONED=""
-        # A window on the hidden special workspace is not composited -- summon
-        # it just long enough to capture, then put it back.
-        if [ "${WS#special}" != "$WS" ]; then
-            hyprctl dispatch togglespecialworkspace doombench >/dev/null 2>&1
-            SUMMONED=1
-            sleep 0.7
-            WIN="$(our_window)"
-        fi
-        GEO="$(echo "$WIN" | awk '{print $3" "$4}')"
+    GEO="$(hyprctl clients -j 2>/dev/null | python3 -c '
+import json,sys
+for c in json.load(sys.stdin):
+    if "ares" in c.get("class","").lower():
+        x,y=c["at"]; w,h=c["size"]; print(f"{x},{y} {w}x{h}"); break
+' 2>/dev/null)"
+    if [ -n "$GEO" ]; then
         grim -g "$GEO" "$WORKDIR/overlay.png" 2>/dev/null \
             && cp "$WORKDIR/overlay.png" "$REPO/bench/last-overlay.png" \
             && echo "[bench] no ISViewer result; saved overlay screenshot -> bench/last-overlay.png" >&2
-        if [ -n "$SUMMONED" ]; then
-            hyprctl dispatch togglespecialworkspace doombench >/dev/null 2>&1
-        fi
     fi
 fi
 

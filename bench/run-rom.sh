@@ -61,56 +61,20 @@ setsid stdbuf -oL "$ARES" --system "Nintendo 64" "$ROM" >"$LOG" 2>&1 &
 ARES_PGID=$!
 echo "[run-rom] ares pgid=$ARES_PGID log=$LOG (timeout ${TIMEOUT}s, wait_for=$WAIT_FOR)" >&2
 
-# Query OUR ares window (pgid-matched -- never another run's or the user's).
-# Prints: <address> <workspace-name> <x>,<y> <w>x<h>
-our_window() {
-    hyprctl clients -j 2>/dev/null | python3 -c "
+shot() {
+    [ -n "$SCREENSHOT" ] || return 0
+    command -v grim >/dev/null 2>&1 && command -v hyprctl >/dev/null 2>&1 || return 0
+    local geo
+    geo="$(hyprctl clients -j 2>/dev/null | python3 -c "
 import json,sys,subprocess
 pids={int(p) for p in subprocess.run(['pgrep','-g','$ARES_PGID'],capture_output=True,text=True).stdout.split()}
 for c in json.load(sys.stdin):
     if c.get('pid') in pids:
-        x,y=c['at']; w,h=c['size']
-        print(c['address'], c['workspace']['name'], f'{x},{y}', f'{w}x{h}'); break
-" 2>/dev/null
-}
-
-# Agent emulator windows stay off the user's visible workspace: move ours to
-# the special:doombench workspace as soon as it maps. ARES_VISIBLE=1 opts out.
-hide_window() {
-    [ -z "${ARES_VISIBLE:-}" ] || return 0
-    command -v hyprctl >/dev/null 2>&1 || return 0
-    local i win
-    for i in $(seq 1 30); do
-        win="$(our_window)"
-        if [ -n "$win" ]; then
-            hyprctl dispatch movetoworkspacesilent "special:doombench,address:${win%% *}" >/dev/null 2>&1
-            echo "[run-rom] ares window hidden (special:doombench)" >&2
-            return 0
-        fi
-        sleep 0.5
-    done
-}
-hide_window &
-
-shot() {
-    [ -n "$SCREENSHOT" ] || return 0
-    command -v grim >/dev/null 2>&1 && command -v hyprctl >/dev/null 2>&1 || return 0
-    local win addr ws geo summoned=""
-    win="$(our_window)" || true
-    [ -n "$win" ] || return 0
-    addr="${win%% *}"; ws="$(echo "$win" | awk '{print $2}')"; geo="$(echo "$win" | awk '{print $3" "$4}')"
-    # A window on a hidden special workspace is not composited -- summon it
-    # just long enough to capture, then put it back.
-    if [ "${ws#special}" != "$ws" ]; then
-        hyprctl dispatch togglespecialworkspace doombench >/dev/null 2>&1
-        summoned=1
-        sleep 0.7
-        win="$(our_window)"; geo="$(echo "$win" | awk '{print $3" "$4}')"
-    fi
-    grim -g "$geo" "$SCREENSHOT" 2>/dev/null \
-        && echo "[run-rom] screenshot -> $SCREENSHOT" >&2
-    if [ -n "$summoned" ]; then
-        hyprctl dispatch togglespecialworkspace doombench >/dev/null 2>&1
+        x,y=c['at']; w,h=c['size']; print(f'{x},{y} {w}x{h}'); break
+" 2>/dev/null)"
+    if [ -n "$geo" ]; then
+        grim -g "$geo" "$SCREENSHOT" 2>/dev/null \
+            && echo "[run-rom] screenshot -> $SCREENSHOT" >&2
     fi
 }
 
