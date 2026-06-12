@@ -69,20 +69,22 @@ typedef struct
     signed char forward;   // *2048 movement
     signed char side;
     short       turn;      // <<16 angle delta per tic
+    byte        buttons;   // held for the whole step; USE retriggers because
+                           // adjacent steps release it
 } bench_step_t;
 
 static const bench_step_t bench_script[] =
 {
-    {  50,   0,      0 },   // forward
-    {  50,   0,   -640 },   // forward + turn left
-    {  50,   0,      0 },   // forward
-    {  25,   0,    768 },   // forward + turn right (wide)
-    {   0,   0,    768 },   // pivot in place
-    {  50,   0,      0 },   // forward
-    { -25,   0,   -512 },   // back-pedal + turn
-    {  50,  25,      0 },   // forward + strafe
-    {  50,   0,    384 },   // forward + slow turn
-    {   0,   0,  -1024 },   // fast pivot
+    {  50,   0,      0, 0         },   // forward
+    {  50,   0,   -640, BT_ATTACK },   // forward + turn left, firing (noise wakes monsters)
+    {  50,   0,      0, BT_USE    },   // forward, try doors
+    {  25,   0,    768, 0         },   // forward + turn right (wide)
+    {   0,   0,    768, BT_USE    },   // pivot in place, try doors
+    {  50,   0,      0, 0         },   // forward
+    { -25,   0,   -512, BT_ATTACK },   // back-pedal + turn, firing
+    {  50,  25,      0, BT_USE    },   // forward + strafe, try doors
+    {  50,   0,    384, 0         },   // forward + slow turn
+    {   0,   0,  -1024, BT_ATTACK },   // fast pivot, firing
 };
 #define BENCH_SCRIPT_STEPS  (sizeof(bench_script) / sizeof(bench_script[0]))
 
@@ -162,6 +164,7 @@ void N64Bench_FillTiccmd(ticcmd_t* cmd)
     cmd->forwardmove = step->forward;
     cmd->sidemove    = step->side;
     cmd->angleturn   = step->turn;
+    cmd->buttons     = step->buttons;
 }
 
 // Called once per gametic from G_Ticker (via the script counter in FillTiccmd
