@@ -17,6 +17,10 @@
 #include "w_wad.h"
 #include "z_zone.h"
 #include "n64_debug.h"
+#include "rdp_view.h"
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
 
 // Rebase hooks for code that caches a screens[0]-derived pointer across frames.
 void R_N64RebaseScreen(void);
@@ -939,17 +943,20 @@ void I_FinishUpdate(void)
 
     rdpq_attach(disp, NULL);
 
+    // Whether the RDP world pass actually drew geometry this frame (Stage 2:
+    // the single routed midtexture seg, if one was eligible). Drives both the
+    // world flush below and the present blit's alpha-compare key-out.
+    {
+    boolean world_drawn = false;
+
     // World-render seam (RDP renderer). When the flag is on, the world pass
     // draws the 3D view directly into the 16bpp display fb, scissored to the
-    // view window, BEFORE the overlay blit and in the SAME rspq stream -- this
-    // is the seam later stages emit walls/planes/sprites into. It sits AFTER
-    // the menu present-pacing early-return above so a paced menu frame never
-    // drains a half-built world list. In Stage 1 the view is still 100%
-    // software-rendered into the CI8 buffer, so the world pass has nothing to
-    // draw: the plumbing exists (attach + standard mode + view scissor) but
-    // emits no geometry. rdpq_attach already set a full-screen scissor, so we
-    // reset it back to full screen before the overlay blit below.
-    if (rdp_on)
+    // view window, BEFORE the overlay blit and in the SAME rspq stream. It sits
+    // AFTER the menu present-pacing early-return above so a paced menu frame
+    // never drains a half-built world list. Stage 2 routes ONE single-sided
+    // (midtexture) seg through DL_Flush; everything else is still software-
+    // rendered into the CI8 buffer that the present blit reads.
+    if (rdp_on && DL_Count() > 0)
     {
         int vx0 = viewwindowx;
         int vy0 = viewwindowy;
@@ -963,40 +970,63 @@ void I_FinishUpdate(void)
 
         if (vx1 > vx0 && vy1 > vy0)
         {
+            // The world pass samples the master TLUT from the upper TMEM half;
+            // upload it BEFORE the flush (the present blit below reuses the same
+            // persistent TLUT, so this also satisfies that path and clears the
+            // dirty flag once). A CI8 tile upload only touches the lower half,
+            // so the TLUT survives the flush.
+            if (n64_palette_dirty)
+            {
+                uint16_t* slot = doom_tlut_up[n64_draw_idx];
+
+                memcpy(slot, doom_tlut_master, sizeof(doom_tlut_master));
+                data_cache_hit_writeback(slot, sizeof(doom_tlut_master));
+                rdpq_tex_upload_tlut(slot, 0, 256);
+                n64_palette_dirty = false;
+            }
+
+            // Standard 1-cycle textured: TEX0*PRIM (free light), CI8 via TLUT,
+            // perspective-correct (free INV_W). Scissor to the view window so
+            // the quads can't spill outside the 3D view (DESIGN section 4).
             rdpq_set_mode_standard();
+            rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+            rdpq_mode_tlut(TLUT_RGBA16);
+            rdpq_mode_persp(true);
             rdpq_set_scissor(vx0, vy0, vx1, vy1);
-            // (Stage 1: nothing to draw -- the software path filled the view.)
+
+#ifdef N64_BENCH
+            N64Bench_PhaseBegin(BPH_DL_BUILD);
+#endif
+            DL_Flush();
+#ifdef N64_BENCH
+            N64Bench_PhaseEnd(BPH_DL_BUILD);
+#endif
+
+            // Restore full-screen scissor + persp off for the overlay COPY blit.
+            rdpq_mode_persp(false);
             rdpq_set_scissor(0, 0, SCREENWIDTH, SCREENHEIGHT);
+            world_drawn = true;
         }
     }
 
     // Present blit. COPY-mode alpha-compare (transparency=true) keys out the
     // alpha-0 reserved index so the RDP-drawn world shows through the view
-    // window. That key-out is valid only once the view is backed by RDP
-    // geometry AND the view region no longer holds opaque world art in the
-    // blitted CI8 buffer -- otherwise any world texel that legitimately equals
-    // the key index (DESIGN s5: opaque world art may contain the key) would be
-    // wrongly discarded and reveal the empty 16bpp fb behind it.
-    //
-    // In Stage 1 NEITHER condition holds: the view is still 100% software-
-    // rendered into the SAME unified CI8 buffer this blit reads (no separate
-    // overlay surface yet), and no RDP world geometry is drawn behind it. So
-    // alpha-compare here could only punch holes in opaque world art over an
-    // empty fb. It is therefore kept OFF this stage regardless of the flag,
-    // which makes the flag-ON present byte-identical to flag-OFF -- the
-    // strongest form of the Stage-1 "visually identical to baseline" gate.
-    // The transparent-key mechanism is still exercised and proven harmless by
-    // the KEY_CLEAR fill (the software path overwrites the key-cleared view, so
-    // no key pixel survives) and the TLUT alpha=0 packing (I_SetPalette). The
-    // view-region key-out goes live in Stage 2, when the first RDP seg is drawn
-    // behind the view and its suppressed colfunc columns hold the key index.
-    // COPY-mode alpha-compare is valid on the 16bpp display fb when re-enabled
+    // window. Enabled ONLY when the RDP actually drew world geometry this frame
+    // (Stage 2: the routed seg). Then the routed seg's suppressed-colfunc
+    // columns hold the key index (from KEY_CLEAR), get keyed out, and reveal the
+    // RDP fill drawn underneath; every other view pixel is still real software-
+    // rendered colour and is blitted normally. When no world geometry was drawn
+    // (flag off, or no eligible seg, or a paced menu frame), alpha-compare stays
+    // OFF so the present is byte-identical to the software path -- opaque art
+    // that happens to contain the key index is never punched out.
+    // COPY-mode alpha-compare is valid on the 16bpp display fb
     // (rdpq_mode.h:328-330,335).
-    rdpq_set_mode_copy(false);
+    rdpq_set_mode_copy(world_drawn ? true : false);
     rdpq_mode_tlut(TLUT_RGBA16);
-    // Palette area of TMEM (upper half) is only ever written by this blit path,
-    // and a CI8 blit only loads texels into the lower half, so the TLUT
-    // persists across frames and is re-uploaded only when it changed.
+    // Palette area of TMEM (upper half) is only ever written by this blit path
+    // (or the world pass above), and a CI8 blit only loads texels into the lower
+    // half, so the TLUT persists across frames and is re-uploaded only when it
+    // changed.
     if (n64_palette_dirty)
     {
         uint16_t* slot = doom_tlut_up[n64_draw_idx];
@@ -1008,8 +1038,10 @@ void I_FinishUpdate(void)
     }
     // The CI8 source covers the entire 320x200 display, so attach (no clear)
     // is sufficient -- the blit overwrites every pixel (except, with the flag
-    // on, the alpha-0 key pixels keyed out by alpha-compare).
+    // on and world geometry drawn, the alpha-0 key pixels keyed out by
+    // alpha-compare).
     rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+    }
 
     // Detach with a completion callback instead of a global rspq_wait(): the
     // CPU can render the next frame while the RDP reads this buffer. The
@@ -1021,10 +1053,20 @@ void I_FinishUpdate(void)
 
     // Flip the CPU's draw target to the other buffer. Wait only if the RDP is
     // still reading it from an earlier frame; normally it finished long ago, so
-    // this spins zero times and the CPU and RDP overlap.
+    // this spins zero times and the CPU and RDP overlap. Bracketed as RDP_BUSY
+    // (Q9): this buffer-flip spin is the point where an RDP that fell behind --
+    // because the new world pass made it slower -- surfaces as counted wall
+    // time, non-serializing (we never force an rspq_wait here). It stays ~0 as
+    // long as the RDP drains inside the CPU residual.
+#ifdef N64_BENCH
+    N64Bench_PhaseBegin(BPH_RDP_BUSY);
+#endif
     next_idx = n64_draw_idx ^ 1;
     while (doom_screen8_rdp_busy[next_idx])
         ;
+#ifdef N64_BENCH
+    N64Bench_PhaseEnd(BPH_RDP_BUSY);
+#endif
 
     if (n64_present_copy_forward)
         memcpy(doom_screen8[next_idx].buffer, doom_screen8[n64_draw_idx].buffer,

@@ -43,6 +43,10 @@ rcsid[] = "$Id: r_segs.c,v 1.3 1997/01/29 20:10:19 b1 Exp $";
 #include "n64_bench.h"
 #endif
 
+#ifdef N64
+#include "rdp_view.h"
+#endif
+
 
 // OPTIMIZE: closed two sided lines as single sided
 
@@ -263,6 +267,37 @@ void R_RenderSegLoop (void)
     fixed_t		l_pixhigh = pixhigh;
     fixed_t		l_pixlow = pixlow;
 
+#ifdef N64
+    // RDP renderer (Stage 2): route the FIRST single-sided (midtexture) wall
+    // seg encountered this frame through the RDP wall path. Deterministic under
+    // the virtual tic clock (the BSP walk order is fixed, so "first eligible
+    // seg" is the same seg every run). For the routed seg the per-column
+    // colfunc pixel write is suppressed (those view columns keep the
+    // transparency-key index from KEY_CLEAR, and the RDP fill drawn at the
+    // present seam shows through), while ALL clip / visplane bookkeeping stays
+    // on the CPU. Per-column screen Y / scale / texturecolumn / light are
+    // captured here and turned into rdp_wall_t records (per light-level run)
+    // after the loop. A single-sided line always has a midtexture, so this is
+    // exactly the midtexture branch below.
+    int			rdp_route = 0;
+    // Per-column capture (one screen width max). Captured only for the routed
+    // seg's columns that actually draw a midtexture span (mid >= yl etc.).
+    static short	rdp_yl[SCREENWIDTH];
+    static short	rdp_yh[SCREENWIDTH];
+    static fixed_t	rdp_scale[SCREENWIDTH];
+    static fixed_t	rdp_scol[SCREENWIDTH];   // texturecolumn
+    static unsigned char rdp_lit[SCREENWIDTH]; // colormap level
+    static unsigned char rdp_drawn[SCREENWIDTH]; // 1 if a span was emitted here
+    int			rdp_first = -1;          // first drawn column
+    int			rdp_last  = -1;          // last drawn column
+
+    if (l_midtexture && DL_WallSegAvailable())
+    {
+	if (DL_ClaimWallSeg())
+	    rdp_route = 1;
+    }
+#endif
+
 #ifdef N64_BENCH
     // SEG_RASTER attributes the per-column wall fill below (the rasterization
     // the RDP renderer offloads) separately from the BSP walk/clip/scale math
@@ -342,8 +377,37 @@ void R_RenderSegLoop (void)
 	    dc_yl = yl;
 	    dc_yh = yh;
 	    dc_texturemid = l_rw_midtexturemid;
+#ifdef N64
+	    if (rdp_route)
+	    {
+		// RDP-routed seg: suppress the CPU pixel write (the column keeps
+		// the key index and the RDP fill shows through) but capture the
+		// per-column span so DL_EmitWallTier can build the quad. KEEP the
+		// ceiling/floor clip writes below exactly as the CPU path does.
+		if (yl <= yh)
+		{
+		    rdp_yl[l_rw_x]    = (short)yl;
+		    rdp_yh[l_rw_x]    = (short)yh;
+		    rdp_scale[l_rw_x] = l_rw_scale;
+		    rdp_scol[l_rw_x]  = texturecolumn;
+		    rdp_lit[l_rw_x]   = DL_WallLightLevel(
+					    (const void* const*)l_walllights,
+					    (unsigned)(l_rw_scale>>LIGHTSCALESHIFT));
+		    rdp_drawn[l_rw_x] = 1;
+		    if (rdp_first < 0) rdp_first = l_rw_x;
+		    rdp_last = l_rw_x;
+		}
+		else
+		{
+		    rdp_drawn[l_rw_x] = 0;
+		}
+	    }
+	    else
+#endif
+	    {
 	    dc_source = R_GetColumn(l_midtexture,texturecolumn);
 	    l_colfunc ();
+	    }
 	    l_ceilingclip[l_rw_x] = l_viewheight;
 	    l_floorclip[l_rw_x] = -1;
 	}
@@ -429,6 +493,77 @@ void R_RenderSegLoop (void)
 #ifdef N64_BENCH
     // Close SEG_RASTER, reopen BSP_WALK for the rest of the walk.
     N64Bench_PhaseSwitch(BPH_SEG_RASTER, BPH_BSP_WALK);
+#endif
+
+#ifdef N64
+    // RDP-routed seg: turn the captured per-column spans into rdp_wall_t
+    // records, splitting at columns where the colormap light level changes
+    // (per light-level run -- preserves vanilla's per-column light banding as
+    // long contiguous runs; Q8 mitigation). The quad's screen-space top/bottom
+    // edges and S are sampled at each run's left/right columns (the seg's
+    // top/bottom/scale step linearly, so a per-run quad is geometrically exact
+    // between its endpoints). T_top/T_bot are the texel rows at the wall's
+    // top/bottom screen edges -- a constant for the wall thanks to the free-W
+    // perspective property (section 3 Q1), so they are taken at the run's left
+    // column.
+    if (rdp_route && rdp_first >= 0)
+    {
+	const float	k = DL_InvWScale();
+	const fixed_t	mid = l_rw_midtexturemid;
+	const int	cy = centery;
+	int		run0 = -1;
+	int		x;
+
+	for (x = rdp_first; x <= rdp_last + 1; x++)
+	{
+	    int drawn = (x <= rdp_last) ? rdp_drawn[x] : 0;
+	    int breakrun = 0;
+
+	    if (run0 < 0)
+	    {
+		if (drawn)
+		    run0 = x;
+		continue;
+	    }
+
+	    // Break the run at a gap (undrawn column) or a light-level change.
+	    if (!drawn)
+		breakrun = 1;
+	    else if (rdp_lit[x] != rdp_lit[run0])
+		breakrun = 1;
+
+	    if (breakrun)
+	    {
+		int		xa = run0;
+		int		xb = x - 1;     // inclusive last column of the run
+		fixed_t		sca = rdp_scale[xa];
+		fixed_t		scb = rdp_scale[xb];
+		fixed_t		isca = 0xffffffffu / (unsigned)sca;
+		rdp_wall_t	w;
+
+		w.x1 = (int16_t)xa;
+		w.x2 = (int16_t)xb;
+		w.ytop_l = (float)rdp_yl[xa];
+		w.ybot_l = (float)(rdp_yh[xa] + 1);   // span is inclusive
+		w.ytop_r = (float)rdp_yl[xb];
+		w.ybot_r = (float)(rdp_yh[xb] + 1);
+		w.s_l = (float)rdp_scol[xa];
+		w.s_r = (float)rdp_scol[xb];
+		w.invw_l = (float)sca * k;
+		w.invw_r = (float)scb * k;
+		// T texel rows at the wall's top/bottom screen edges (left col).
+		w.t_top = (float)((mid + (rdp_yl[xa] - cy) * isca) >> FRACBITS);
+		w.t_bot = (float)((mid + ((rdp_yh[xa] + 1) - cy) * isca) >> FRACBITS);
+		w.texid = (uint16_t)l_midtexture;
+		w.light = rdp_lit[xa];
+
+		DL_EmitWallTier(&w);
+
+		// Start a new run at the current column if it still draws.
+		run0 = drawn ? x : -1;
+	    }
+	}
+    }
 #endif
 
     // write back the accumulators the caller / next seg reads

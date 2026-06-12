@@ -137,7 +137,8 @@ DOOM_PLATFORM_SRCS = \
 	$(DOOM_SRC)/i_system_n64.c \
 	$(DOOM_SRC)/i_video_n64.c \
 	$(DOOM_SRC)/i_sound_n64.c \
-	$(DOOM_SRC)/i_net_n64.c
+	$(DOOM_SRC)/i_net_n64.c \
+	$(DOOM_SRC)/rdp_view.c
 
 DOOM_SRCS = $(DOOM_COMMON_SRCS) $(DOOM_PLATFORM_SRCS)
 OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)

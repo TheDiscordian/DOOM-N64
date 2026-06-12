@@ -85,6 +85,7 @@ static const char rcsid[] = "$Id: d_main.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
 #include "i_wad_browser_n64.h"
 #include "i_main_n64.h"
 #include "n64_debug.h"
+#include "rdp_view.h"
 #endif
 #ifdef N64_BENCH
 #include "n64_bench.h"
@@ -674,6 +675,12 @@ void D_Display (void)
     if (gamestate == GS_LEVEL && !automapactive && gametic)
 	{
 #ifdef N64
+	    // RDP renderer: reset the per-frame emit arena + routed-seg latch
+	    // ONCE before the player render(s). The world pass is drained later
+	    // by DL_Flush at the present seam (i_video_n64.c). DL_BeginFrame also
+	    // derives this frame's free-W constant k. No-op work-wise when the
+	    // flag is off (the seg loop never routes), but cheap to call always.
+	    DL_BeginFrame();
 #if DEBUG
 	    D_N64UpdateDebugFps();
 #endif
