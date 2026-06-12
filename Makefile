@@ -132,6 +132,9 @@ DOOM_PLATFORM_SRCS = \
 DOOM_SRCS = $(DOOM_COMMON_SRCS) $(DOOM_PLATFORM_SRCS)
 OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)
 
+# Renderer hot TUs at -O3 (appended after n64.mk's -O2; last -O wins).
+$(BUILD_DIR)/$(DOOM_SRC)/r_%.o: CFLAGS += -O3
+
 MUSIC_ASSETS_XM_LOWER = $(wildcard assets/music/*.xm)
 MUSIC_ASSETS_XM_UPPER = $(wildcard assets/music/*.XM)
 MUSIC_ASSETS_YM_LOWER = $(wildcard assets/music/*.ym)
