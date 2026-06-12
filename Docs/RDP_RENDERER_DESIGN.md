@@ -382,7 +382,13 @@ CI4-walls) keeps the wall look bit-exact and removes the CI4 banding risk on the
 
 **Q8 — Lighting → per-drawseg PRIM-colour shade-multiply; flashes stay in the TLUT (graft #2).**
 Use `RDPQ_COMBINER_TEX_FLAT` (`TEX0*PRIM`, verified `rdpq_macros.h:531`, free in 1-cycle) with a
-16-entry PRIM-brightness LUT built once at level/light init from the colormap darkening ramp. Emit
+16-entry PRIM-brightness LUT built once at level/light init from the colormap darkening ramp.
+**LUT reference index (Stage-2 fix round, load-bearing):** the ramp is sampled by feeding a
+**pure-white** PLAYPAL index through each colormap level — `colormaps[level*256 + 4]` (PLAYPAL
+index 4 = (255,255,255)) — and reading the mapped entry's RGB back through PLAYPAL. PLAYPAL
+**index 0 is pure black (0,0,0), not a bright grey**: a LUT referenced on index 0 maps black→black
+at every level, making PRIM (and therefore every `TEX0*PRIM` wall pixel) solid black. This exact
+bug shipped in the first Stage-2 cut and blinded all texture-path validation. Emit
 `rdpq_set_prim_color(light_lut[index])` using the **same index DOOM computes today** —
 `rw_scale>>LIGHTSCALESHIFT` for walls (`r_segs.c:315`), `distance>>LIGHTZSHIFT` for planes
 (`r_plane.c:226`). DOOM's lighting is *already* quantized to 16 levels (`LIGHTLEVELS 16`,

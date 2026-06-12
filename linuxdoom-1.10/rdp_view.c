@@ -182,10 +182,18 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h)
 static uint32_t     dl_prim_lut[NUMCOLORMAPS];
 static int          dl_prim_inited;
 
-// A bright greyscale reference near the top of the DOOM grey ramp (indices
-// 0..31 are the light->dark greys). Index 0 is the brightest light grey; using
-// it makes the LUT track the colormap's full darkening range.
-#define DL_PRIM_REF 0
+// The brightness reference index fed through the colormap. It MUST be a bright
+// (ideally pure-white) palette entry so colormaps[level*256 + ref] traces the
+// colormap's darkening curve as a grey ramp; TEX0*PRIM then reproduces DOOM's
+// stepped falloff on the textured wall.
+//
+// DOOM's PLAYPAL index 0 is PURE BLACK (0,0,0) -- NOT a grey-ramp top. Feeding 0
+// here made the colormap map black->black at every level, so dl_prim_lut was
+// black for all 32 levels and every routed wall rendered TEX0*0 = solid black
+// (visually a flat dark/uncleared-fb hole). DOOM's white is index 4
+// (255,255,255); colormaps[level*256 + 4] gives the canonical 255,223,191,...,35
+// brightness ramp, which is exactly the per-level shade we want as PRIM.
+#define DL_PRIM_REF 4
 
 static void DL_BuildPrimLUT(void)
 {
