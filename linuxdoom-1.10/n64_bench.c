@@ -402,7 +402,9 @@ void N64Bench_LoopEnd(void)
     // on each one. Frame N is the same game state on every build (virtual tic
     // clock), so captures pair exactly across flag-on/flag-off ROMs. Never
     // enabled in timing builds -- the debugf cost would skew the numbers.
-    if ((bench_frame_count & 255) == 0)
+    // Every 128 retained frames (32 points/run): Ryan observed texture
+    // artifacting falling between the original 256-frame samples.
+    if ((bench_frame_count & 127) == 0)
     {
         debugf("BENCH_MARK frame=%lu\n", bench_frame_count);
 
