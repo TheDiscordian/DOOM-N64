@@ -991,15 +991,18 @@ void R_RenderPlayerView (player_t* player)
 
     // The head node is the last node output.
     R_RenderBSPNode (numnodes-1);
-    
-    // Check for new console commands.
-    NetUpdate ();
-    
+
+    // Mid-render NetUpdate keeps the net serviced during a long frame. In
+    // 1p there is no net to service, so it only burns I_GetTime + joypad
+    // polling; gate on netgame (true for local split-screen MP too).
+    if (netgame)
+	NetUpdate ();
+
     R_DrawPlanes ();
-    
-    // Check for new console commands.
-    NetUpdate ();
-    
+
+    if (netgame)
+	NetUpdate ();
+
     R_DrawMasked ();
 
     // Check for new console commands.
