@@ -368,10 +368,19 @@ the master TLUT preserves DOOM's exact 8-bit look, the 8-bit RDRAM footprint, an
 already-uploaded 256-entry palette. A 64×32 CI8 wall tile = 2 KB fits the lower TMEM half beside the
 TLUT — **at exactly 2048 bytes, zero margin** (`rdpq_tex.c:188` caps CI/RGBA32/YUV tiles to 2048;
 `tmem_pitch = ROUND_UP(64,8) = 64`, ×32 rows = 2048). This is a **hard boundary, not a comfortable
-fit**: any CI8 tile wider than 64 texels exceeds 2048 at 32 rows. DOOM textures are 64-wide so this
-holds, but the 64-wide tile width is load-bearing — a wider tile would have to drop to 24 rows or
-split. Tall 64×128 walls draw as stacked 64×32 tiles (the seg quad is split/scissored vertically with
-a 1-texel overlap + T-clamp at the seam). **Flats specifically use CI4** (64×64 = 2 KB, fits beside
+fit**: any CI8 tile wider than 64 texels exceeds 2048 at 32 rows. **CORRECTED PREMISE (Stage-2 fix
+round): DOOM textures are NOT all 64-wide.** 44 of DOOM1's 125 `TEXTURE1` entries are wider — 36 are
+128-wide (STARTAN3, COMPTILE, BROWN1, …), 8 are 256-wide — and one is 24-wide (non-power-of-two;
+its `texturewidthmask` sampling period is 16). The original "DOOM textures are 64-wide so this
+holds" claim was false and produced a fixed 64-wide transpose that sampled `col mod 64` where
+software samples `col mod width` — wrong columns across half of every wide wall. The rule that
+ships: **tile rows are sized per width** as `rows ≤ 2048 / width` (64-wide: 32 rows; 128-wide: 16;
+256-wide: 8), with the transpose width equal to the texture's power-of-two sampling period
+(`texturewidthmask+1`), so S wraps with the same mask software uses. Tall walls draw as stacked
+width×rows tiles: bands are split at TMEM row caps **and at texture-period boundaries** (the column
+drawer wraps T, see §4), each band uploaded tile-local at TMEM row 0 with **period-relative,
+band-local T** on the triangles, a 1-texel overlap row uploaded where headroom exists and T-clamp
+closing the seam at the hard 2 KB boundary. **Flats specifically use CI4** (64×64 = 2 KB, fits beside
 the 2 KB TLUT) — a 64×64 CI8 flat is 4 KB and does *not* fit; CI4 also halves the flat cache, and
 flats are low-frequency mostly-flat-shaded surfaces where a 16-entry sub-palette is visually safe.
 RGBA16 is used **nowhere** (doubles both TMEM and RDRAM for no fidelity gain on paletted art).
@@ -489,15 +498,28 @@ deterministic scenario warms the cache within 1–2 frames and will surface any 
 
 ## 4. Texture system
 
-**Formats (Q7):** walls **CI8** (column-major posts transposed to row-major, 64×32 tiles, stacked
-for tall walls), flats **CI4** (64×64 row-major, 16-entry sub-palette per flat, fits 2 KB beside
-the TLUT), sprites **CI8** (full palette + alpha-key). Per-lump CI8 override for any flat/wall whose
+**Formats (Q7):** walls **CI8** (column-major posts transposed to row-major at the texture's
+power-of-two sampling width, width×(2048/width) tiles, stacked for tall walls — see the corrected
+Q7: 44/125 DOOM1 textures are wider than 64), flats **CI4** (64×64 row-major, 16-entry sub-palette
+per flat, fits 2 KB beside the TLUT), sprites **CI8** (full palette + alpha-key). **Vertical wrap
+(software parity):** the column drawer wraps T (`source[(frac>>FRACBITS)&127]`, `r_draw.c:150`) —
+walls taller than their texture TILE it, never clamp. The flush walks the full T range in bands
+split at period boundaries and TMEM caps with period-relative T. Accepted divergence: software
+wraps mod 128 always (sub-128-tall textures tutti-frutti past their height); the RDP path wraps
+mod texture-height (clean tiling). Per-lump CI8 override for any flat/wall whose
 distinct-colour count exceeds 16 (graft #5). RGBA16 nowhere.
 
-**Conversion timing (Q10):** on-demand at first TMEM upload, cached in `PU_CACHE` zone memory keyed
-by `texnum`/`flatnum`, evicted by the existing zone LRU. Transpose (walls) + CI4 down-convert
+**Conversion timing (Q10):** on-demand at first TMEM upload, cached in zone memory keyed by
+`texnum`/`flatnum`, evicted by the existing zone LRU. Transpose (walls) + CI4 down-convert
 (flats) paid once per residency, amortized to ~0 steady-state. Every converted/transposed block is
 `data_cache_hit_writeback`'d before the RDP DMA reads it (graft #1, mirroring `i_video_n64.c:763`).
+**Async-read lifetime rule (Stage-2 fix round; Q10 originally ignored this):** the RDP reads the
+block *after* `rdpq_detach_cb` returns, while the CPU is already building later frames — a plain
+`PU_CACHE` block can be evicted and reused inside that window, feeding the RDP DMA garbage. Blocks
+are therefore allocated/pinned `PU_STATIC` while in flight and only demoted to `PU_CACHE` by
+`DL_PresentEnd`, one present later, once the present-seam buffer-flip spin has proven the using
+present's RDP stream fully drained (a 2-deep pending/previous in-flight list; see
+`rdp_view.c:DL_MarkInFlight`). The zone LRU still manages everything not in flight.
 
 **TMEM residency (Q6):** 4 KB total; **TLUT permanently owns the upper 2 KB** (256 RGBA16 entries,
 written only by the present blit, persists across frames — `i_video_n64.c:755-764`). The lower 2 KB

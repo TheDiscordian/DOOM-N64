@@ -1300,6 +1300,18 @@ void I_FinishUpdate(void)
     N64Bench_PhaseEnd(BPH_RDP_BUSY);
 #endif
 
+    // Retire the RDP world state for this present. Sits AFTER the busy spin
+    // (the spin proves the PREVIOUS present's RDP stream -- including its
+    // texture-block DMAs -- fully drained, so DL_PresentEnd may demote that
+    // present's pinned transpose blocks back to PU_CACHE) and clears the emit
+    // arena so a later present that skipped the world render (automap, wipe,
+    // menu-paced) can never re-flush this frame's quads or re-punch its keyed
+    // box over non-world content. Gated on the kill-switch: with the flag off
+    // the arena is empty and no block is ever pinned, so skipping the call
+    // keeps the flag-off present seam unchanged.
+    if (rdp_on)
+        DL_PresentEnd();
+
     if (n64_present_copy_forward)
         memcpy(doom_screen8[next_idx].buffer, doom_screen8[n64_draw_idx].buffer,
                SCREENWIDTH * SCREENHEIGHT);

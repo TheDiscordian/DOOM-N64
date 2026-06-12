@@ -45,6 +45,10 @@ rcsid[] = "$Id: r_segs.c,v 1.3 1997/01/29 20:10:19 b1 Exp $";
 
 #ifdef N64
 #include "rdp_view.h"
+
+#if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
+#include <libdragon.h>      // debugf for the diagnostic seg-claim trace
+#endif
 #endif
 
 
@@ -280,22 +284,33 @@ void R_RenderSegLoop (void)
     // after the loop. A single-sided line always has a midtexture, so this is
     // exactly the midtexture branch below.
     int			rdp_route = 0;
-    // Per-column capture (one screen width max). Captured only for the routed
-    // seg's columns that actually draw a midtexture span (mid >= yl etc.).
-    static short	rdp_yl[SCREENWIDTH];
-    static short	rdp_yh[SCREENWIDTH];
-    static fixed_t	rdp_scale[SCREENWIDTH];
-    static fixed_t	rdp_scol[SCREENWIDTH];   // texturecolumn
-    static unsigned char rdp_lit[SCREENWIDTH]; // colormap level
-    static unsigned char rdp_drawn[SCREENWIDTH]; // 1 if a span was emitted here
-    int			rdp_first = -1;          // first drawn column
-    int			rdp_last  = -1;          // last drawn column
 
-    if (l_midtexture && DL_WallSegAvailable())
+    // Kill-switch FIRST, inline, before any cross-TU call. With the flag OFF
+    // this short-circuits to the pre-RDP software seg loop with ZERO added
+    // function calls (DL_WallSegAvailable/DL_ClaimWallSeg are never reached),
+    // so the flag-OFF hot path is byte-identical to the Stage-1 baseline rather
+    // than carrying a per-single-sided-seg cross-TU call into the kill-switch
+    // path. Only when the flag is ON do we consult the per-frame routed-seg
+    // latch. (Gate criterion 2: flag-OFF byte-identical to baseline.) ALL
+    // routed-seg capture state + the post-loop emit live in rdp_view.c so this
+    // hot translation unit's .text stays at the pre-RDP size when the flag is
+    // off (structural flag-OFF drift minimised).
+    if (n64_use_rdp_renderer
+	&& l_midtexture && DL_WallSegAvailable())
     {
 	if (DL_ClaimWallSeg())
+	{
 	    rdp_route = 1;
+	    DL_RouteBeginSeg();
+	}
     }
+#if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
+    // Diagnostic builds only (DL_TRACE=1): log every single-sided seg-loop
+    // invocation with its column range and whether it claimed the routed slot.
+    if (n64_use_rdp_renderer && l_midtexture)
+	debugf("DL_SEG mid=%d x=%d..%d claim=%d\n",
+	       l_midtexture, l_rw_x, l_rw_stopx - 1, rdp_route);
+#endif
 #endif
 
 #ifdef N64_BENCH
@@ -378,29 +393,21 @@ void R_RenderSegLoop (void)
 	    dc_yh = yh;
 	    dc_texturemid = l_rw_midtexturemid;
 #ifdef N64
-	    if (rdp_route)
+	    // RDP-routed seg: suppress the CPU pixel write ONLY for columns the
+	    // RDP will actually fill (yl <= yh). Those columns keep the key index
+	    // (from KEY_CLEAR) and the RDP quad shows through; they are exactly the
+	    // columns DL_RouteCapture records and DL_KeyedSpan later keys out, so
+	    // suppressed == recorded == keyed -- no column is left key-index but
+	    // un-keyed (which the present blit would opaque-blit as the key colour,
+	    // a salmon "hole" on the right of the view). Columns with yl > yh fall
+	    // through to the normal path: l_colfunc draws zero pixels there (yl>yh),
+	    // byte-identical to vanilla, so a vertically-clipped part of the routed
+	    // seg never becomes a stray key-index leak. KEEP the ceiling/floor clip
+	    // writes below exactly as the CPU path does.
+	    if (rdp_route && yl <= yh)
 	    {
-		// RDP-routed seg: suppress the CPU pixel write (the column keeps
-		// the key index and the RDP fill shows through) but capture the
-		// per-column span so DL_EmitWallTier can build the quad. KEEP the
-		// ceiling/floor clip writes below exactly as the CPU path does.
-		if (yl <= yh)
-		{
-		    rdp_yl[l_rw_x]    = (short)yl;
-		    rdp_yh[l_rw_x]    = (short)yh;
-		    rdp_scale[l_rw_x] = l_rw_scale;
-		    rdp_scol[l_rw_x]  = texturecolumn;
-		    rdp_lit[l_rw_x]   = DL_WallLightLevel(
-					    (const void* const*)l_walllights,
-					    (unsigned)(l_rw_scale>>LIGHTSCALESHIFT));
-		    rdp_drawn[l_rw_x] = 1;
-		    if (rdp_first < 0) rdp_first = l_rw_x;
-		    rdp_last = l_rw_x;
-		}
-		else
-		{
-		    rdp_drawn[l_rw_x] = 0;
-		}
+		DL_RouteCapture(l_rw_x, yl, yh, l_rw_scale, texturecolumn,
+				(const void* const*)l_walllights);
 	    }
 	    else
 #endif
@@ -496,74 +503,12 @@ void R_RenderSegLoop (void)
 #endif
 
 #ifdef N64
-    // RDP-routed seg: turn the captured per-column spans into rdp_wall_t
-    // records, splitting at columns where the colormap light level changes
-    // (per light-level run -- preserves vanilla's per-column light banding as
-    // long contiguous runs; Q8 mitigation). The quad's screen-space top/bottom
-    // edges and S are sampled at each run's left/right columns (the seg's
-    // top/bottom/scale step linearly, so a per-run quad is geometrically exact
-    // between its endpoints). T_top/T_bot are the texel rows at the wall's
-    // top/bottom screen edges -- a constant for the wall thanks to the free-W
-    // perspective property (section 3 Q1), so they are taken at the run's left
-    // column.
-    if (rdp_route && rdp_first >= 0)
-    {
-	const float	k = DL_InvWScale();
-	const fixed_t	mid = l_rw_midtexturemid;
-	const int	cy = centery;
-	int		run0 = -1;
-	int		x;
-
-	for (x = rdp_first; x <= rdp_last + 1; x++)
-	{
-	    int drawn = (x <= rdp_last) ? rdp_drawn[x] : 0;
-	    int breakrun = 0;
-
-	    if (run0 < 0)
-	    {
-		if (drawn)
-		    run0 = x;
-		continue;
-	    }
-
-	    // Break the run at a gap (undrawn column) or a light-level change.
-	    if (!drawn)
-		breakrun = 1;
-	    else if (rdp_lit[x] != rdp_lit[run0])
-		breakrun = 1;
-
-	    if (breakrun)
-	    {
-		int		xa = run0;
-		int		xb = x - 1;     // inclusive last column of the run
-		fixed_t		sca = rdp_scale[xa];
-		fixed_t		scb = rdp_scale[xb];
-		fixed_t		isca = 0xffffffffu / (unsigned)sca;
-		rdp_wall_t	w;
-
-		w.x1 = (int16_t)xa;
-		w.x2 = (int16_t)xb;
-		w.ytop_l = (float)rdp_yl[xa];
-		w.ybot_l = (float)(rdp_yh[xa] + 1);   // span is inclusive
-		w.ytop_r = (float)rdp_yl[xb];
-		w.ybot_r = (float)(rdp_yh[xb] + 1);
-		w.s_l = (float)rdp_scol[xa];
-		w.s_r = (float)rdp_scol[xb];
-		w.invw_l = (float)sca * k;
-		w.invw_r = (float)scb * k;
-		// T texel rows at the wall's top/bottom screen edges (left col).
-		w.t_top = (float)((mid + (rdp_yl[xa] - cy) * isca) >> FRACBITS);
-		w.t_bot = (float)((mid + ((rdp_yh[xa] + 1) - cy) * isca) >> FRACBITS);
-		w.texid = (uint16_t)l_midtexture;
-		w.light = rdp_lit[xa];
-
-		DL_EmitWallTier(&w);
-
-		// Start a new run at the current column if it still draws.
-		run0 = drawn ? x : -1;
-	    }
-	}
-    }
+    // RDP-routed seg: turn the captured per-column spans into rdp_wall_t records
+    // (run-coalescing + the per-run quad math live in rdp_view.c so this hot TU
+    // stays at the pre-RDP baseline size when the flag is off). No-op unless this
+    // seg was actually routed.
+    if (rdp_route)
+	DL_RouteEmit(l_rw_midtexturemid, l_midtexture, centery);
 #endif
 
     // write back the accumulators the caller / next seg reads

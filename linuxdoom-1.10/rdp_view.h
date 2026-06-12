@@ -51,6 +51,27 @@ void DL_BeginFrame(void);
 // arena is full. Returns nonzero if the record was emitted.
 int DL_EmitWallTier(const rdp_wall_t* w);
 
+// --- routed-seg per-column capture (Stage 2) -------------------------------
+// All routed-seg capture state + the post-loop run-coalescing emit live HERE,
+// out of the R_RenderSegLoop hot translation unit, so the flag-OFF seg loop
+// compiles to (near) the pre-RDP baseline .text layout. The seg loop, ONLY when
+// it has actually claimed the routed seg, feeds each drawn midtexture column to
+// DL_RouteCapture and then calls DL_RouteEmit once after the column loop.
+
+// Reset the per-column capture for a freshly-claimed routed seg. Called once,
+// right after DL_ClaimWallSeg() returns true.
+void DL_RouteBeginSeg(void);
+
+// Capture one drawn midtexture column of the routed seg. scale = rw_scale at
+// this column, texcol = texturecolumn, walllights = the seg's light table.
+void DL_RouteCapture(int x, int yl, int yh, fixed_t scale, fixed_t texcol,
+                     const void* const* walllights);
+
+// After the column loop, coalesce the captured columns into rdp_wall_t records
+// (per light-level run) and emit them. mid = rw_midtexturemid, texnum =
+// midtexture, centery = the global centery.
+void DL_RouteEmit(fixed_t mid, int texnum, int centery);
+
 // Convert a DOOM wall light index (rw_scale>>LIGHTSCALESHIFT, clamped) plus the
 // seg's walllights table into the colormap level used as the PRIM index. Kept
 // here so the emit site stays a pure data feed.
@@ -69,6 +90,14 @@ void DL_Flush(void);
 // How many records are queued this frame (0 in Stage 2 unless the routed seg
 // was found). Lets the present seam skip the flush plumbing when empty.
 int DL_Count(void);
+
+// Retire per-present RDP world state. Call at the END of the present seam,
+// AFTER the buffer-flip busy spin (which proves the PREVIOUS present's RDP
+// stream fully drained). Demotes texture blocks pinned for the previous
+// present's async RDP reads back to PU_CACHE, and clears the emit arena so a
+// present that skipped the world render (automap, wipe, menu-paced) can never
+// re-flush the last world frame's quads or re-punch its keyed box.
+void DL_PresentEnd(void);
 
 // The inclusive screen-space bounding box [*x0,*y0]..[*x1,*y1] covered by this
 // frame's emitted world records (the routed seg's suppressed-colfunc pixels).

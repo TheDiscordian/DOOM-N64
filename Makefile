@@ -58,6 +58,13 @@ ifeq ($(BENCH_MARKS),1)
 CFLAGS += -DN64_BENCH_MARKS=1
 endif
 endif
+# DL_TRACE=1: one-off diagnostic builds only -- per-present RDP flush/emit
+# trace lines (DL_TRACE ...) on the ISViewer log (rdp_view.c DL_DEBUG_TRACE).
+# Never for timing runs, never the default for capture runs (extra log
+# traffic skews both).
+ifeq ($(DL_TRACE),1)
+CFLAGS += -DDL_DEBUG_TRACE=1
+endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
 CFLAGS += -I$(CURDIR)/libdragon/include
