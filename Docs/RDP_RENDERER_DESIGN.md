@@ -521,6 +521,23 @@ are therefore allocated/pinned `PU_STATIC` while in flight and only demoted to `
 present's RDP stream fully drained (a 2-deep pending/previous in-flight list; see
 `rdp_view.c:DL_MarkInFlight`). The zone LRU still manages everything not in flight.
 
+**Byte-level validation (Stage-2 closure round) — transpose cache and PRIM levels are EXACT.**
+An in-ROM diagnostic build dumped the actual `dl_rowmajor` cache blocks (full hex + CRC-32 over
+the live ISViewer log) for all 10 textures the bench scenario routes — BROWN1, BROWNGRN,
+COMPTILE, COMPUTE2, DOORTRAK, LITE3, STARG3, STARGR1, STARTAN3, SUPPORT2; widths 8/32/64/128/256,
+multi-patch composites and single-patch lump columns both covered — and a host-side harness
+recomputed the expected `block[row*tw+col] == R_GetColumn(tex,col)[row]` bytes from DOOM1.WAD by
+replicating `R_GenerateLookup`/`R_GenerateComposite`/`R_DrawColumnInCache`/`R_GetColumn`
+semantics. Result: 109,568 bytes compared, **zero differing** (all 10 whole-block CRCs equal). The
+same build asserted `(dc_colormap-equivalent pointer) - colormaps == level*256` for every routed
+column over the full 4117-frame run: **zero mismatches** — the PRIM light level equals software's
+colormap level exactly (same `walllights[index]` element, same clamped index expression as
+`r_segs.c:378-383`). Texture DATA delivered to the RDP is bit-exact; any residual texture-look
+report against stills must therefore be judged against freeze-aligned captures (the jittered-still
+"smear"/"blue-noise" residuals of DEFECT-2 were capture artifacts: the state-aligned pairs show
+the same scene structure, e.g. COMPTILE's circuit grid exists identically in the flag-off
+reference).
+
 **TMEM residency (Q6):** 4 KB total; **TLUT permanently owns the upper 2 KB** (256 RGBA16 entries,
 written only by the present blit, persists across frames — `i_video_n64.c:755-764`). The lower 2 KB
 holds exactly one tile per batch. `DL_Flush` uploads one tile, draws all its primitives, then loads
