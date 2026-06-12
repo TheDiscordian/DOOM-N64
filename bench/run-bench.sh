@@ -143,12 +143,29 @@ LAUNCH_PID=$!
 ARES_PGID="$LAUNCH_PID"
 
 # --- wait for the BENCH_RESULT line (or hard timeout) ------------------------
+# Fail fast instead of burning the whole TIMEOUT:
+#  - a crashed ROM prints its assert/exception to the ISViewer log immediately
+#    (the on-screen inspector freezes forever; BENCH_RESULT will never come);
+#  - a ROM wedged at boot never reaches the warmup-done line (warmup is ~1
+#    emulated second; WARMUP_DEADLINE wall seconds is generous even in the
+#    slow-motion virtual-tic-clock mode).
+WARMUP_DEADLINE="${WARMUP_DEADLINE:-120}"
 RESULT=""
-deadline=$(( $(date +%s) + TIMEOUT ))
+start_ts=$(date +%s)
+deadline=$(( start_ts + TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! kill -0 -- "-$ARES_PGID" 2>/dev/null; then
         # OUR ares process group is gone (crash or quit) before we saw a result
         break
+    fi
+    CRASH="$(grep -m1 -E '^ASSERTION FAILED|<EXCEPTION HANDLER>' "$ARES_LOG" 2>/dev/null)"
+    if [ -n "$CRASH" ]; then
+        sleep 2   # let the full backtrace flush through the line-buffered pipe
+        fail "ROM crashed: $(grep -m1 '^ASSERTION FAILED' "$ARES_LOG" 2>/dev/null || echo "$CRASH") -- full backtrace in /tmp/bench-${LABEL}-ares.log"
+    fi
+    if ! grep -q 'warmup done' "$ARES_LOG" 2>/dev/null \
+        && [ $(( $(date +%s) - start_ts )) -gt "$WARMUP_DEADLINE" ]; then
+        fail "ROM wedged: no warmup-done after ${WARMUP_DEADLINE}s (boot hang) -- log in /tmp/bench-${LABEL}-ares.log"
     fi
     RESULT="$(grep -m1 '^BENCH_RESULT' "$ARES_LOG" 2>/dev/null)"
     if [ -n "$RESULT" ]; then
