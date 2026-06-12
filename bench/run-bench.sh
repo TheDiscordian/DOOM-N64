@@ -28,6 +28,7 @@
 #   TIMEOUT=180     hard cap (seconds) on the ares run
 #   ARES=/usr/bin/ares
 #   DOCKER_IMAGE=doom-n64:tc
+#   LOCK_TIMEOUT=1800  max seconds to queue for the build lock
 
 set -u
 
@@ -37,24 +38,28 @@ ARES="${ARES:-/usr/bin/ares}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-doom-n64:tc}"
 TIMEOUT="${TIMEOUT:-180}"
 RUN_ROM="${ROM:-}"
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-1800}"
 
 WORKDIR="$(mktemp -d /tmp/doom-bench.XXXXXX)"
 ARES_LOG="$WORKDIR/ares.log"
 ARES_PGID=""
 
-# --- teardown: kill the ares process group AND sweep any stray ares ----------
+# --- teardown: kill OUR ares process group only -------------------------------
+# Never sweep ares by name: concurrent/queued bench runs (and any ares the user
+# has open themselves) must survive this run's cleanup.
 cleanup() {
     if [ -n "$ARES_PGID" ]; then
         kill -- "-$ARES_PGID" 2>/dev/null
         sleep 0.3
         kill -9 -- "-$ARES_PGID" 2>/dev/null
-    fi
-    # belt-and-suspenders: ares forks a child, $! is only the launcher.
-    local pids
-    pids="$(pgrep -x ares 2>/dev/null)"
-    if [ -n "$pids" ]; then
-        # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null
+        # belt-and-suspenders: ares forks a child; sweep strays, but ONLY ones
+        # still in our process group.
+        local pid
+        for pid in $(pgrep -x ares 2>/dev/null); do
+            if [ "$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$ARES_PGID" ]; then
+                kill -9 "$pid" 2>/dev/null
+            fi
+        done
     fi
     # Preserve the raw ares output (full ISViewer stream incl. phase report)
     # before discarding the workdir.
@@ -66,7 +71,17 @@ trap cleanup EXIT INT TERM
 fail() { echo "BENCH_ERROR $*" >&2; exit 1; }
 
 # --- build (unless a prebuilt ROM was supplied) ------------------------------
+# Only the BUILD is serialized: two builds share build/ and Doom-N64.z64 and
+# would corrupt each other. The ares runs themselves may overlap freely -- the
+# bench measures emulated CP0 ticks (host load doesn't bias results) and
+# teardown/wait are scoped to this run's own process group.
 if [ -z "$RUN_ROM" ]; then
+    LOCKFILE=/tmp/doom-bench-build.lock
+    exec 9>"$LOCKFILE"
+    if ! flock -w "$LOCK_TIMEOUT" 9; then
+        fail "timed out (${LOCK_TIMEOUT}s) waiting for $LOCKFILE held by another bench build"
+    fi
+    echo "[bench] build lock acquired ($LOCKFILE)" >&2
     echo "[bench] building BENCH ROM ($DOCKER_IMAGE)" >&2
     # Full wipe of build/: the n64_bench.o object must never cross-contaminate a
     # later non-BENCH build (the linker pulls in any stale .o left on disk).
@@ -84,6 +99,10 @@ if [ -z "$RUN_ROM" ]; then
     if [ -n "${KEEP_ROM:-}" ]; then
         cp "$BUILT" "$KEEP_ROM" && echo "[bench] kept ROM -> $KEEP_ROM" >&2
     fi
+
+    # ROM is snapshotted into our private workdir; release the build lock so a
+    # queued run can build while our ares run proceeds concurrently.
+    flock -u 9
 fi
 [ -f "$RUN_ROM" ] || fail "ROM not found: $RUN_ROM"
 
@@ -102,8 +121,8 @@ ARES_PGID="$LAUNCH_PID"
 RESULT=""
 deadline=$(( $(date +%s) + TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    if ! pgrep -x ares >/dev/null 2>&1; then
-        # ares exited on its own (crash or quit) before we saw a result
+    if ! kill -0 -- "-$ARES_PGID" 2>/dev/null; then
+        # OUR ares process group is gone (crash or quit) before we saw a result
         break
     fi
     RESULT="$(grep -m1 '^BENCH_RESULT' "$ARES_LOG" 2>/dev/null)"
