@@ -391,6 +391,16 @@ void DL_RouteBeginSeg(void)
 {
     dl_rt_first = -1;
     dl_rt_last  = -1;
+    // Clear the drawn flags for the whole width. The seg loop only calls
+    // DL_RouteCapture for columns that actually draw (yl <= yh), so a column
+    // skipped this seg would otherwise keep a STALE drawn=1 (and stale
+    // yl/yh/scale/texturecolumn) from an earlier frame's routed seg. The emit
+    // walk reads those stale cells for run-break decisions and (worse) as run
+    // endpoints, producing quads at last-frame's screen coordinates -- visible
+    // as warped / misplaced wall pieces. The pre-refactor seg loop zeroed the
+    // flag inline in its else-branch; this restores that invariant in one
+    // place. 320 bytes once per claimed seg (once per frame), flag-on only.
+    memset(dl_rt_drawn, 0, sizeof(dl_rt_drawn));
 }
 
 void DL_RouteCapture(int x, int yl, int yh, fixed_t scale, fixed_t texcol,
