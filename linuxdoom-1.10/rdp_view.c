@@ -429,11 +429,29 @@ void DL_RouteCapture(int x, int yl, int yh, fixed_t scale, fixed_t texcol,
 // Coalesce the captured columns into rdp_wall_t records, splitting at columns
 // where the colormap light level changes (per light-level run -- preserves
 // vanilla's per-column light banding as long contiguous runs; Q8 mitigation).
-// The quad's screen-space top/bottom edges and S are sampled at each run's
-// left/right columns (top/bottom/scale step linearly, so a per-run quad is
-// geometrically exact between its endpoints). T_top/T_bot are the texel rows at
-// the wall's top/bottom screen edges -- a constant for the wall thanks to the
-// free-W perspective property (Q1), so taken at the run's left column.
+//
+// COVERAGE RULE (the wall/plane junction-gap fix): every suppressed CPU pixel
+// -- exactly the per-column [yl..yh] spans, with software's own >>HEIGHTBITS
+// truncation -- MUST be covered by an emitted quad, or it stays key-index and
+// the keyed present blit punches a hole at the junction (green/stale gap rows
+// between the wall and its CPU-drawn ceiling/floor). A quad whose edges lerp
+// yl/yh between the run's endpoint columns can land sub-row SHORT of the
+// truncated per-column spans in between. Instead each run emits its full
+// bounding RECTANGLE: ytop = min(yl), ybot = max(yh)+1 over the run. OVER-
+// coverage is harmless by construction: every overdrawn pixel outside the
+// suppressed spans holds non-key software art in the CI8 overlay, so the
+// present blit (keyed inside the box, opaque outside) repaints it -- only
+// key pixels ever reveal the RDP layer. UNDER-coverage is the only sin.
+//
+// T is computed PER CORNER from that corner's own 1/scale (T at a shared
+// screen row differs between edges when scale differs). With per-corner T and
+// INV_W = scale*k, T/W and 1/W are affine in screen space, so the perspective
+// interpolation reproduces software's per-column T = mid + (y-cy)/scale(x)
+// exactly (DOOM itself lerps scale linearly per column); rect corners above/
+// below a column's drawn span just extend the same projective map, so texel
+// rows stay aligned with software wherever pixels survive the blit. The 16.16
+// fraction is kept (divide, not >>FRACBITS) so band slicing in DL_Flush never
+// mis-seats a seam.
 void DL_RouteEmit(fixed_t mid, int texnum, int centery)
 {
     const float     k = dl_invw_k;
@@ -480,27 +498,42 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
             fixed_t     sca = dl_rt_scale[xa];
             fixed_t     scb = dl_rt_scale[xb];
             fixed_t     isca = 0xffffffffu / (unsigned)sca;
+            fixed_t     iscb = 0xffffffffu / (unsigned)scb;
+            int         ytop, ybot;
+            int         xi;
             rdp_wall_t  w;
+
+            // Run bounding rectangle: cover every column's truncated
+            // [yl..yh] span exactly (see COVERAGE RULE above).
+            ytop = dl_rt_yl[xa];
+            ybot = dl_rt_yh[xa];
+            for (xi = xa + 1; xi <= xb; xi++)
+            {
+                if (dl_rt_yl[xi] < ytop) ytop = dl_rt_yl[xi];
+                if (dl_rt_yh[xi] > ybot) ybot = dl_rt_yh[xi];
+            }
+            ybot += 1;                  // span is inclusive
 
             w.x1 = (int16_t)xa;
             w.x2 = (int16_t)xb;
-            w.ytop_l = (float)dl_rt_yl[xa];
-            w.ybot_l = (float)(dl_rt_yh[xa] + 1);   // span is inclusive
-            w.ytop_r = (float)dl_rt_yl[xb];
-            w.ybot_r = (float)(dl_rt_yh[xb] + 1);
+            w.ytop_l = (float)ytop;
+            w.ybot_l = (float)ybot;
+            w.ytop_r = (float)ytop;
+            w.ybot_r = (float)ybot;
             w.s_l = (float)dl_rt_scol[xa];
             w.s_r = (float)dl_rt_scol[xb];
             w.invw_l = (float)sca * k;
             w.invw_r = (float)scb * k;
-            // T texel rows at the wall's top/bottom screen edges (left col).
-            // Keep the 16.16 FRACTION (divide, don't >>FRACBITS-truncate): the
-            // flush slices the quad into TMEM bands and truncating here shifted
-            // every band by up to a texel, mis-seating the band seams. The
-            // fixed-point sum itself keeps software's wrap-around semantics.
-            w.t_top = (float)(mid + (dl_rt_yl[xa] - cy) * isca)
-                      * (1.0f / (float)FRACUNIT);
-            w.t_bot = (float)(mid + ((dl_rt_yh[xa] + 1) - cy) * isca)
-                      * (1.0f / (float)FRACUNIT);
+            // Per-corner T at the rect's shared top/bottom rows, through each
+            // edge's own 1/scale (see the T note above).
+            w.t_top_l = (float)(mid + (ytop - cy) * isca)
+                        * (1.0f / (float)FRACUNIT);
+            w.t_bot_l = (float)(mid + (ybot - cy) * isca)
+                        * (1.0f / (float)FRACUNIT);
+            w.t_top_r = (float)(mid + (ytop - cy) * iscb)
+                        * (1.0f / (float)FRACUNIT);
+            w.t_bot_r = (float)(mid + (ybot - cy) * iscb)
+                        * (1.0f / (float)FRACUNIT);
             w.texid = (uint16_t)texnum;
             w.light = dl_rt_lit[xa];
 
@@ -663,7 +696,9 @@ void DL_Flush(void)
         uint32_t prim;
         float   xl, xr;
         float   s_l, s_r;       // S endpoints, period-bias-reduced (BUG D)
-        float   t0, t1;         // texel-T range covered by the quad
+        float   tl0, tl1;       // left-edge texel-T range (top..bottom)
+        float   tr0, tr1;       // right-edge texel-T range (top..bottom)
+        float   t0, t1;         // union texel-T range covered by the quad
 
         block = DL_RowMajorBlock(w->texid, &blkh, &blkw);
         if (!block || blkh < 1 || blkw < 1)
@@ -677,12 +712,12 @@ void DL_Flush(void)
 
 #if DL_DEBUG_TRACE
         debugf("DL_TRACE p=%d rec=%d tex=%d w=%d h=%d x=%d..%d "
-               "y=%d.%d/%d.%d t=%d.%d..%d.%d s=%d..%d lit=%d\n",
+               "y=%d.%d/%d.%d tl=%d..%d tr=%d..%d s=%d..%d lit=%d\n",
                dl_present_no, i, w->texid, blkw, blkh,
                (int)w->x1, (int)w->x2,
                (int)w->ytop_l, (int)w->ytop_r, (int)w->ybot_l, (int)w->ybot_r,
-               (int)w->t_top, (int)((w->t_top - (int)w->t_top) * 100),
-               (int)w->t_bot, (int)((w->t_bot - (int)w->t_bot) * 100),
+               (int)w->t_top_l, (int)w->t_bot_l,
+               (int)w->t_top_r, (int)w->t_bot_r,
                (int)w->s_l, (int)w->s_r, (int)w->light);
 #endif
 
@@ -719,8 +754,17 @@ void DL_Flush(void)
             s_r = w->s_r - bias;
         }
 
-        t0 = w->t_top;          // texel row at the wall's TOP screen edge
-        t1 = w->t_bot;          // texel row at the wall's BOTTOM screen edge
+        // Per-edge T ranges (texel rows at the rect's top/bottom screen rows,
+        // through each edge's own 1/scale -- see DL_RouteEmit). Both increase
+        // down-screen. The band walk marches their UNION; a band's slice is
+        // clamped per edge, so adjacent slices share their boundary chord
+        // exactly (no gap, no overlap) and the union tiles the full rect.
+        tl0 = w->t_top_l;
+        tl1 = w->t_bot_l;
+        tr0 = w->t_top_r;
+        tr1 = w->t_bot_r;
+        t0 = (tl0 < tr0) ? tl0 : tr0;   // union range start
+        t1 = (tl1 > tr1) ? tl1 : tr1;   // union range end
 
         // Texel-T band walk (BUG B fix). DOOM's column drawer WRAPS the source
         // vertically (`source[(frac>>FRACBITS)&127]`, r_draw.c:150) -- the
@@ -773,8 +817,10 @@ void DL_Flush(void)
             int     rows;           // drawn rows in this band
             int     rows_up;        // uploaded rows (rows + optional overlap)
             float   band_end;       // T where this band stops (texels)
-            float   f0, f1;         // screen-Y lerp factors for the slice
-            float   bt0, bt1;       // band-local T at slice top/bottom
+            float   a_l, b_l;       // band T clamped into the left edge range
+            float   a_r, b_r;       // band T clamped into the right edge range
+            float   f0, f1;         // per-edge screen-Y lerp factors
+            float   base;           // band-local T origin (texels)
             float   ytl, ytr, ybl, ybr;
             byte*   bandsrc;
 
@@ -811,25 +857,57 @@ void DL_Flush(void)
             parms.t.repeats = 1;                // clamp T at the band edges
             rdpq_tex_upload(TILE0, &surf, &parms);
 
-            // Screen-Y for this slice: Y is affine in T along the wall (free-W,
-            // Q1), so lerp both edges by the slice's fractional T position.
-            f0 = (cur - t0) / span;
-            f1 = (band_end - t0) / span;
+            // Slice corners. T iso-lines of the wall's projective map are
+            // straight lines in screen space, so the slice between T=cur and
+            // T=band_end is bounded by two chords; each chord's endpoint on an
+            // edge sits at that EDGE's own T position, clamped into the edge's
+            // range (a chord that exits through the rect's horizontal top/
+            // bottom edge clamps to the corner). Adjacent bands clamp the SAME
+            // chord identically, so slices share edges exactly -- the union
+            // tiles the full rect with no gap and no overlap. Y is affine in T
+            // along each vertical edge, so the corner Y is a per-edge lerp.
+            a_l = cur;
+            if (a_l < tl0) a_l = tl0;
+            if (a_l > tl1) a_l = tl1;
+            b_l = band_end;
+            if (b_l < tl0) b_l = tl0;
+            if (b_l > tl1) b_l = tl1;
+            a_r = cur;
+            if (a_r < tr0) a_r = tr0;
+            if (a_r > tr1) a_r = tr1;
+            b_r = band_end;
+            if (b_r < tr0) b_r = tr0;
+            if (b_r > tr1) b_r = tr1;
+
+            f0 = (a_l - tl0) / (tl1 - tl0);
+            f1 = (b_l - tl0) / (tl1 - tl0);
             ytl = w->ytop_l + (w->ybot_l - w->ytop_l) * f0;
             ybl = w->ytop_l + (w->ybot_l - w->ytop_l) * f1;
+            f0 = (a_r - tr0) / (tr1 - tr0);
+            f1 = (b_r - tr0) / (tr1 - tr0);
             ytr = w->ytop_r + (w->ybot_r - w->ytop_r) * f0;
             ybr = w->ytop_r + (w->ybot_r - w->ytop_r) * f1;
 
-            // Band-local T, fraction preserved (the slice's top usually starts
-            // mid-texel after a period or cap split).
-            bt0 = cur - (float)(period_base + src_lo);
-            bt1 = band_end - (float)(period_base + src_lo);
+            // Skip a slice that degenerated on BOTH edges (band entirely
+            // outside both edge ranges -- possible at the union's extremes).
+            if (b_l <= a_l && b_r <= a_r)
+            {
+                cur = band_end;
+                continue;
+            }
+
+            // Band-local, fraction-preserved T per corner (the slice's top
+            // usually starts mid-texel after a period or cap split). A corner
+            // clamped past the band range by the chord clamp lands within one
+            // texel of the tile edge; t.repeats=1 + the overlap row keep the
+            // sampled texel correct there.
+            base = (float)(period_base + src_lo);
 
             {
-                float tl[5] = { xl, ytl, s_l, bt0, w->invw_l };
-                float tr[5] = { xr, ytr, s_r, bt0, w->invw_r };
-                float bl[5] = { xl, ybl, s_l, bt1, w->invw_l };
-                float br[5] = { xr, ybr, s_r, bt1, w->invw_r };
+                float tl[5] = { xl, ytl, s_l, a_l - base, w->invw_l };
+                float tr[5] = { xr, ytr, s_r, a_r - base, w->invw_r };
+                float bl[5] = { xl, ybl, s_l, b_l - base, w->invw_l };
+                float br[5] = { xr, ybr, s_r, b_r - base, w->invw_r };
 
                 rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
                 rdpq_triangle(&TRIFMT_TEX, tr, br, bl);

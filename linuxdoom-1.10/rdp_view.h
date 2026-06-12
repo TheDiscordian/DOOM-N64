@@ -28,15 +28,21 @@
 // the quad is two triangles. Per Docs/RDP_RENDERER_DESIGN.md section 2.
 //
 // S is the texture column (texels) and is perspective-correct across the seg
-// (free INV_W from rw_scale, Q1). T is affine in screen-y per column, so T at
-// the top/bottom edges is a constant texel row for the whole wall.
+// (free INV_W from rw_scale, Q1). T is affine in screen-y per column with
+// per-column slope 1/scale, so T at a shared screen row DIFFERS between the
+// left and right edges whenever the scale differs -- the record carries T per
+// corner. With per-corner T (and INV_W = scale*k), T/W and 1/W are affine in
+// screen space, so the RDP's perspective interpolation reproduces software's
+// per-column T = mid + (y - centery)/scale(x) exactly (scale itself stepping
+// linearly per column, as DOOM lerps it).
 typedef struct
 {
     int16_t  x1, x2;            // screen column span (inclusive); vertical edges
     float    ytop_l, ybot_l;    // top/bottom screen Y at the left edge
     float    ytop_r, ybot_r;    // top/bottom screen Y at the right edge
     float    s_l, s_r;          // texture S (texels) at each edge
-    float    t_top, t_bot;      // texture T (texels) at the top/bottom edges
+    float    t_top_l, t_bot_l;  // texture T (texels) at the LEFT edge's Y span
+    float    t_top_r, t_bot_r;  // texture T (texels) at the RIGHT edge's Y span
     float    invw_l, invw_r;    // INV_W = rw_scale * k (free W, Q1)
     uint16_t texid;             // texnum (the wall texture)
     uint8_t  light;             // colormap level 0..NUMCOLORMAPS-1 (PRIM index)
