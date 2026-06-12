@@ -25,6 +25,8 @@
 #   ROM=path        skip the build, run an existing BENCH .z64
 #   BENCH_MP=N      build the scripted local split-screen bench (N players)
 #   BENCH_FORCE_RDP=1  build with the RDP renderer forced on (flag-on A/B runs)
+#   BENCH_MARKS=1   build with frame-keyed BENCH_MARK log lines for screenshot
+#                   capture runs (never for timing runs -- skews the numbers)
 #   KEEP_ROM=path   copy the built ROM here after the run (e.g. baseline)
 #   TIMEOUT=180     hard cap (seconds) on the ares run
 #   ARES=/usr/bin/ares
@@ -88,7 +90,7 @@ if [ -z "$RUN_ROM" ]; then
     # later non-BENCH build (the linker pulls in any stale .o left on disk).
     docker run --rm -v "$REPO":/doom -w /doom -e N64_INST=/n64_toolchain \
         "$DOCKER_IMAGE" bash -c \
-        "rm -rf filesystem build && make BENCH=1 ${BENCH_MP:+BENCH_MP=$BENCH_MP }${BENCH_FORCE_RDP:+BENCH_FORCE_RDP=$BENCH_FORCE_RDP }-j4" \
+        "rm -rf filesystem build && make BENCH=1 ${BENCH_MP:+BENCH_MP=$BENCH_MP }${BENCH_FORCE_RDP:+BENCH_FORCE_RDP=$BENCH_FORCE_RDP }${BENCH_MARKS:+BENCH_MARKS=$BENCH_MARKS }-j4" \
         >"$WORKDIR/build.log" 2>&1 \
         || { cat "$WORKDIR/build.log" >&2; fail "build failed"; }
 

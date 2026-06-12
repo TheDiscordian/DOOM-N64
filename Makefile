@@ -50,6 +50,13 @@ endif
 ifeq ($(BENCH_FORCE_RDP),1)
 CFLAGS += -DBENCH_FORCE_RDP=1
 endif
+# BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
+# ISViewer every 256 retained frames) for exactly-paired cross-build
+# screenshot series. Visual-capture builds only -- never timing builds, the
+# debugf cost would skew the numbers.
+ifeq ($(BENCH_MARKS),1)
+CFLAGS += -DN64_BENCH_MARKS=1
+endif
 endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
