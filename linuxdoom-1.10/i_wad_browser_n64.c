@@ -1866,6 +1866,14 @@ void I_N64RunWadBrowser(void)
     I_N64LogMemoryStats("wad_browser:after_exit");
 }
 
+#ifdef N64_BENCH
+void I_N64ForceSelectedWad(const char* path)
+{
+    I_CopyTruncated(n64_selected_wad, sizeof(n64_selected_wad), path);
+    I_CopyTruncated(n64_selected_base_iwad, sizeof(n64_selected_base_iwad), path);
+}
+#endif
+
 const char* I_N64GetSelectedWadPath(void)
 {
     return n64_selected_wad;

@@ -79,6 +79,10 @@ rcsid[] = "$Id: g_game.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
 
 #include "g_game.h"
 
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
+
 
 #define SAVEGAMESIZE	0x2c000
 #define SAVESTRINGSIZE	24
@@ -609,12 +613,17 @@ void G_BuildTiccmd (ticcmd_t* cmd)
 	cmd->buttons = BT_SPECIAL | BTS_PAUSE; 
     } 
  
-    if (sendsave) 
-    { 
-	sendsave = false; 
-	cmd->buttons = BT_SPECIAL | BTS_SAVEGAME | (savegameslot<<BTS_SAVESHIFT); 
-    } 
-} 
+    if (sendsave)
+    {
+	sendsave = false;
+	cmd->buttons = BT_SPECIAL | BTS_SAVEGAME | (savegameslot<<BTS_SAVESHIFT);
+    }
+#ifdef N64_BENCH
+    // Bench: replace real input with the deterministic scripted sequence so the
+    // scenario is identical every run, independent of any host-side input.
+    N64Bench_FillTiccmd(cmd);
+#endif
+}
 
 #ifdef N64
 void G_BuildTiccmdN64Local(ticcmd_t* cmd, int playernum, const n64_local_input_t* input)
@@ -1029,11 +1038,15 @@ void G_Ticker (void)
 	F_Ticker (); 
 	break; 
  
-      case GS_DEMOSCREEN: 
-	D_PageTicker (); 
-	break; 
-    }        
-} 
+      case GS_DEMOSCREEN:
+	D_PageTicker ();
+	break;
+    }
+#ifdef N64_BENCH
+    // Once per gametic: advance scenario timing (warm-up / collect / finish).
+    N64Bench_TicHook();
+#endif
+}
  
  
 //

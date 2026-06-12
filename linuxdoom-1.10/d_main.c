@@ -86,6 +86,9 @@ static const char rcsid[] = "$Id: d_main.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
 #include "i_main_n64.h"
 #include "n64_debug.h"
 #endif
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
 
 //
 // D-DoomLoop()
@@ -785,6 +788,9 @@ void D_Display (void)
     M_Drawer ();          // menu is drawn even on top of everything
     NetUpdate ();         // send out any new accumulation
 
+#ifdef N64_BENCH
+    N64Bench_DrawOverlay();   // frozen result numbers, drawn over everything
+#endif
 
     // normal update
     if (!wipe)
@@ -899,6 +905,13 @@ void D_DoomLoop (void)
 		&& (!netgame || D_LocalMultiplayerEnabled());
 	    boolean interpolate =
 		render_uncapped && frame_interpolation && !D_LocalMultiplayerEnabled();
+#ifdef N64_BENCH
+	    // Bench measures the SHIPPING uncapped+interpolated path; force
+	    // interpolation on regardless of persisted EEPROM settings (which the
+	    // emulator may not carry). singletics/demoplayback are never set here.
+	    if (N64Bench_Active())
+		interpolate = render_uncapped && !D_LocalMultiplayerEnabled();
+#endif
 
 	    r_interpolate = interpolate;
 	    tryruntics_nonblocking = render_uncapped;
@@ -945,7 +958,13 @@ void D_DoomLoop (void)
 	S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
 
 	// Update display, next frame, with current state.
+#ifdef N64_BENCH
+	N64Bench_FrameBegin();
+#endif
 	D_Display ();
+#ifdef N64_BENCH
+	N64Bench_FrameEnd();
+#endif
 
 #ifndef SNDSERV
 	// Sound mixing for the buffer is snychronous.
@@ -2012,6 +2031,16 @@ void D_DoomMain (void)
 	G_LoadGame (file);
     }
 	
+
+#ifdef N64_BENCH
+    // Bench mode: auto-start E1M1 on medium skill, no monsters disabled (a
+    // representative scenario), and arm the harness. Bypasses the title loop.
+    startskill = sk_medium;
+    startepisode = 1;
+    startmap = 1;
+    autostart = true;
+    N64Bench_Init();
+#endif
 
     if ( gameaction != ga_loadgame )
     {
