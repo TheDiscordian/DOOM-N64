@@ -92,8 +92,8 @@ typedef struct
     int			x;
     int			y;
 
-    // last icon number
-    int			oldinum;
+    // last icon number drawn into each CI8 draw buffer
+    int			oldinum[2];
 
     // pointer to current icon
     int*		inum;
@@ -121,8 +121,8 @@ typedef struct
     int			x;
     int			y;
 
-    // last icon value
-    int			oldval;
+    // last icon value drawn into each CI8 draw buffer
+    int			oldval[2];
 
     // pointer to current icon status
     boolean*		val;

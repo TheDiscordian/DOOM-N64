@@ -701,6 +701,12 @@ static void I_N64PointScreen(int idx)
     F_N64WipeRebaseScreen();
 }
 
+// CI8 draw-buffer index; st_lib keeps widget diff state per buffer.
+int I_N64DrawBufferIndex(void)
+{
+    return n64_draw_idx;
+}
+
 // Fired (under RDP interrupt) when the RDP has finished reading a CI8 buffer.
 // Marks it free and shows the framebuffer it was blitted into -- the same
 // display_show that rdpq_detach_show would have scheduled.

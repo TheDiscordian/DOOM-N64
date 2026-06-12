@@ -42,6 +42,9 @@ rcsid[] = "$Id: st_lib.c,v 1.4 1997/02/03 16:47:56 b1 Exp $";
 #include "st_lib.h"
 #include "r_local.h"
 
+// CI8 draw-buffer index (i_video_n64.c); widget diff state is kept per buffer.
+int I_N64DrawBufferIndex(void);
+
 
 // in AM_map.c
 extern boolean		automapactive; 
@@ -200,7 +203,8 @@ STlib_initMultIcon
 {
     i->x	= x;
     i->y	= y;
-    i->oldinum 	= -1;
+    i->oldinum[0] = -1;
+    i->oldinum[1] = -1;
     i->inum	= inum;
     i->on	= on;
     i->p	= il;
@@ -217,17 +221,18 @@ STlib_updateMultIcon
     int			h;
     int			x;
     int			y;
+    int			idx = I_N64DrawBufferIndex();
 
     if (*mi->on
-	&& (mi->oldinum != *mi->inum || refresh)
+	&& (mi->oldinum[idx] != *mi->inum || refresh)
 	&& (*mi->inum!=-1))
     {
-	if (mi->oldinum != -1)
+	if (mi->oldinum[idx] != -1)
 	{
-	    x = mi->x - SHORT(mi->p[mi->oldinum]->leftoffset);
-	    y = mi->y - SHORT(mi->p[mi->oldinum]->topoffset);
-	    w = SHORT(mi->p[mi->oldinum]->width);
-	    h = SHORT(mi->p[mi->oldinum]->height);
+	    x = mi->x - SHORT(mi->p[mi->oldinum[idx]]->leftoffset);
+	    y = mi->y - SHORT(mi->p[mi->oldinum[idx]]->topoffset);
+	    w = SHORT(mi->p[mi->oldinum[idx]]->width);
+	    h = SHORT(mi->p[mi->oldinum[idx]]->height);
 
 	    if (y - ST_Y < 0)
 		I_Error("updateMultIcon: y - ST_Y < 0");
@@ -235,7 +240,7 @@ STlib_updateMultIcon
 	    V_CopyRect(x, y-ST_Y, BG, w, h, x, y, FG);
 	}
 	V_DrawPatch(mi->x, mi->y, FG, mi->p[*mi->inum]);
-	mi->oldinum = *mi->inum;
+	mi->oldinum[idx] = *mi->inum;
     }
 }
 
@@ -252,7 +257,8 @@ STlib_initBinIcon
 {
     b->x	= x;
     b->y	= y;
-    b->oldval	= 0;
+    b->oldval[0] = 0;
+    b->oldval[1] = 0;
     b->val	= val;
     b->on	= on;
     b->p	= i;
@@ -269,9 +275,10 @@ STlib_updateBinIcon
     int			y;
     int			w;
     int			h;
+    int			idx = I_N64DrawBufferIndex();
 
     if (*bi->on
-	&& (bi->oldval != *bi->val || refresh))
+	&& (bi->oldval[idx] != *bi->val || refresh))
     {
 	x = bi->x - SHORT(bi->p->leftoffset);
 	y = bi->y - SHORT(bi->p->topoffset);
@@ -286,7 +293,7 @@ STlib_updateBinIcon
 	else
 	    V_CopyRect(x, y-ST_Y, BG, w, h, x, y, FG);
 
-	bi->oldval = *bi->val;
+	bi->oldval[idx] = *bi->val;
     }
 
 }
