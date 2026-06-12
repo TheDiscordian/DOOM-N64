@@ -685,6 +685,7 @@ typedef struct
     uint32_t       voice_seq;
     mus_voice_t    voices[MUS_MAX_VOICES];
     n64_mus_channel_t channels[MUS_MAX_CHANNELS];
+    uint16_t       active_mask;     /* bit v set iff voices[v].active */
     uint8_t        playing;
     uint8_t        looping;
     uint8_t        eos;
@@ -708,6 +709,12 @@ static n64_mus_instrument_t mus_instruments[MUS_NUM_MIDI_INSTRUMENTS];
 static uint32_t mus_instrument_ptrs[MUS_NUM_MIDI_INSTRUMENTS];
 static char mus_bank_path[MUS_BANK_PATH_MAX];
 static boolean mus_bank_loaded;
+
+// Cached scratch the per-sample mix is rendered into before being block-copied
+// into the uncached mixer buffer; processed in MUS_SCRATCH_SAMPLES chunks so any
+// poll length is covered. 8-byte aligned for 64-bit copies into the dest.
+#define MUS_SCRATCH_SAMPLES 1024
+static int16_t mus_scratch[MUS_SCRATCH_SAMPLES * 2] __attribute__((aligned(8)));
 
 static uint16_t N64_BSwap16(uint16_t value)
 {
@@ -1076,6 +1083,7 @@ static void N64_MusStopVoice(int voice)
     }
 
     memset(mv, 0, sizeof(*mv));
+    mus_player.active_mask &= (uint16_t)~(1u << voice);
 }
 
 static void N64_MusStopAllVoices(void)
@@ -1560,6 +1568,7 @@ static void N64_MusPlayNote(int ch, int note, int note_volume)
 
     memset(mv, 0, sizeof(*mv));
     mv->active = 1;
+    mus_player.active_mask |= (uint16_t)(1u << voice);
     mv->channel = (int16_t)ch;
     mv->note = (uint8_t)note;
     mv->lvol = channel->lvol;
@@ -1966,78 +1975,116 @@ static void N64_MusWaveRead(void *ctx, samplebuffer_t *sbuf,
     if (!buf)
         return;
 
-    for (i = 0; i < wlen; i++)
     {
-        /* advance MUS tick counter */
-        mus_player.tick_frac += MUS_TICK_RATE;
-        while (mus_player.tick_frac >= N64_AUDIO_FREQUENCY)
+        int remaining = wlen;
+        int16_t *dst = buf;
+
+        while (remaining > 0)
         {
-            mus_player.tick_frac -= N64_AUDIO_FREQUENCY;
-            if (!mus_player.eos)
+            int chunk = (remaining < MUS_SCRATCH_SAMPLES)
+                      ? remaining : MUS_SCRATCH_SAMPLES;
+            int16_t *scratch = mus_scratch;
+
+            for (i = 0; i < chunk; i++)
             {
-                if (mus_player.tick_delay > 0)
-                    mus_player.tick_delay--;
-                if (mus_player.tick_delay == 0)
+                uint32_t mask;
+
+                /* advance MUS tick counter */
+                mus_player.tick_frac += MUS_TICK_RATE;
+                while (mus_player.tick_frac >= N64_AUDIO_FREQUENCY)
                 {
-                    do { N64_MusProcessBatch(); }
-                    while (mus_player.tick_delay == 0 && !mus_player.eos);
+                    mus_player.tick_frac -= N64_AUDIO_FREQUENCY;
+                    if (!mus_player.eos)
+                    {
+                        if (mus_player.tick_delay > 0)
+                            mus_player.tick_delay--;
+                        if (mus_player.tick_delay == 0)
+                        {
+                            do { N64_MusProcessBatch(); }
+                            while (mus_player.tick_delay == 0 && !mus_player.eos);
+                        }
+                        if (mus_player.eos)
+                        {
+                            if (mus_player.looping)
+                            {
+                                N64_MusResetPlayback();
+                                N64_MusProcessBatch();
+                            }
+                            else
+                            {
+                                mus_player.playing = 0;
+                            }
+                        }
+                    }
                 }
-                if (mus_player.eos)
+
+                mix_l = 0;
+                mix_r = 0;
+
+                /* render only active voices, ascending index order */
+                mask = mus_player.active_mask;
+                while (mask)
                 {
-                    if (mus_player.looping)
-                    {
-                        N64_MusResetPlayback();
-                        N64_MusProcessBatch();
-                    }
-                    else
-                    {
-                        mus_player.playing = 0;
-                    }
+                    v = __builtin_ctz(mask);
+                    mask &= mask - 1;
+                    N64_MusRenderVoice(v, &mix_l, &mix_r);
                 }
-            }
-        }
 
-        mix_l = 0;
-        mix_r = 0;
+                if (mix_l > 32767)
+                    mix_l = 32767;
+                else if (mix_l < -32768)
+                    mix_l = -32768;
 
-        for (v = 0; v < MUS_MAX_VOICES; v++)
-            N64_MusRenderVoice(v, &mix_l, &mix_r);
+                if (mix_r > 32767)
+                    mix_r = 32767;
+                else if (mix_r < -32768)
+                    mix_r = -32768;
 
-        if (mix_l > 32767)
-            mix_l = 32767;
-        else if (mix_l < -32768)
-            mix_l = -32768;
-
-        if (mix_r > 32767)
-            mix_r = 32767;
-        else if (mix_r < -32768)
-            mix_r = -32768;
-
-        buf[i * 2]     = (int16_t)mix_l;
-        buf[i * 2 + 1] = (int16_t)mix_r;
+                scratch[i * 2]     = (int16_t)mix_l;
+                scratch[i * 2 + 1] = (int16_t)mix_r;
 
 #if DOOM_N64_DEBUG
-        sum = (mix_l + mix_r) / 2;
-        abs_sum = (sum < 0) ? -sum : sum;
-        if (abs_sum > mus_player.dbg_peak_abs)
-            mus_player.dbg_peak_abs = abs_sum;
+                sum = (mix_l + mix_r) / 2;
+                abs_sum = (sum < 0) ? -sum : sum;
+                if (abs_sum > mus_player.dbg_peak_abs)
+                    mus_player.dbg_peak_abs = abs_sum;
 
-        if (sum != 0)
-        {
-            mus_player.dbg_nonzero_samples++;
-            if (!mus_player.dbg_reported_nonzero)
-            {
-                N64_DEBUGF("MUS first nonzero sample at %u (amp=%d, notes_on=%u, events=%u)\n",
-                       (unsigned)mus_player.dbg_generated_samples,
-                       (int)sum,
-                       (unsigned)mus_player.dbg_note_on,
-                       (unsigned)mus_player.dbg_events);
-                mus_player.dbg_reported_nonzero = 1;
-            }
-        }
+                if (sum != 0)
+                {
+                    mus_player.dbg_nonzero_samples++;
+                    if (!mus_player.dbg_reported_nonzero)
+                    {
+                        N64_DEBUGF("MUS first nonzero sample at %u (amp=%d, notes_on=%u, events=%u)\n",
+                               (unsigned)mus_player.dbg_generated_samples,
+                               (int)sum,
+                               (unsigned)mus_player.dbg_note_on,
+                               (unsigned)mus_player.dbg_events);
+                        mus_player.dbg_reported_nonzero = 1;
+                    }
+                }
 
-        mus_player.dbg_generated_samples++;
+                mus_player.dbg_generated_samples++;
 #endif
+            }
+
+            /* copy cached scratch into the uncached mixer buffer; both are
+               8-byte aligned so move 4 int16s (two stereo samples) at a time. */
+            {
+                int words = chunk * 2;          /* int16 lanes in this chunk */
+                int j = 0;
+                const uint64_t *src64 = (const uint64_t *)scratch;
+                uint64_t *dst64 = (uint64_t *)dst;
+
+                for (; j + 4 <= words; j += 4)
+                    *dst64++ = *src64++;
+
+                for (; j < words; j++)
+                    dst[j] = scratch[j];
+            }
+
+            dst += chunk * 2;
+            remaining -= chunk;
+        }
     }
 
     #if DOOM_N64_DEBUG
