@@ -1227,7 +1227,24 @@ void I_FinishUpdate(void)
         // exclusive box edges for the opaque bands
         int bx1 = kx1 + 1;      // one past the box's right column
         int by1 = ky1 + 1;      // one past the box's bottom row
+        rdpq_blitparms_t bp;
 
+        // CARVING RULE (LOAD-BEARING): each region is blitted as an EXPLICIT
+        // SOURCE SUB-RECT (rdpq_blitparms_t s0/t0/width/height) drawn at its
+        // own screen position -- NEVER as a full-surface blit carved by the
+        // scissor. A COPY-mode texture rectangle that crosses the scissor's
+        // left/top edge does NOT get its texture coordinates compensated for
+        // the clipped-off part: the rectangle's S restarts at the scissor
+        // edge, so the blit painted SCREEN-LEFT content at the region's left
+        // edge. That one displacement produced the whole duplication defect
+        // family: the view's left half mirrored into the right half (box
+        // shifted by kx0), the gun/HU text duplicated "on the opposite side"
+        // (bands shifted by bx1), and solid key-colour polygons (a band's
+        // shifted sampling window covering the suppressed key columns gets
+        // painted with alpha-compare OFF -- a translated opaque copy of the
+        // keyed wall region). Sub-rect blits derive the texrect S/T and
+        // screen X/Y together, so no clipping is ever needed.
+        //
         // (1) Keyed box: alpha-compare ON discards the key-index pixels so the
         //     RDP fill drawn earlier survives there; non-key overlay pixels in
         //     the box (e.g. HUD intruding into these columns -- scanned safe)
@@ -1249,8 +1266,10 @@ void I_FinishUpdate(void)
         rdpq_set_blend_color(RGBA32(0, 0, 0, 1));
         rdpq_set_mode_copy(true);
         rdpq_mode_tlut(TLUT_RGBA16);
-        rdpq_set_scissor(kx0, ky0, bx1, by1);
-        rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+        memset(&bp, 0, sizeof(bp));
+        bp.s0 = kx0;  bp.t0 = ky0;
+        bp.width = bx1 - kx0;  bp.height = by1 - ky0;
+        rdpq_tex_blit(&doom_screen8[n64_draw_idx], kx0, ky0, &bp);
 
         // (2) Opaque remainder: the up-to-4 bands around the box, alpha-compare
         //     OFF, so software-rendered world art outside the box is blitted
@@ -1262,30 +1281,35 @@ void I_FinishUpdate(void)
         // top band: full width, rows [0, ky0)
         if (ky0 > 0)
         {
-            rdpq_set_scissor(0, 0, SCREENWIDTH, ky0);
-            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+            memset(&bp, 0, sizeof(bp));
+            bp.s0 = 0;  bp.t0 = 0;
+            bp.width = SCREENWIDTH;  bp.height = ky0;
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, &bp);
         }
         // bottom band: full width, rows [by1, SCREENHEIGHT)
         if (by1 < SCREENHEIGHT)
         {
-            rdpq_set_scissor(0, by1, SCREENWIDTH, SCREENHEIGHT);
-            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+            memset(&bp, 0, sizeof(bp));
+            bp.s0 = 0;  bp.t0 = by1;
+            bp.width = SCREENWIDTH;  bp.height = SCREENHEIGHT - by1;
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, by1, &bp);
         }
         // left band: columns [0, kx0), box rows only
         if (kx0 > 0)
         {
-            rdpq_set_scissor(0, ky0, kx0, by1);
-            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+            memset(&bp, 0, sizeof(bp));
+            bp.s0 = 0;  bp.t0 = ky0;
+            bp.width = kx0;  bp.height = by1 - ky0;
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, ky0, &bp);
         }
         // right band: columns [bx1, SCREENWIDTH), box rows only
         if (bx1 < SCREENWIDTH)
         {
-            rdpq_set_scissor(bx1, ky0, SCREENWIDTH, by1);
-            rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
+            memset(&bp, 0, sizeof(bp));
+            bp.s0 = bx1;  bp.t0 = ky0;
+            bp.width = SCREENWIDTH - bx1;  bp.height = by1 - ky0;
+            rdpq_tex_blit(&doom_screen8[n64_draw_idx], bx1, ky0, &bp);
         }
-
-        // Restore full-screen scissor for any later RDP work this stream.
-        rdpq_set_scissor(0, 0, SCREENWIDTH, SCREENHEIGHT);
     }
     }
     }
