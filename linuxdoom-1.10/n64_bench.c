@@ -403,7 +403,29 @@ void N64Bench_LoopEnd(void)
     // clock), so captures pair exactly across flag-on/flag-off ROMs. Never
     // enabled in timing builds -- the debugf cost would skew the numbers.
     if ((bench_frame_count & 255) == 0)
+    {
         debugf("BENCH_MARK frame=%lu\n", bench_frame_count);
+
+        // FREEZE-AT-MARKER: hold ~2 wall-clock seconds before returning to
+        // the loop, so the screen keeps showing EXACTLY the marker frame
+        // while the host capture loop (grep marker -> grim) fires. Without
+        // the hold, captures land frames late with host-side jitter, so
+        // paired "frame N" stills were only tic-approximate -- the capture-
+        // methodology hole that produced false texture-defect evidence.
+        // Determinism is untouched: the virtual tic clock advances on
+        // N64Bench_VirtualTick (per render-loop iteration / per present),
+        // never on wall time, so stalling here freezes the game state with
+        // the presented frame. Marks-build timing is already meaningless
+        // (the debugf traffic skews it), so the stall is free. get_ticks()
+        // is emulated CP0 time; ares runs the bench at full speed, so 2
+        // emulated seconds == ~2 host seconds for the capture window.
+        {
+            uint64_t hold_until = get_ticks()
+                                + (uint64_t)TICKS_PER_SECOND * 2;
+            while (get_ticks() < hold_until)
+                ;   // spin: no VirtualTick, no present, state frozen
+        }
+    }
 #endif
 }
 
