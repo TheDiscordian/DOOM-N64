@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <libdragon.h>
 
@@ -13,8 +14,23 @@
 #include "v_video.h"
 #include "n64_debug.h"
 
+// Rebase hooks for code that caches a screens[0]-derived pointer across frames.
+void R_N64RebaseScreen(void);
+void AM_N64RebaseScreen(void);
+void F_N64WipeRebaseScreen(void);
+
+#define N64_CI8_BUFFERS 2
+
 static boolean video_initialized;
-static surface_t doom_screen8;
+static surface_t doom_screen8[N64_CI8_BUFFERS];
+// Set true when a buffer is handed to the RDP, cleared (under interrupt) when
+// the RDP has finished reading it. The CPU must not overwrite a buffer that is
+// still busy. Updated from an interrupt callback, so volatile.
+static volatile boolean doom_screen8_rdp_busy[N64_CI8_BUFFERS];
+static surface_t* doom_screen8_disp[N64_CI8_BUFFERS]; // framebuffer to show per buffer
+static int n64_draw_idx;                 // CI8 buffer the CPU draws into (== screens[0])
+static boolean n64_palette_dirty;        // TLUT needs re-upload
+boolean n64_present_copy_forward;        // wipe: copy presented frame into next draw buffer
 static byte* n64_aux_screens[3];
 static boolean n64_aux_screen_owned[3];
 static uint16_t doom_tlut[256] __attribute__((aligned(8)));
@@ -451,14 +467,13 @@ void I_N64SplitScreenBeginFrame(int player_count)
     n64_split_player_count = player_count;
     n64_split_active = (screens[0] != NULL) && (player_count > 1);
 
-    // Correctness-first clear policy:
-    // - 3/4-player layouts clear every frame to prevent stale fragments
-    //   persisting when some low-detail edge cases underdraw a pixel.
-    // - 2-player keeps clear-on-layout-change to preserve bandwidth savings.
+    // The CI8 buffer is ping-ponged at present time, so the draw buffer holds
+    // the frame from two presents ago -- the clear-on-layout-change shortcut
+    // would leave that stale content behind. Clear every frame for all split
+    // layouts so no quadrant keeps another buffer's pixels.
     if (n64_split_active)
     {
-        if (player_count >= 3 || player_count != n64_split_prev_count)
-            memset(screens[0], 0, SCREENWIDTH * SCREENHEIGHT);
+        memset(screens[0], 0, SCREENWIDTH * SCREENHEIGHT);
         n64_split_prev_count = player_count;
     }
     else
@@ -529,7 +544,17 @@ void I_ShutdownGraphics(void)
     n64_last_active_port = JOYPAD_PORT_1;
     memset(n64_local_inputs, 0, sizeof(n64_local_inputs));
 
-    surface_free(&doom_screen8);
+    // Ensure the RDP has finished reading either CI8 buffer before freeing.
+    rspq_wait();
+    for (i = 0; i < N64_CI8_BUFFERS; i++)
+    {
+        surface_free(&doom_screen8[i]);
+        doom_screen8_rdp_busy[i] = false;
+        doom_screen8_disp[i] = NULL;
+    }
+    n64_draw_idx = 0;
+    n64_palette_dirty = false;
+    n64_present_copy_forward = false;
     screens[0] = NULL;
     rdpq_close();
 
@@ -662,16 +687,45 @@ void I_UpdateNoBlit(void)
 {
 }
 
+// Point screens[0] (and everything derived from it) at one of the two CI8
+// buffers. Called at present time to flip the CPU's draw target away from the
+// buffer the RDP is reading.
+static void I_N64PointScreen(int idx)
+{
+    n64_draw_idx = idx;
+    screens[0] = (byte*)doom_screen8[idx].buffer;
+
+    // Rebase everything that caches a screens[0]-derived pointer across frames.
+    R_N64RebaseScreen();    // ylookup[] (column renderer destination)
+    AM_N64RebaseScreen();   // automap fb
+    F_N64WipeRebaseScreen();
+}
+
+// Fired (under RDP interrupt) when the RDP has finished reading a CI8 buffer.
+// Marks it free and shows the framebuffer it was blitted into -- the same
+// display_show that rdpq_detach_show would have scheduled.
+static void I_N64BufferDone(void* arg)
+{
+    int idx = (int)(intptr_t)arg;
+
+    if (doom_screen8_disp[idx])
+        display_show(doom_screen8_disp[idx]);
+    doom_screen8_rdp_busy[idx] = false;
+}
+
 void I_FinishUpdate(void)
 {
     surface_t* disp;
     uint64_t now_ms;
+    int next_idx;
 
     if (!video_initialized)
         return;
 
     // Menu overlays can trigger back-to-back presents while logic catches up.
     // Pace these to display rate to avoid transient tearing/partial updates.
+    // No swap happens on this path, so the next frame keeps drawing into the
+    // same buffer.
     if (menuactive && gamestate == GS_LEVEL)
     {
         now_ms = get_ticks_ms();
@@ -683,20 +737,41 @@ void I_FinishUpdate(void)
     if (!disp)
         return;
 
-    rdpq_attach_clear(disp, NULL);
+    rdpq_attach(disp, NULL);
     rdpq_set_mode_copy(false);
     rdpq_mode_tlut(TLUT_RGBA16);
-    rdpq_tex_upload_tlut(doom_tlut, 0, 256);
-    rdpq_tex_blit(&doom_screen8, 0, 0, NULL);
-    rdpq_detach_show();
+    // Palette area of TMEM (upper half) is only ever written by this blit path,
+    // and a CI8 blit only loads texels into the lower half, so the TLUT
+    // persists across frames and is re-uploaded only when it changed.
+    if (n64_palette_dirty)
+    {
+        rdpq_tex_upload_tlut(doom_tlut, 0, 256);
+        n64_palette_dirty = false;
+    }
+    // The CI8 source covers the entire 320x200 display, so attach (no clear)
+    // is sufficient -- the blit overwrites every pixel.
+    rdpq_tex_blit(&doom_screen8[n64_draw_idx], 0, 0, NULL);
 
-    // doom_screen8 IS screens[0]; the blit above reads it asynchronously on
-    // the RDP. Wait for that read to finish before the next frame's CPU
-    // rendering overwrites the same buffer -- otherwise, at high (uncapped)
-    // frame rates the CPU races ahead and the RDP samples a half-updated
-    // framebuffer, which shows up as flicker on static elements like the
-    // status-bar numbers.
-    rspq_wait();
+    // Detach with a completion callback instead of a global rspq_wait(): the
+    // CPU can render the next frame while the RDP reads this buffer. The
+    // callback (RDP-done, not just RSP-done) marks the buffer free and shows
+    // the framebuffer, exactly as rdpq_detach_show would.
+    doom_screen8_disp[n64_draw_idx] = disp;
+    doom_screen8_rdp_busy[n64_draw_idx] = true;
+    rdpq_detach_cb(I_N64BufferDone, (void*)(intptr_t)n64_draw_idx);
+
+    // Flip the CPU's draw target to the other buffer. Wait only if the RDP is
+    // still reading it from an earlier frame; normally it finished long ago, so
+    // this spins zero times and the CPU and RDP overlap.
+    next_idx = n64_draw_idx ^ 1;
+    while (doom_screen8_rdp_busy[next_idx])
+        ;
+
+    if (n64_present_copy_forward)
+        memcpy(doom_screen8[next_idx].buffer, doom_screen8[n64_draw_idx].buffer,
+               SCREENWIDTH * SCREENHEIGHT);
+
+    I_N64PointScreen(next_idx);
 
     if (menuactive && gamestate == GS_LEVEL)
         last_menu_present_ms = get_ticks_ms();
@@ -704,7 +779,11 @@ void I_FinishUpdate(void)
 
 void I_ReadScreen(byte* scr)
 {
-    memcpy(scr, screens[0], SCREENWIDTH * SCREENHEIGHT);
+    // screens[0] is the current draw buffer; after a present that is the back
+    // buffer, while the visible frame is the other one. The wipe start/end
+    // capture wants the most recently presented (visible) image, so read that.
+    int src_idx = video_initialized ? (n64_draw_idx ^ 1) : 0;
+    memcpy(scr, doom_screen8[src_idx].buffer, SCREENWIDTH * SCREENHEIGHT);
 }
 
 void I_SetPalette(byte* palette)
@@ -724,6 +803,8 @@ void I_SetPalette(byte* palette)
 
         palette += 3;
     }
+
+    n64_palette_dirty = true;
 }
 
 void I_InitGraphics(void)
@@ -750,13 +831,23 @@ void I_InitGraphics(void)
 
     rdpq_init();
 
-    doom_screen8 = surface_alloc(FMT_CI8, SCREENWIDTH, SCREENHEIGHT);
-    if (!doom_screen8.buffer)
-        I_Error("I_InitGraphics: failed to allocate %dx%d CI8 surface",
-                SCREENWIDTH, SCREENHEIGHT);
+    // Two uncached CI8 source buffers, ping-ponged at present time so the CPU
+    // renders the next frame while the RDP reads the previous one.
+    for (i = 0; i < N64_CI8_BUFFERS; i++)
+    {
+        doom_screen8[i] = surface_alloc(FMT_CI8, SCREENWIDTH, SCREENHEIGHT);
+        if (!doom_screen8[i].buffer)
+            I_Error("I_InitGraphics: failed to allocate %dx%d CI8 surface",
+                    SCREENWIDTH, SCREENHEIGHT);
+        memset(doom_screen8[i].buffer, 0, SCREENWIDTH * SCREENHEIGHT);
+        doom_screen8_rdp_busy[i] = false;
+        doom_screen8_disp[i] = NULL;
+    }
 
-    screens[0] = (byte*)doom_screen8.buffer;
-    memset(screens[0], 0, SCREENWIDTH * SCREENHEIGHT);
+    n64_draw_idx = 0;
+    n64_palette_dirty = true;
+    n64_present_copy_forward = false;
+    screens[0] = (byte*)doom_screen8[0].buffer;
 
     aux_size = (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT;
     for (i = 0; i < 3; i++)

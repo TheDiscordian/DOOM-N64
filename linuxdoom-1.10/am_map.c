@@ -1333,6 +1333,16 @@ void AM_drawCrosshair(int color)
 
 }
 
+#ifdef N64
+// The N64 layer ping-pongs screens[0] at present time; fb caches that pointer
+// from AM_initVariables, so rebase it to the active draw buffer each swap.
+void AM_N64RebaseScreen(void)
+{
+    if (automapactive)
+	fb = screens[0];
+}
+#endif
+
 void AM_Drawer (void)
 {
     if (!automapactive) return;

@@ -46,6 +46,20 @@ static byte*	wipe_scr_start;
 static byte*	wipe_scr_end;
 static byte*	wipe_scr;
 
+#ifdef N64
+// The N64 layer ping-pongs screens[0] between two buffers at present time. The
+// melt writes its result incrementally into wipe_scr, so it must follow the
+// active draw buffer, and the layer must keep both buffers in sync during the
+// wipe (copy-forward) so the melt always reads its own previous output.
+extern boolean n64_present_copy_forward;
+
+void F_N64WipeRebaseScreen(void)
+{
+    if (go)
+	wipe_scr = screens[0];
+}
+#endif
+
 
 void
 wipe_shittyColMajorXform
@@ -253,7 +267,13 @@ wipe_EndScreen
   int	height )
 {
     wipe_scr_end = screens[3];
+#ifdef N64
+    // The end screen is the frame just rendered into the draw buffer
+    // (screens[0]); I_ReadScreen returns the previously presented buffer.
+    memcpy(wipe_scr_end, screens[0], width * height);
+#else
     I_ReadScreen(wipe_scr_end);
+#endif
     V_DrawBlock(x, y, 0, width, height, wipe_scr_start); // restore start scr.
     return 0;
 }
@@ -282,6 +302,10 @@ wipe_ScreenWipe
 	go = 1;
 	// wipe_scr = (byte *) Z_Malloc(width*height, PU_STATIC, 0); // DEBUG
 	wipe_scr = screens[0];
+#ifdef N64
+	// Keep both ping-pong buffers in sync while the melt runs incrementally.
+	n64_present_copy_forward = true;
+#endif
 	(*wipes[wipeno*3])(width, height, ticks);
     }
 
@@ -295,6 +319,9 @@ wipe_ScreenWipe
     {
 	go = 0;
 	(*wipes[wipeno*3+2])(width, height, ticks);
+#ifdef N64
+	n64_present_copy_forward = false;
+#endif
     }
 
     return !go;

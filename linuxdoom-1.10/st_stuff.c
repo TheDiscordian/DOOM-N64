@@ -1112,6 +1112,14 @@ void ST_Drawer (boolean fullscreen, boolean refresh)
     st_statusbaron = (!fullscreen) || automapactive;
     st_firsttime = st_firsttime || refresh;
 
+#ifdef N64
+    // screens[0] is ping-ponged each present, so the draw buffer holds the
+    // frame from two presents ago. The diff-drawn widgets (face, arms, keys)
+    // would keep that stale buffer's icon; force a full refresh every frame so
+    // every widget is redrawn into the current draw buffer.
+    st_firsttime = true;
+#endif
+
     // Do red-/gold-shifts from damage/items
     ST_doPaletteStuff();
 

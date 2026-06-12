@@ -852,8 +852,20 @@ R_SetViewWindow
     for (i=0 ; i<viewheight ; i++)
 	ylookup[i] = screens[0] + (i+viewwindowy)*SCREENWIDTH;
 }
- 
- 
+
+#ifdef N64
+// The N64 layer ping-pongs screens[0] each present; ylookup caches that base,
+// so rebase it to the active draw buffer using the current view geometry.
+void R_N64RebaseScreen(void)
+{
+    int i;
+
+    for (i=0 ; i<viewheight ; i++)
+	ylookup[i] = screens[0] + (i+viewwindowy)*SCREENWIDTH;
+}
+#endif
+
+
 
 
 //
