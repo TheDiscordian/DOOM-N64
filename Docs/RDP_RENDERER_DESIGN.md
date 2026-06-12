@@ -61,10 +61,13 @@ its flash/invuln mechanism.
    CI4 otherwise) to bound CI4 banding on gradient flats (NUKAGE-type).
 6. **From `ceiling` — INV_W trapezoid subdivision** as the documented fallback if the
    proportionality constant can't be tuned to sub-pixel accuracy.
-7. **From `incremental`/`ceiling`/`bandwidth` (consensus) — fuzz/spectre and translated
-   (player-colour) columns stay on the CPU overlay path initially.** `R_DrawFuzzColumn` reads its
-   own framebuffer output and `R_DrawTranslatedColumn` remaps per-pixel; neither maps to a simple
-   textured primitive.
+7. **From `incremental`/`ceiling`/`bandwidth` (consensus) — translated (player-colour) columns
+   stay on the CPU overlay path initially.** `R_DrawTranslatedColumn` remaps per-pixel and does not
+   map to a simple textured primitive. **Fuzz/spectre does NOT stay on CPU** — `R_DrawFuzzColumn`
+   reads its *own framebuffer output* (`dest[fuzzoffset[pos]]`, `r_draw.c:391`), and under the
+   transparent-key overlay model the view-window CI8 holds key-index pixels, not world colours, so a
+   CPU fuzz read returns garbage. Fuzz moves to an **RDP blender pass** that reads the world the RDP
+   just drew into the 16bpp fb (`MEMORY_RGB`); see Q8 and the staging plan.
 8. **From `bandwidth` (kept, hardened) — the explicit per-frame RDRAM byte-budget table** as the
    standing accounting artifact, extended with the two costs all three under-tracked: the
    on-first-touch column-major→row-major transpose + CI4/colormap-convert CPU cost (lands in
@@ -80,9 +83,11 @@ perspective-correct quads (INV_W from `scale`, free), planes and sprites as affi
 rects/quads (constant-z by construction), all in CI8/CI4 sampling the master TLUT, lit per-drawseg
 by a quantized `PRIM`-colour multiply that reproduces DOOM's already-stepped colormap falloff,
 with damage/pickup flashes staying free in the TLUT. The ~70 non-3D drawers keep writing CI8 into a
-separate overlay surface that is blitted on top each present. No z-buffer (BSP already orders), no
-T3D/RSP transform (geometry is already projected), no per-byte CPU fill — the CPU races into the
-next frame's BSP walk behind the existing non-blocking `rdpq_detach_cb` fence while the RDP drains.
+separate overlay surface that is **composited via a transparent-key alpha-compare blit** (one
+reserved palette index keyed out so the RDP-drawn world shows through the view window) on top each
+present. No z-buffer (BSP already orders), no T3D/RSP transform (geometry is already projected), no
+per-byte CPU fill — the CPU races into the next frame's BSP walk behind the existing non-blocking
+`rdpq_detach_cb` fence while the RDP drains.
 
 ---
 
@@ -113,7 +118,7 @@ DL_BeginFrame()                                       NEW: reset emit arena + pe
       - REPLACE R_DrawMaskedColumn/R_DrawVisSprite inner loops with DL_EmitSprite():
         per-sprite clipped textured quad(s), coalesced from clipbot[]/cliptop[] into
         vertical scissor sub-rects, ordered back-to-front; transparency = TLUT-key alpha-compare
-      - fuzz/translated columns: keep on CPU overlay path (graft #7)
+      - fuzz/spectre: RDP blender pass (MEM-blend darken, Q8); translated columns: CPU overlay (graft #7)
 ── end player loop ──
 DL_Flush()                             [DL_BUILD]  NEW: walk buckets in texture order →
   per texture: rdpq_tex_upload(tile) once, then all its rdpq_triangle/rect cmds, then next texture
@@ -136,9 +141,22 @@ The RDP attaches the **16bpp display fb**, scissored to the 3D view window, in
 4. **Masked mid-textures + sprites** — last, alpha-compare via TLUT key, clipped to the CPU's
    silhouette arrays, drawn strictly back-to-front.
 5. **Invuln/inverse tint** (when `fixedcolormap` is the inverse map) — single full-view blend rect.
-6. **Overlay blit** — `rdpq_set_mode_copy(false)` (valid: the *display fb is 16bpp*) +
-   `rdpq_mode_tlut(TLUT_RGBA16)` + `rdpq_tex_blit(&overlay,0,0,NULL)`, then
-   `rdpq_detach_cb(I_N64BufferDone, idx)` — the existing non-blocking fence.
+6. **Overlay blit** — `rdpq_set_mode_copy(true)` (valid: the *display fb is 16bpp*; **`true`
+   enables transparent-key alpha-compare** — see below) + `rdpq_mode_tlut(TLUT_RGBA16)` +
+   `rdpq_tex_blit(&overlay,0,0,NULL)`, then `rdpq_detach_cb(I_N64BufferDone, idx)` — the existing
+   non-blocking fence. The overlay's view-window pixels carry the reserved key index (alpha=0 in the
+   TLUT), so the alpha-compare in COPY mode discards them and the world the RDP drew in steps 1–5
+   shows through; every other overlay pixel (HUD/menu/border) overwrites the fb as today.
+
+**Transparent-key overlay model (the compositing mechanism).** The RDP world pass (steps 1–5) draws
+**into the 16bpp fb before** the overlay blit (step 6) in the *same* rspq stream. One palette index
+is reserved as the **transparency key**: its TLUT entry is written with **alpha=0** (every other
+entry keeps alpha=1, `i_video_n64.c:815-818`), so the present blit's alpha-compare keys it out. Any
+view-window pixel the CPU drawers leave as the key index becomes transparent and reveals the world
+underneath; the same key index doubles as the sprite/masked-texture transparent-gap index. This
+model is established **before any world geometry moves to the RDP** (a dedicated early stage,
+software-only) so the split is de-risked while the view is still 100% software-rendered. See §5 and
+the staging plan.
 
 Because BSP + solidseg already eliminate hidden walls/planes (each visible screen column written
 ~once per tier) and sprites are drawn back-to-front after the opaque world, painter ordering needs
@@ -216,7 +234,7 @@ tex_bucket_t flat_buckets[NUMFLATS];
 
 | Site | File:line | Change |
 |---|---|---|
-| Bench enum | `n64_bench.h:33-43` | Split `BPH_BSP` → `BSP_WALK`/`SEG_RASTER`; add `PLANE_EMIT`, `MASKED_EMIT`, `DL_BUILD`, `RDP_BUSY` |
+| Bench enum | `n64_bench.h:33-43` | Split `BPH_BSP` → `BSP_WALK`/`SEG_RASTER`; add `PLANE_EMIT`, `MASKED_EMIT`, `DL_BUILD`, `RDP_BUSY`, `KEY_CLEAR` |
 | Bench brackets | `n64_bench.c:219-246` | `PhaseSwitch`/`PhaseBegin` for the new phases; non-serializing RDP-done timestamp read |
 | Wall fill | `r_segs.c:333,355,…` (the `l_colfunc()` sites in `R_RenderSegLoop`) | Replace each with `DL_EmitWallTier()`; KEEP all clip/visplane-marking math (`r_segs.c:262-432`) |
 | Wall scale/S/T inputs | `r_segs.c:312` (texturecolumn), `:315` (light index), `:322` (iscale) | Read as emit inputs, not fill inputs |
@@ -227,8 +245,10 @@ tex_bucket_t flat_buckets[NUMFLATS];
 | Silhouette clip | `r_things.c:898-1006` (`R_DrawSprite`, `clipbot[]`/`cliptop[]`) | KEEP; coalesce to scissor sub-rects at emit |
 | Drawseg endpoints | `r_defs.h:322-347` (`scale1/scale2/scalestep`, silhouette arrays) | Consumed by wall emit + sprite clip; unchanged |
 | Wall transpose/convert | `r_data.c:228` (`R_GenerateComposite`), `r_data.c:383` (`R_GetColumn`), `r_data.c:743` (`R_PrecacheLevel`) | Extend to lazily produce + cache row-major CI8 tiles in PU_CACHE zone |
-| Present seam | `i_video_n64.c:728-794` (`I_FinishUpdate`) | Insert view-render before the overlay blit; reuse `detach_cb`/busy-flag verbatim |
-| Palette/flashes | `i_video_n64.c:805-823` (`I_SetPalette`), `:758-765` (TLUT upload) | UNCHANGED — flashes stay free via TLUT swap |
+| Present seam | `i_video_n64.c:728-794` (`I_FinishUpdate`) | Insert view-render BEFORE the overlay blit (same rspq stream); flip the blit to `rdpq_set_mode_copy(true)` for transparent-key alpha-compare; reuse `detach_cb`/busy-flag verbatim |
+| Palette/flashes + key | `i_video_n64.c:805-823` (`I_SetPalette`), `:758-765` (TLUT upload) | Per-frame flash swaps UNCHANGED (free via TLUT swap). **NEW:** the per-entry pack at `:815-818` forces `alpha=0` for the reserved key index in EVERY uploaded TLUT variant, so damage/pickup swaps preserve the key |
+| Transparency-key reserve | startup, after PLAYPAL load (key-scan helper near `I_SetPalette`) | Scan UI/status-bar/font/menu patch lumps drawn outside the 3D view, pick a palette index none of them use; assert if none free |
+| View-window key-clear | `I_FinishUpdate` / view-render entry (when `n64_use_rdp_renderer` ON) | Batched 64-bit key-fill of the 3D-view region of the CI8 surface (~54 KB). **TEMPORARY SCAFFOLDING** — removed in the final stage when view-window CI8 writes become event-driven erase-to-key |
 | Split render loop | `d_main.c:686-728` | Per-pane `rdpq_set_scissor(viewrect)`; KEEP loop structure |
 | Split dividers | `i_video_n64.c:482,491-525` | Replace `memset`/byte-poke with RDP fill rects (or keep on overlay) |
 | Renderer toggle | `r_main.c` (renderer dispatch) + `m_menu.c` (option) | `n64_use_rdp_renderer` flag selects RDP vs software `colfunc`/`spanfunc` path |
@@ -262,15 +282,23 @@ non-overlapping geometry per screen column. Draw order: sky → flats → walls 
 bandwidth call; it quantifiably avoids the +250 KiB the depth buffer would add. T3D defaults
 z-buffer *on* (`t3d.c:170`) — another reason to bypass T3D, not adopt it.
 
-**Q3 — Overlay-blit vs native-RDP UI → CI8 overlay-blit (graft #1).** Render the 3D view into the
-16bpp fb; keep a **separate uncached CI8 overlay surface** that all ~70 `V_DrawPatch`/AM/ST/menu/
-finale/intermission sites (§6 of the notes) write into byte-for-byte unchanged, blitted on top each
-present (COPY mode, valid on the 16bpp display fb). Cost: 320×200 CI8 read (64 KB) + RGBA5551 write
-(128 KB) = 192 KB ≈ 4.6% of the bus budget and ~0.26 ms COPY fill — affordable. The overlay is
-`data_cache_hit_writeback`'d before the RDP reads it (graft, mirroring `i_video_n64.c:763`).
-*Rationale:* lowest rewrite risk and lowest fidelity surface; native-RDP UI (`rdpq_font`,
-`i_wad_browser_n64.c` model) rewrites ~12 sites and is **not** on the critical path to 60 FPS —
-deferred to an optional later stage if the blit ever hurts (it doesn't, per §6 budget).
+**Q3 — Overlay-blit vs native-RDP UI → CI8 transparent-key overlay-blit (graft #1).** Render the 3D
+view into the 16bpp fb; keep a **separate uncached CI8 overlay surface** that all ~70 `V_DrawPatch`/
+AM/ST/menu/finale/intermission sites (§6 of the notes) write into byte-for-byte unchanged, composited
+on top each present in **COPY mode with transparent-key alpha-compare** (`rdpq_set_mode_copy(true)`).
+**Verified COPY-mode alpha-compare:** `rdpq_set_mode_copy(bool transparency)` — when `true`, "pixels
+with alpha set to 0 can optionally be discarded during blit, so that the target buffer contents is
+not overwritten for those pixels. This is implemented using alpha compare" (`rdpq_mode.h:328-330`),
+and COPY mode "only works with 16-bpp framebuffers" (`rdpq_mode.h:335`). The present target **is** the
+16bpp display fb, so alpha-compare in COPY mode is valid here — **no 1-cycle fallback needed**, the
+~256 µs / 192 KB COPY cost line stands. The reserved key index has alpha=0 in the TLUT, so its
+view-window pixels are discarded and the RDP world shows through; all other overlay pixels overwrite.
+Cost: 320×200 CI8 read (64 KB) + RGBA5551 write (128 KB) = 192 KB ≈ 4.6% of the bus budget and
+~0.26 ms COPY fill — affordable. The overlay is `data_cache_hit_writeback`'d before the RDP reads it
+(graft, mirroring `i_video_n64.c:763`). *Rationale:* lowest rewrite risk and lowest fidelity surface;
+native-RDP UI (`rdpq_font`, `i_wad_browser_n64.c` model) rewrites ~12 sites and is **not** on the
+critical path to 60 FPS — deferred to an optional later stage if the blit ever hurts (it doesn't, per
+§6 budget).
 
 **Q4 — Status-bar diff-draw → DROP it; full-redraw the status bar onto the overlay each frame.**
 The diff-draw is hard-coupled to exactly 2 ping-pong buffers + per-buffer `oldval[idx]` widget
@@ -334,8 +362,32 @@ hatch a single full-view blend rect; both are bounded and faithful. Fullbright s
 PRIM=white (`colormaps[0]`). *Caveat acknowledged:* `TEX0*PRIM` is a linear RGB multiply while
 DOOM's colormap is a non-linear palette remap, so per-level brightness is matched by *sampling the
 colormap ramp into the LUT* rather than assuming a uniform scale — the LUT bakes the actual
-darkening curve, keeping the stepped falloff recognisably DOOM. Fuzz/spectre (framebuffer-read
-effect) and translated columns stay on the CPU overlay path (graft #7).
+darkening curve, keeping the stepped falloff recognisably DOOM. Translated (player-colour) columns
+stay on the CPU overlay path (graft #7).
+
+**Fuzz/spectre → RDP blender pass (PRIMARY); translucent-dark alpha-keyed sprite (FALLBACK).** Fuzz
+**cannot** stay on CPU under the overlay model: `R_DrawFuzzColumn` reads its own framebuffer output
+(`*dest = fuzzmap[dest[fuzzoffset[pos]]]`, `r_draw.c:391`; `fuzzoffset` = ±`SCREENWIDTH`,
+`r_draw.c:289`; `fuzzmap = colormaps+6*256`, `r_draw.c:382`), but the view-window CI8 now holds
+key-index pixels, not world colours, so a CPU read returns garbage. **Primary — RDP blender-based
+fuzz:** draw the spectre as a textured/alpha-keyed quad whose blender **multiplies/darkens the
+framebuffer** it just rendered into. The blender can read `MEMORY_RGB` — "current contents of the
+framebuffer, where the current pixel will be drawn" (`rdpq_macros.h:802-805`) — and combine it as
+`(P*A) + (Q*B)` (`rdpq_macros.h:767-778`); a formula like `RDPQ_BLENDER((BLEND_RGB, IN_ALPHA,
+MEMORY_RGB, INV_MUX_ALPHA))` (or `RDPQ_BLENDER_MULTIPLY`, `rdpq_macros.h:515`) darkens the world
+toward a constant dark `BLEND_RGB` by the sprite's keyed alpha. On the 16bpp fb, `P`/`Q` carry 5-bit
+precision and `A`/`B` 5-bit (`rdpq_macros.h:840-847`) — coarse but acceptable for a shimmer. This is
+**distortion-free** (no ±column displacement) — a dark-shimmer approximation rather than DOOM's exact
+pixel-smear, but it reads the *correct* world the RDP drew, which the CPU path no longer can. Note
+the blender reads the framebuffer at the draw position only (no neighbour offset), so the lateral
+"swim" is lost; the darkening + masked sprite silhouette preserves the spectre read. **Fallback —
+translucent-dark sprite draw:** draw the spectre's own alpha-keyed sprite texture (the masked sprite
+already emitted in Stage 5) with the blender in MEM-mix toward dark (`RDPQ_BLENDER_MULTIPLY_CONST`,
+`rdpq_macros.h:537`, with a fixed dark `FOG_RGB`), giving a flat translucent-shadow silhouette — less
+faithful (no per-pixel framebuffer modulation) but trivially correct and reusing the masked path.
+**Rejected — CPU fuzz from the previous frame's 16bpp fb converted back to indices:** requires an
+RGBA5551→index reverse-lookup per pixel every frame on the bandwidth-bound CPU, re-introducing the
+exact per-pixel uncached fill this design exists to remove; cost/complexity disqualify it.
 
 **Q9 — Determinism with async RDP → BRACKET THE CPU WALL; report RDP_BUSY separately.** The bench
 brackets the CPU wall only (`LoopBegin`/`LoopEnd`), letting the RDP overlap into the next frame
@@ -348,8 +400,8 @@ RDP surfaces as rising counted busy-spin time rather than hidden async work — 
 buffer-flip spin (`i_video_n64.c:783`) is itself inside the wall and counted, so an RDP that can't
 keep up shows up directly. Provide a debug `BENCH_SYNC=1` variant that forces an `rspq_wait` inside
 `LoopEnd` for a fully-serialized byte-identical A/B when validating the RDP cost itself. Split
-`BPH_BSP` → `BSP_WALK`/`SEG_RASTER` and add `PLANE_EMIT`/`MASKED_EMIT`/`DL_BUILD`/`RDP_BUSY`
-(`n64_bench.h:33-43`). Success criterion unchanged: `avg_us < 16670` AND `p95_us < 16670` on the
+`BPH_BSP` → `BSP_WALK`/`SEG_RASTER` and add `PLANE_EMIT`/`MASKED_EMIT`/`DL_BUILD`/`RDP_BUSY`/
+`KEY_CLEAR` (`n64_bench.h:33-43`). Success criterion unchanged: `avg_us < 16670` AND `p95_us < 16670` on the
 CPU wall; `RDP_BUSY` is the diagnostic guardrail. Keep the `I_ShutdownGraphics` `rspq_wait`
 (`i_video_n64.c:554`) out of the timed loop. *Rationale:* preserves the load-bearing
 byte-identical A/B method while making the async pipeline measurable.
@@ -401,8 +453,30 @@ both 16 live TLUTs and any per-pixel colormap lookup.
 
 **Model:** the 3D view renders into the **16bpp display fb** (scissored to the view window); all
 non-3D drawers keep writing 8-bit indices into a **separate uncached CI8 overlay surface** that is
-blitted on top each present with the TLUT (graft #1). This preserves ~70 `V_DrawPatch`/AM/ST/menu
-call sites byte-for-byte.
+composited on top each present with the TLUT via **transparent-key alpha-compare**
+(`rdpq_set_mode_copy(true)`, graft #1). This preserves ~70 `V_DrawPatch`/AM/ST/menu call sites
+byte-for-byte.
+
+**Transparent-key compositing (established early, before any world geometry moves to RDP):** one
+palette index is reserved as the **transparency key**. At startup, after PLAYPAL load, scan the
+UI/status-bar/font/menu patch lumps actually drawn *outside* the 3D view and pick an index none of
+them use (**assert if none free**; likely candidates sit near the end of PLAYPAL — the high indices
+that DOOM's UI art rarely touches). The TLUT builder (`I_SetPalette`, the per-entry RGBA5551 pack at
+`i_video_n64.c:815-818`) sets **alpha=0** for the key index in EVERY uploaded palette variant — so
+damage/pickup/invuln palette swaps preserve the key — while every other entry keeps alpha=1. The
+present blit runs `rdpq_set_mode_copy(true)`, whose alpha-compare discards the alpha-0 key pixels
+(`rdpq_mode.h:328-330`), so any view-window pixel left as the key index reveals the RDP world drawn
+underneath in the same rspq stream. The **same index doubles** as the sprite/masked-texture
+transparent-gap index: alpha-compare ON for masked draws keys out the gaps, OFF for opaque
+walls/flats — so opaque world art may legitimately *contain* the key index without being keyed out.
+**Temporary scaffolding:** while the view-window CPU drawers are being removed stage-by-stage, the
+frame begins (when `n64_use_rdp_renderer` is ON) with a batched 64-bit key-clear of the 3D-view
+region of the CI8 surface (~54 KB, the 320×~168 window) so any pixel the CPU drawers no longer write
+becomes the key and reveals the world. Cost basis: a full-region uncached CI8 fill is the same class
+of write the round-2 "Narrow visplane top[] clear to spanned columns" commit (`0d2ea28`) reduced —
+~54 KB of uncached RDRAM ≈ **0.3–0.6 ms**. This clear is **removed in the final stage** when
+view-window CI8 writes become event-driven erase-to-key. The key-clear lands in a **named bench
+phase** so its cost is visible.
 
 - **UI/menus/HUD** (`V_DrawPatch` family `v_video.c:239-407`, `m_menu.c:1437-1528`,
   `hu_lib.c:122-165`): unchanged; write into the overlay surface. Native-RDP text is an optional
@@ -412,10 +486,20 @@ call sites byte-for-byte.
 - **Automap** (`am_map.c:464,833-1067`): keep on the overlay surface initially (Bresenham `PUTDOT`
   into overlay CI8); optionally later move lines to `rdpq_fill_rectangle`/filled triangles. Marks
   via `V_DrawPatch` unchanged.
-- **Melt wipe** (`f_wipe.c:152-307`): transient + perf-insensitive — keep CPU-side on a small CI8
-  scratch (it reads its own prior output), composited via the overlay blit. Its own blocking present
-  loop (`d_main.c:822-835`) is preserved. `n64_present_copy_forward` (`f_wipe.c:307`) coherency is
-  preserved because the wipe stays on the CI8 path.
+- **Melt wipe** (`f_wipe.c:152-307`): transient + perf-insensitive — **but the start/end scenes it
+  melts no longer exist in CI8 after the split.** `wipe_StartScreen` captures via
+  `I_ReadScreen(wipe_scr_start)` into `screens[2]` (`f_wipe.c:257-258`) and `wipe_EndScreen` on N64
+  does `memcpy(wipe_scr_end, screens[0], …)` into `screens[3]` (`f_wipe.c:269-273`) — both source the
+  CI8 `screens[0]`/presented buffer, which under the overlay model holds only the overlay (key-index
+  view window), not the 3D scene. So there is **nothing to capture**. **Fix:** wipe-capture frames
+  render via the **software renderer path** — the mandatory kill-switch toggle is reused per-frame:
+  when a wipe capture is pending (`gamestate != wipegamestate`, the `wipe_StartScreen` trigger at
+  `d_main.c:614-617`), that frame renders with `n64_use_rdp_renderer` behaviour **off** so the full
+  3D scene lands in CI8 exactly as today, and the capture reads a real scene. Wipes are level
+  transitions — **perf-irrelevant**, so the one-frame software fallback is free. The wipe's own
+  blocking present loop (`d_main.c:822-835`) runs the **unchanged CI8 present** and is compatible as
+  is. `n64_present_copy_forward` (`f_wipe.c:307`) coherency is preserved because the wipe frames stay
+  fully on the CI8 software path.
 - **Finale / intermission** (`f_finale.c:322-767`, `wi_stuff.c:408-1042`): full-screen flat
   backgrounds become a single tiled RDP texture fill (kills the large CPU `memcpy` into uncached
   RDRAM); glyphs/pics stay on the overlay.
@@ -447,8 +531,9 @@ Bus budget = 250 MB/s × (1/60 s) = **4,166,667 B/frame ≈ 4.17 MB**. Typical c
 | UI overlay blit (CI8 read 64 KB + RGBA5551 write 128 KB) | 188 | 188 | full-screen; dirty-rect (38) is an optional later win |
 | DL commands (RSP reads) | 25 | 58 | ~400 prims × ~64 B; static parts via `rspq_block` |
 | **First-touch transpose/CI4-convert** (graft #8, cold tiles only) | ~0 (warm) | ≤~30 (cold) | amortized to ~0 steady-state; lands in `BSP_WALK` |
+| **Temporary view-window key-clear** (`KEY_CLEAR`, Stages 1–6 only) | 54 | 54 | ~54 KB uncached CI8 fill ≈ 0.3–0.6 ms; **removed in Stage 7** (event-driven erase-to-key) |
 | **Z-buffer (REJECTED, Q2)** | **0 (+250 avoided)** | **0 (+250 avoided)** | BSP already orders |
-| **TOTAL** | **~396 (9.5%)** | **~624 (15.0%)** | bus never within ~6× of saturation |
+| **TOTAL (Stages 1–6, with key-clear)** | **~450 (10.8%)** | **~678 (16.3%)** | drops to ~396 / ~624 after Stage 7 removes the key-clear |
 
 ### RDP fill time (62.5 MHz; standard 1-cycle textured = ~1 px/cycle; COPY = ~4 px/cycle, 16bpp only)
 
@@ -474,7 +559,7 @@ where the same ~54K-pixel fill costs ~1 ms against a bus that is only ~10% utili
 residual of ~9.9 ms that runs concurrently with RDP rasterization. **Both processors finish well
 under 16.67 ms**, and the current p95 tail (dominated by plane+masked fill) collapses because that
 fill is exactly what moved to the RDP. The honest expectation: shipping **avg ≈ 10–13 ms (≈ 75–100
-FPS)** and **p95 < 16.67 ms gated on the texture-batching (Stage 2/3) landing the autosync
+FPS)** and **p95 < 16.67 ms gated on the texture-batching (Stage 3/4) landing the autosync
 collapse** — the one residual risk, measured directly by `RDP_BUSY`.
 
 ---
@@ -487,74 +572,113 @@ baseline` for the A/B reference). `BENCH_RESULT` success: `avg_us < 16670` AND `
 Each later stage A/Bs against the *previous* stage and the frozen baseline.
 
 1. **Stage 0 — Instrumentation (no behaviour change).** Split `BPH_BSP` → `BSP_WALK`/`SEG_RASTER`
-   and add `PLANE_EMIT`/`MASKED_EMIT`/`DL_BUILD`/`RDP_BUSY` enum entries + brackets
+   and add `PLANE_EMIT`/`MASKED_EMIT`/`DL_BUILD`/`RDP_BUSY`/`KEY_CLEAR` enum entries + brackets
    (`n64_bench.h:33-43`, `n64_bench.c:219-246`). Add the `n64_use_rdp_renderer` toggle skeleton
    (defaults off). **Expected effect:** 0% perf change. **Bench gate:** `SEG_RASTER` ≈ matches the
    52.5% `bsp_segs` share and `PLANE_EMIT` ≈ matches 15.8% — confirms the split is correct and
    gives the per-stage A/B baseline.
 
-2. **Stage 1 — Single wall seg through the RDP path, behind the flag (graft from `bandwidth`
+2. **Stage 1 — Transparent-key overlay model + framebuffer/overlay split (view still 100%
+   software-rendered).** Establish the compositing mechanism *before any world geometry moves to the
+   RDP*, so the split is de-risked while the scene still renders in software exactly as today. (a)
+   Reserve the **transparency key** index: at startup, after PLAYPAL load, scan the
+   UI/status-bar/font/menu patch lumps drawn outside the 3D view and pick an index none of them use
+   (assert if none free; likely candidates near the end of PLAYPAL). (b) The TLUT builder
+   (`I_SetPalette` per-entry pack, `i_video_n64.c:815-818`) sets **alpha=0** for the key index in
+   EVERY uploaded palette variant (so damage/pickup/invuln swaps preserve the key). (c) Flip the
+   present blit to `rdpq_set_mode_copy(true)` so its alpha-compare keys out the alpha-0 index
+   (verified COPY-mode alpha-compare on the 16bpp display fb, `rdpq_mode.h:328-330,335` — no 1-cycle
+   fallback needed). (d) Introduce the **CI8 overlay surface**; redraw HUD/ST/AM/menu/border onto it
+   (full status-bar redraw, diff-draw dropped — Q4); present = software 3D view (still in CI8) +
+   overlay blit + `detach_cb` (`i_video_n64.c:728-794`). (e) When `n64_use_rdp_renderer` is ON, the
+   frame begins with the **temporary scaffolding key-clear** — a batched 64-bit key-fill of the
+   3D-view region of the CI8 surface (~54 KB) in the named `KEY_CLEAR` phase — so any pixel the CPU
+   drawers no longer write becomes transparent; at this stage the software renderer still writes the
+   whole view so nothing shows through yet (the clear is overwritten), proving the mechanism is
+   harmless before walls move. Verify melt wipe: wipe-capture frames render with `n64_use_rdp_renderer`
+   **off** (software path) so start/end scenes land in CI8 (`wipe_StartScreen`/`wipe_EndScreen`,
+   `f_wipe.c:257-273`); the wipe's blocking present loop (`d_main.c:822-835`) runs the unchanged CI8
+   present. **Expected effect:** neutral-to-slight (+overlay blit ~0.26 ms / 188 KiB + `KEY_CLEAR`
+   ~0.3–0.6 ms, both affordable per §6). **Bench gate:** `present`/`hud` phase shape changes,
+   `KEY_CLEAR` appears with the expected cost; total holds < 16.67 ms; HUD + menu + wipe + flashes
+   visually identical to baseline (the alpha-key + key-clear are invisible while software still fills
+   the view).
+
+3. **Stage 2 — Single wall seg through the RDP path, behind the flag (graft from `bandwidth`
    feasibility #1).** Keep the CPU rasterizing everything **except** route one single-sided
    (midtexture) wall seg through `DL_EmitWallTier` → `DL_Flush` → `rdpq_triangle` (perspective
-   INV_W, `TEX_FLAT`, CI8, on-demand transpose). One texture upload per seg (no batching yet) to
+   INV_W, `TEX_FLAT`, CI8, on-demand transpose), rendered into the fb **before** the overlay blit in
+   the same rspq stream. That seg's CPU `colfunc` writes are suppressed so its view-window columns
+   hold the key index and the RDP fill shows through; one texture upload per seg (no batching yet) to
    validate geometry / free-W / lighting on **one** seg, pixel-diffable against the software frame
    via the per-seg A/B toggle (graft #4). **Expected effect:** small net regression (autosync
    thrash, no batching) — honest and falsifiable; proves the wall pipeline + the proportionality
-   constant `k`. **Bench gate:** `SEG_RASTER` drops slightly for that seg, `RDP_BUSY` appears and
-   stays < frame; screenshot diff on a near wall is sub-pixel-clean.
+   constant `k` + the transparent-key compositing on a live RDP pixel. **Bench gate:** `SEG_RASTER`
+   drops slightly for that seg, `RDP_BUSY` appears and stays < frame; screenshot diff on a near wall
+   is sub-pixel-clean.
 
-3. **Stage 2 — Walls fully on RDP + texture batching (the dominant 52.5%).** Replace all three
-   `l_colfunc()` sites in `R_RenderSegLoop` with `DL_EmitWallTier`; add the per-texture bucket arena
-   and texture-sorted `DL_Flush`; extend to two-sided top/bottom tiers and tall-wall vertical tiling
-   (1-texel overlap + T-clamp). KEEP visplane `top[]/bottom[]` marking on CPU. **Expected effect:**
-   `bsp_segs` fill (~10.9 ms) → RDP-overlapped; CPU wall drops to BSP traversal + emit. Autosync
-   collapses to per-texture. **Bench gate:** `SEG_RASTER` → ~0; `RDP_BUSY` rises but stays < frame;
-   avg should approach or pass 16.67 ms; full A/B screenshot diff vs software matches.
+4. **Stage 3 — Walls fully on RDP + texture batching (the dominant 52.5%).** Replace all three
+   `l_colfunc()` sites in `R_RenderSegLoop` (`r_segs.c:333,355,390`) with `DL_EmitWallTier`; add the
+   per-texture bucket arena and texture-sorted `DL_Flush`; extend to two-sided top/bottom tiers and
+   tall-wall vertical tiling (1-texel overlap + T-clamp). KEEP visplane `top[]/bottom[]` marking on
+   CPU. Wall `colfunc` writes stop entirely, so those view columns are left as the key index (cleared
+   by `KEY_CLEAR`) and the RDP walls show through; **opaque** walls draw with alpha-compare OFF, so
+   wall art may legitimately contain the key index. **Expected effect:** `bsp_segs` fill (~10.9 ms) →
+   RDP-overlapped; CPU wall drops to BSP traversal + emit. Autosync collapses to per-texture.
+   **Bench gate:** `SEG_RASTER` → ~0 (the gate holds because wall colfunc writes cease completely);
+   `RDP_BUSY` rises but stays < frame; avg should approach or pass 16.67 ms; full A/B screenshot diff
+   vs software matches.
 
-4. **Stage 3 — Planes on RDP (15.8%).** Replace `R_MapPlane`'s `spanfunc()` with `DL_EmitSpan`;
+5. **Stage 4 — Planes on RDP (15.8%).** Replace `R_MapPlane`'s `spanfunc()` with `DL_EmitSpan`;
    emit per-flat CI4 textured rects (on-demand down-convert, per-flat CI8 override by colour
    histogram, graft #5); sky as fullbright textured columns. Reuses the residency manager + PRIM
-   light table from Stage 2. **Expected effect:** `planes` (~3.3 ms) → RDP-overlapped; targets the
-   tail directly (the current p95 tail is plane-dominated). **Bench gate:** `PLANE_EMIT` → ~0; avg
-   comfortably < 16.67 ms; p95 drops sharply; no flat banding (histogram override caught any
+   light table from Stage 3. Plane `spanfunc` writes stop, leaving those columns as the key index for
+   the RDP flats to show through. **Expected effect:** `planes` (~3.3 ms) → RDP-overlapped; targets
+   the tail directly (the current p95 tail is plane-dominated). **Bench gate:** `PLANE_EMIT` → ~0;
+   avg comfortably < 16.67 ms; p95 drops sharply; no flat banding (histogram override caught any
    gradient flat).
-
-5. **Stage 4 — View framebuffer + overlay split.** Move the 3D view to render into the 16bpp
-   display fb (scissored to the view window); introduce the CI8 overlay surface; redraw HUD/ST/AM/
-   menu/border onto it (full status-bar redraw, diff-draw dropped — Q4). Present = view (in fb) +
-   overlay blit + `detach_cb` (`i_video_n64.c:728-794`). Verify melt wipe (`copy_forward`), border
-   removal, menu present pacing (`i_video_n64.c:741-746`). **Expected effect:** neutral-to-slight
-   (+overlay blit ~0.26 ms / 188 KiB, affordable per §6); unlocks dropping the per-frame CI8 view
-   blit. **Bench gate:** `present`/`hud` phase shape changes; total holds < 16.67 ms; wipe + HUD +
-   menu visually correct.
 
 6. **Stage 5 — Sprites / masked mid-textures on RDP.** Replace `R_DrawMaskedColumn`/
    `R_DrawVisSprite` inner loops with `DL_EmitSprite`: per-sprite clipped quads, silhouette
-   `clipbot[]/cliptop[]` coalesced into vertical scissor sub-rects, TLUT-key alpha-compare for
-   transparency, back-to-front order. Masked mid-textures via the same path. Fuzz/translated stay on
-   the CPU overlay (graft #7). **Expected effect:** `masked` (~1.3 ms avg, tail spikes to 11.8 ms) →
-   RDP; kills the worst p95 spikes (last big tail lever). **Bench gate:** `MASKED_EMIT` → ~0; p95 <
-   16670; sprite-vs-wall clipping correct in scenes with sprites behind/in-front of pillars and
-   through masked grates (screenshot diff vs software).
+   `clipbot[]/cliptop[]` coalesced into vertical scissor sub-rects, **TLUT-key alpha-compare ON** for
+   transparent gaps (the same reserved key index), back-to-front order. Masked mid-textures via the
+   same path. Translated (player-colour) columns stay on the CPU overlay (graft #7). **Expected
+   effect:** `masked` (~1.3 ms avg, tail spikes to 11.8 ms) → RDP; kills the worst p95 spikes (last
+   big tail lever). **Bench gate:** `MASKED_EMIT` → ~0; p95 < 16670; sprite-vs-wall clipping correct
+   in scenes with sprites behind/in-front of pillars and through masked grates (screenshot diff vs
+   software).
 
-7. **Stage 6 — Lighting flashes + invuln + split-screen + interp validation.** Confirm
-   damage/pickup flashes via TLUT swap (graft #2, free), invuln via inverse PRIM ramp / tint rect
-   (Q8). Add per-pane `rdpq_set_scissor` and divider RDP fill rects (`d_main.c:686-728`,
-   `i_video_n64.c:491-525`); verify 1–4p split + the uncapped/interpolated path. **Expected
-   effect:** visual-fidelity completion + final overlap headroom; perf-neutral hardening. **Bench
-   gate:** flashes/invuln match vanilla; no split regression (each pane is a scissored sub-emit);
-   final A/B `avg_us < 16670` AND `p95_us < 16670`.
+7. **Stage 6 — Fuzz/spectre on RDP + lighting flashes + invuln + split-screen + interp validation.**
+   Implement fuzz as the **RDP blender pass** (primary, Q8): a textured/alpha-keyed spectre quad
+   whose blender reads `MEMORY_RGB` and darkens the world the RDP just drew (distortion-free
+   dark-shimmer); **fallback** is the translucent-dark alpha-keyed sprite draw (Q8). This replaces
+   the CPU `R_DrawFuzzColumn` (`r_draw.c:314-404`), which cannot run under the overlay model (it reads
+   the view-window framebuffer, now key-index — `r_draw.c:391`). Confirm damage/pickup flashes via
+   TLUT swap (graft #2, free), invuln via inverse PRIM ramp / tint rect (Q8). Add per-pane
+   `rdpq_set_scissor` and divider RDP fill rects (`d_main.c:686-728`, `i_video_n64.c:491-525`); verify
+   1–4p split + the uncapped/interpolated path. **Expected effect:** visual-fidelity completion +
+   final overlap headroom; perf-neutral hardening. **Bench gate:** fuzz/flashes/invuln match vanilla
+   (fuzz as faithful dark-shimmer); no split regression (each pane is a scissored sub-emit); final
+   A/B `avg_us < 16670` AND `p95_us < 16670`.
 
-8. **Stage 7 (optional, only if a stage shows a bus regression) — Dirty-rect overlay.** Replace the
+8. **Stage 7 — Remove the temporary key-clear scaffolding (event-driven erase-to-key).** With every
+   view-window CPU drawer now removed (walls Stage 3, planes Stage 4, sprites/masked Stage 5, fuzz
+   Stage 6), the full-region `KEY_CLEAR` is no longer needed each frame: make view-window CI8 writes
+   **event-driven erase-to-key** (only the few overlay drawers that still intrude on the view region —
+   e.g. psprites if kept on CPU, the split dividers — erase their own footprint to the key on change),
+   dropping the ~0.3–0.6 ms `KEY_CLEAR` phase. **Expected effect:** −~54 KB/frame, `KEY_CLEAR` → ~0.
+   **Bench gate:** `KEY_CLEAR` disappears; no stale view pixels leak through; A/B holds < 16.67 ms.
+
+9. **Stage 8 (optional, only if a stage shows a bus regression) — Dirty-rect overlay.** Replace the
    full-screen overlay blit with a status-bar + HUD dirty-rect blit (38 vs 188 KiB). **Expected
    effect:** −150 KiB/frame. **Deferred:** the §6 budget shows the full blit already fits; do it
    only if the tail needs the headroom.
 
-9. **Stage 8 (optional follow-on) — CI4 walls / RDP automap / native-RDP text.** Pull CI4 for walls
-   only if the texture cache blows the 2–4 MB zone (halves the cache, costs 16-colour
-   restriction, per-texture histogram override); move automap lines and finale/intermission
-   backgrounds to RDP if profiling shows the CPU paths hurt. **Bench gate:** each A/B'd
-   independently; ship only if it doesn't regress fidelity or the budget.
+10. **Stage 9 (optional follow-on) — CI4 walls / RDP automap / native-RDP text.** Pull CI4 for walls
+    only if the texture cache blows the 2–4 MB zone (halves the cache, costs 16-colour
+    restriction, per-texture histogram override); move automap lines and finale/intermission
+    backgrounds to RDP if profiling shows the CPU paths hurt. **Bench gate:** each A/B'd
+    independently; ship only if it doesn't regress fidelity or the budget.
 
 ---
 
@@ -565,19 +689,27 @@ Each later stage A/Bs against the *previous* stage and the frozen baseline.
 software `colfunc`/`spanfunc` path (`r_main.c:781-794`) and the CI8 `screens[0]` present
 (`i_video_n64.c:728-794`) run **byte-for-byte unchanged** — the software path stays selectable for
 every stage, every release. Each new stage is additionally gated so an individual sub-path (e.g.
-walls) can fall back to CPU per-seg (the Stage-1 A/B toggle).
+walls) can fall back to CPU per-seg (the Stage-2 A/B toggle). **The toggle is also reused per-frame
+by the melt wipe:** when a wipe capture is pending the renderer drops to software behaviour for that
+frame so the 3D scene lands in CI8 for `wipe_StartScreen`/`wipe_EndScreen` to capture
+(`f_wipe.c:257-273`) — wipes are level transitions and perf-irrelevant, so the one-frame fallback is
+free and the wipe's blocking CI8 present loop (`d_main.c:822-835`) is unchanged.
 
 | Risk | Why | Mitigation / kill-switch |
 |---|---|---|
-| **Autosync / pipe-sync, not bandwidth, is the real 60-FPS gate** | many small triangles with material/PRIM changes force `AUTOSYNC_PIPE` between draws (`t3d.c:412-454`) | Batch by texture (Stage 2/3); sort within a batch to group PRIM changes; `RDP_BUSY` measures it every stage. Stage 1 is *expected* to regress before Stage 2 wins — falsifiable. |
-| **Free-W proportionality constant** (`INV_W = scale*k`, not literally 1/W) | if `k` is wrong, textures scale wrong with depth / near walls warp ("single biggest unknown", notes §8.1) | Derive `k` analytically from `projection`/`centerxfrac` in `R_SetupFrame` (`r_main.c:776`); validate Stage 1 pixel-vs-pixel on a near wall via the per-seg toggle. **Fallback:** trapezoid subdivision (graft #6) or affine (visible warp but trivially correct). |
+| **Autosync / pipe-sync, not bandwidth, is the real 60-FPS gate** | many small triangles with material/PRIM changes force `AUTOSYNC_PIPE` between draws (`t3d.c:412-454`) | Batch by texture (Stage 3/4); sort within a batch to group PRIM changes; `RDP_BUSY` measures it every stage. Stage 2 is *expected* to regress before Stage 3 wins — falsifiable. |
+| **Free-W proportionality constant** (`INV_W = scale*k`, not literally 1/W) | if `k` is wrong, textures scale wrong with depth / near walls warp ("single biggest unknown", notes §8.1) | Derive `k` analytically from `projection`/`centerxfrac` in `R_SetupFrame` (`r_main.c:776`); validate Stage 2 pixel-vs-pixel on a near wall via the per-seg toggle. **Fallback:** trapezoid subdivision (graft #6) or affine (visible warp but trivially correct). |
 | **`TEX0*PRIM` lighting divergence** (linear RGB multiply vs non-linear colormap) | the fidelity judge's flag on the ceiling design | PRIM LUT baked from the *actual* colormap darkening ramp, not a uniform scale (Q8); DOOM lighting is already 16-level stepped, so per-drawseg shade is faithful. A/B screenshot diff vs software per stage. **Fallback:** per-light pre-shaded CI8 source tiles (the `incremental` index-remap) if the multiply ever bands visibly. |
 | **CI4 flat banding** | 64×64 flats forced to 16-entry sub-palettes may band on gradients (NUKAGE) | Per-flat sub-palette from the flat's colour histogram; CI8-tile override for >16-colour flats (graft #5). |
 | **Tall-wall vertical-tile seams** | stacking 64×32 CI8 tiles risks a 1-px seam | 1-texel overlap between vertical tiles + T-clamp at the seam (known libdragon pattern). |
-| **RDP falls a frame behind under tail load** (the 60-FPS gate, not avg) | even with CPU < 16.67 ms, if `RDP_BUSY` > 16.67 ms on worst frames the pipeline stalls on the buffer-flip spin (`i_video_n64.c:783`) | Triple-buffered display gives one frame of slack; `RDP_BUSY` makes it observable per stage; pull Stage 2/3 batching (and Stage 8 CI4) harder if it rises. |
+| **RDP falls a frame behind under tail load** (the 60-FPS gate, not avg) | even with CPU < 16.67 ms, if `RDP_BUSY` > 16.67 ms on worst frames the pipeline stalls on the buffer-flip spin (`i_video_n64.c:783`) | Triple-buffered display gives one frame of slack; `RDP_BUSY` makes it observable per stage; pull Stage 3/4 batching (and Stage 9 CI4) harder if it rises. |
+| **Transparency-key index exhaustion** | the reserved key index must be unused by every UI/HUD/font/menu patch drawn *outside* the 3D view, or those pixels vanish | Stage 1 scans the actual non-view patch lumps and asserts if no index is free (likely candidates near the end of PLAYPAL); opaque world art may *contain* the key (alpha-compare OFF for walls/flats), only masked draws key it out. |
+| **Key index leaks through opaque world art** | if a wall/flat texel legitimately uses the key index, alpha-compare would wrongly punch a hole | alpha-compare is **OFF** for opaque walls/flats (they write every covered pixel into the fb), **ON** only for masked/sprite draws — so opaque art carrying the key index renders normally. |
 | **Sprite silhouette → scissor-run mis-clip** | coalescing per-column `clipbot/cliptop` into scissor sub-rects could mis-clip vs walls ("sprite clipping vs walls must work") | Stage 5 keeps the exact silhouette scan (`r_things.c:898-1006`); only the leaf draw changes. Validate behind/in-front-of-pillar + masked-grate scenes. **Fallback:** per-column quads (more commands, exact). |
-| **Masked-gap transparency** | sparse posts (`r_things.c:355-389`) must reproduce DOOM's transparent gaps via TLUT-key alpha-compare | source texels store the transparent index in gaps; alpha-bit-on-every-entry TLUT (`i_video_n64.c:818`) keys them out. Screenshot-diff masked mid-textures. **Fallback:** keep masked mids on CPU. |
-| **Overlay / wipe buffer coherency** | overlay must be `data_cache_hit_writeback`'d before RDP read; wipe reads its own output | explicit writeback (graft #1, `i_video_n64.c:763` precedent); wipe stays on the CI8 scratch path. |
+| **Masked-gap transparency** | sparse posts (`r_things.c:355-389`) must reproduce DOOM's transparent gaps via TLUT-key alpha-compare | source texels store the reserved key index in gaps; the key's alpha=0 TLUT entry (`i_video_n64.c:815-818`) + alpha-compare ON keys them out. Screenshot-diff masked mid-textures. **Fallback:** keep masked mids on CPU. |
+| **Fuzz/spectre under the overlay model** | `R_DrawFuzzColumn` reads the view-window framebuffer (`dest[fuzzoffset[pos]]`, `r_draw.c:391`), which now holds key-index pixels not world colours → CPU fuzz produces garbage | Move fuzz to the **RDP blender pass** (Stage 6, primary): a spectre quad whose blender reads `MEMORY_RGB` (`rdpq_macros.h:802-805`) and darkens the RDP-drawn world — distortion-free dark-shimmer. **Fallback:** translucent-dark alpha-keyed sprite draw (`RDPQ_BLENDER_MULTIPLY_CONST`). The lateral "swim" is lost in both. |
+| **Overlay / wipe buffer coherency** | overlay must be `data_cache_hit_writeback`'d before RDP read; wipe captures need a real CI8 scene | explicit writeback (graft #1, `i_video_n64.c:763` precedent); wipe-capture frames render via the **software path** (toggle off per-frame) so `wipe_StartScreen`/`wipe_EndScreen` (`f_wipe.c:257-273`) capture a real scene; `copy_forward` (`f_wipe.c:307`) coherency preserved on the CI8 path. |
+| **Temporary key-clear scaffolding lingers** | the ~54 KB/frame `KEY_CLEAR` is a crutch while CPU view drawers are removed; left in, it wastes ~0.3–0.6 ms forever | Stage 7 removes it once all view-window CPU writes are gone, replacing with event-driven erase-to-key; tracked in the named `KEY_CLEAR` bench phase so the cost stays visible until removed. |
 | **Bench determinism under async RDP** | a serializing fence could drift CP0 ticks | headline brackets the CPU wall only (deterministic); `RDP_BUSY` read non-serializing; `BENCH_SYNC=1` debug variant for serialized validation (Q9). |
 | **DL arena overflow on tail frames** (ds=29, vp=15) | emit arena / buckets must handle worst case | size for documented tail ×2; on overflow, fall back to un-bucketed `rdpq_triangle` (slower, correct), mirroring how `drawsegs[256]`/visplanes grow today. |
 
@@ -596,9 +728,10 @@ walls) can fall back to CPU per-seg (the Stage-1 A/B toggle).
   output scaling; the present blit stays 1:1. Widescreen (`g_game.c:338`) keeps only changing
   3D projection/FOV, not the display.
 - **No RGBA16 textures.** CI8/CI4 + master TLUT end-to-end preserves the 8-bit look and footprint.
-- **No removal of the software renderer.** It stays behind the toggle, selectable forever (§8).
+- **No removal of the software renderer.** It stays behind the toggle, selectable forever (§8), and
+  is reused per-frame by the melt wipe to land start/end scenes in CI8 for capture (§5).
 - **No native-RDP UI rewrite as a ship requirement.** The overlay-blit model ships; `rdpq_font`/
-  RDP automap are optional follow-ons (Stage 8) only if profiling demands them.
+  RDP automap are optional follow-ons (Stage 9) only if profiling demands them.
 - **No change to gametic determinism, the 35 Hz sim, or the bench scenario / tic injection.** The
   CPU sim, NetUpdate gating, and the deterministic bench harness are untouched.
 - **No modification of `libdragon/` or `tiny3d/`.** All changes live in `linuxdoom-1.10/` and the
