@@ -538,6 +538,19 @@ report against stills must therefore be judged against freeze-aligned captures (
 the same scene structure, e.g. COMPTILE's circuit grid exists identically in the flag-off
 reference).
 
+**VERIFY-5 (flag-off "blocky grey corrupted region", ref frame-256) — closed: pre-existing,
+software-correct, and not corruption at all.** A throwaway worktree at 25c6ce5 (pre-Stage-2) with
+only the bench-marker/freeze commits cherry-picked produced a frozen flag-off capture series
+(fingerprint exact: frames=4117 ds=14 vp=8 vs=4 — the playthrough is identical across the whole
+stage). The frozen pre-Stage-2 software frame-256 shows the same grey region on the same wall; the
+grey blocks are STARTAN3's authored art (large grey metallic panels in a brown surround — rendered
+directly from the byte-verified texture data), magnified at close range. The old reference's
+"blocky corrupted" look is that art at its jitter-displaced capture moment (2 tics later, closer).
+No flag-off regression exists. Reminder for future still-judgement: bench/ref-frames-off/ was
+captured pre-freeze (jittered, inconsistent window sizes); the frozen 25c6ce5 series at
+/tmp/stage2-marks/verify5-off/ is the preferred software ground truth, 32 markers at 128-frame
+spacing.
+
 **TMEM residency (Q6):** 4 KB total; **TLUT permanently owns the upper 2 KB** (256 RGBA16 entries,
 written only by the present blit, persists across frames — `i_video_n64.c:755-764`). The lower 2 KB
 holds exactly one tile per batch. `DL_Flush` uploads one tile, draws all its primitives, then loads
