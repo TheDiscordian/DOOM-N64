@@ -653,14 +653,32 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
 
     // Deviation scan: compare the quad's interpolation (Y edges linear, S
     // projective via s/w over 1/w -- exactly what the rasterizer computes) at
-    // every pixel center against the captured per-column values.
-    if (xb > xa)
+    // every pixel center against the captured per-column values. Width-1/2
+    // pieces are exact by construction (the lerp through two extrapolated
+    // corners passes through both column samples), so they skip the scan --
+    // and they are the recursion's fixed point. The scan EARLY-EXITS at the
+    // first threshold-crossing column and splits there (sub-pieces re-verify
+    // themselves), so failing pieces pay only a partial scan; the S split
+    // threshold needs the run's max per-column S step, which a cheap integer
+    // prepass provides.
+    if (xb > xa + 1)
     {
         float swl = s_l * invw_l, swr = s_r * invw_r;
-        float maxstep = 1.0f;
-        float worstS = 0.0f, worstY = 0.0f;
         float sthresh;
         int   x;
+
+        {
+            fixed_t maxstep = 1;
+            for (x = xa; x < xb; x++)
+            {
+                fixed_t st = t_scol[x + 1] - t_scol[x];
+                if (st < 0) st = -st;
+                if (st > maxstep) maxstep = st;
+            }
+            sthresh = 0.51f * (float)maxstep;
+            if (sthresh < DL_SPLIT_DEVS)
+                sthresh = DL_SPLIT_DEVS;
+        }
 
         for (x = xa; x <= xb; x++)
         {
@@ -676,62 +694,34 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
             float aT = (dT < 0.0f) ? -dT : dT;
             float aB = (dB < 0.0f) ? -dB : dB;
 
+            if ((aT > DL_SPLIT_DEVY || aB > DL_SPLIT_DEVY || aS > sthresh)
+                && depth < 10)
+            {
+                // Split at the first deviating column. Keep both halves
+                // non-empty so the recursion always shrinks.
+                int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
+                DL_EmitRunPiece(tier, xa, xm, mid, texnum, cy, k, depth + 1);
+                DL_EmitRunPiece(tier, xm + 1, xb, mid, texnum, cy, k,
+                                depth + 1);
+                return;
+            }
             if (dT > devtop) devtop = dT;
             if (dB > devbot) devbot = dB;
-            if (aT > worstY) worstY = aT;
-            if (aB > worstY) worstY = aB;
-            if (aS > worstS) worstS = aS;
-            if (x < xb)
-            {
-                float st = (float)t_scol[x + 1] - (float)t_scol[x];
-                if (st < 0.0f) st = -st;
-                if (st > maxstep) maxstep = st;
-            }
         }
-
-        sthresh = 0.51f * maxstep;
-        if (sthresh < DL_SPLIT_DEVS)
-            sthresh = DL_SPLIT_DEVS;
-
-        if ((worstY > DL_SPLIT_DEVY || worstS > sthresh) && depth < 10)
-        {
-            // Split at the worst column (second pass; splits are the rare
-            // path) and recurse. Convergence: pieces shrink every level and
-            // a width-1 piece is exact by construction.
-            int   xm = xa;
-            float bad_best = -1.0f;
-
-            for (x = xa; x <= xb; x++)
-            {
-                float f  = ((float)x + 0.5f - (float)xa) / width;
-                float wm = invw_l + (invw_r - invw_l) * f;
-                float sp = (swl + (swr - swl) * f) / wm;
-                float lt = ytl + (ytr - ytl) * f;
-                float lb = ybl + (ybr - ybl) * f;
-                float dS = sp - (float)t_scol[x];
-                float dT = lt - (float)t_yl[x];
-                float dB = ((float)t_yh[x] + 1.0f) - lb;
-                float bad;
-                if (dS < 0.0f) dS = -dS;
-                if (dT < 0.0f) dT = -dT;
-                if (dB < 0.0f) dB = -dB;
-                bad = dS / sthresh;
-                if (dT / DL_SPLIT_DEVY > bad) bad = dT / DL_SPLIT_DEVY;
-                if (dB / DL_SPLIT_DEVY > bad) bad = dB / DL_SPLIT_DEVY;
-                if (bad > bad_best)
-                {
-                    bad_best = bad;
-                    xm = x;
-                }
-            }
-            if (xm >= xb)
-                xm = xb - 1;
-            if (xm < xa)
-                xm = xa;
-            DL_EmitRunPiece(tier, xa, xm, mid, texnum, cy, k, depth + 1);
-            DL_EmitRunPiece(tier, xm + 1, xb, mid, texnum, cy, k, depth + 1);
-            return;
-        }
+    }
+    else if (xb > xa)
+    {
+        // Width-2: the corner extrapolation makes the edge lerps pass through
+        // both column samples exactly; only the half-row sampling margin
+        // remains, which the 0.49 coverage slack absorbs.
+        float dT = ytl + (ytr - ytl) * 0.25f - (float)t_yl[xa];
+        float dB = ((float)t_yh[xa] + 1.0f) - (ybl + (ybr - ybl) * 0.25f);
+        float dT2 = ytl + (ytr - ytl) * 0.75f - (float)t_yl[xb];
+        float dB2 = ((float)t_yh[xb] + 1.0f) - (ybl + (ybr - ybl) * 0.75f);
+        if (dT > devtop) devtop = dT;
+        if (dT2 > devtop) devtop = dT2;
+        if (dB > devbot) devbot = dB;
+        if (dB2 > devbot) devbot = dB2;
     }
 
     // Coverage bias: raise/lower the whole edge by the measured worst
