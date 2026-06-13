@@ -1517,6 +1517,17 @@ void I_N64MarkPaletteDirty(void)
     n64_palette_dirty = true;
 }
 
+// The CI4 wall pass (DL_Flush) overwrites the 256-entry TLUT region with up to
+// 16 per-texture 16-colour sub-palettes. Force the master 256-TLUT to re-upload
+// before the present blit so sprites/HUD/overlay (CI8 on the master) and the
+// keyed COPY blit sample the correct colours again. The master already carries
+// the right key alpha, so this does NOT touch any entry -- it just re-arms the
+// upload. Negligible: one 512-byte writeback + one LOAD_TLUT per frame.
+void I_N64ForceTLUTReupload(void)
+{
+    n64_palette_dirty = true;
+}
+
 void I_InitGraphics(void)
 {
     int i;

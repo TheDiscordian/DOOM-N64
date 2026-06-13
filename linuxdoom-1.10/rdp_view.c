@@ -173,18 +173,34 @@ static float        dl_invw_k = 1.0f;
 // row offsets; no stock DOOM texture is that narrow -- refuse to route them.
 #define DL_MIN_TEX_W    8
 
+// CI4 sub-palette (Stage-3 CI4 wall path). Each routed texture quantizes its
+// distinct PLAYPAL colours down to <=16 (median-cut + nearest-PLAYPAL snap,
+// matching /tmp/ci4-preview/quantize.py) ONCE at first touch. subpal[] holds
+// the <=16 chosen colours as RGBA5551 (the TLUT format, alpha=1 opaque) for
+// upload into the CI4 palette region; remap[] maps every PLAYPAL index 0..255
+// to its 0..15 sub-palette slot so the transpose loop packs 2 CI4 nibbles/byte.
 typedef struct
 {
     void* raw;      // the actual Z_Malloc'd allocation (back-referenced by zone)
-    byte* block;    // 8-byte-aligned row-major width x height CI8 view into raw
+    byte* block;    // 8-byte-aligned row-major width x height CI4 view into raw
     int   height;   // texture height in texels (rows in the block)
     int   width;    // transpose width = texturewidthmask+1 (pow2 sample period)
     uint32_t lastuse;   // present generation of the last DL_MarkInFlight
     uint8_t  pinned;    // currently PU_STATIC for an in-flight window
+    uint8_t  subpal_n;  // count of valid sub-palette entries (1..16)
+    uint8_t  subpal_inited; // 1 once the sub-palette + remap are built
+    uint8_t  pal_slot;  // CI4 palette slot assigned for the CURRENT frame (0..15)
+    uint16_t subpal[16];    // <=16 RGBA5551 TLUT entries (the quantized colours)
+    uint8_t  remap[256];    // PLAYPAL index -> sub-palette slot (0..subpal_n-1)
 } dl_rowmajor_t;
 
 static dl_rowmajor_t* dl_rowmajor;      // [numtextures]
 static int            dl_rowmajor_inited;
+
+// 8-byte-aligned scratch for CI4 sub-palette TLUT uploads (rdpq_tex_upload_tlut
+// reads the source via set_texture_image_raw; a misaligned source shifts the
+// load by init_offset). 16 RGBA5551 entries = 32 bytes.
+static uint16_t       dl_subpal_up[16] __attribute__((aligned(8)));
 
 // Present generation counter for the in-flight pin/demote schedule (see the
 // in-flight block tracking section below). Declared here because fresh
@@ -201,6 +217,258 @@ static void DL_InitCaches(void)
                                            PU_STATIC, 0);
     memset(dl_rowmajor, 0, numtextures * sizeof(dl_rowmajor_t));
     dl_rowmajor_inited = 1;
+}
+
+// --- CI4 sub-palette quantizer (Stage-3 CI4 wall path) ---------------------
+// Build a texture's <=16-colour CI4 sub-palette ONCE, at first touch, into the
+// rowmajor slot. The algorithm mirrors /tmp/ci4-preview/quantize.py (the
+// fidelity target the previews were rendered from):
+//   1. gather the texture's DISTINCT PLAYPAL indices + per-index pixel
+//      frequency over every column software can sample (col & widthmask);
+//   2. if <=16 distinct, take them verbatim (lossless -- BROWNGRN/COMPTILE/
+//      SLADWALL all land here);
+//   3. else frequency-weighted median-cut in RGB to 16 representatives, each
+//      snapped to its nearest PLAYPAL entry (squared-RGB distance -- the C
+//      path drops the Python preview's CIELab snap, perceptually a wash for
+//      snapping to the source art's own palette);
+//   4. remap[] maps every used PLAYPAL index to its nearest sub-palette slot
+//      (squared-RGB), filling the 256-entry remap so the transpose can pack
+//      any column's texels (unused indices map to slot 0, never sampled).
+// The sub-palette colours are stored RGBA5551 (TLUT format, alpha=1, gamma via
+// the SAME gammatable I_SetPalette uses so wall colour matches the master).
+//
+// Cost: once per routed texture, on its cold frame (excluded from steady-state
+// timing). Median-cut over <=256 colours is a handful of partition passes.
+extern int      usegamma;
+extern byte     gammatable[5][256];
+
+// One median-cut box: an index range into a working array of distinct colours,
+// plus its frequency-weighted centroid (filled at extraction).
+typedef struct { int lo, hi; } dl_mc_box_t;
+
+static inline int DL_RGBdist2(int r0,int g0,int b0,int r1,int g1,int b1)
+{
+    int dr=r0-r1, dg=g0-g1, db=b0-b1;
+    return dr*dr + dg*dg + db*db;
+}
+
+static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
+{
+    const byte* playpal;
+    int   th, tw, col, row, i, k;
+    int   freq[256];
+    int   nuniq = 0;
+    // working arrays for median-cut (parallel, reordered together)
+    uint8_t  wpix[256];     // PLAYPAL index of distinct colour
+    int      wfreq[256];    // its frequency
+    uint8_t  wr[256], wg[256], wb[256];     // gamma-applied RGB
+    dl_mc_box_t boxes[16];
+    int   nboxes;
+    uint8_t  pal_r[16], pal_g[16], pal_b[16];   // final sub-palette RGB (gamma)
+
+    if (slot->subpal_inited)
+        return;
+
+    playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
+    th = slot->height;
+    tw = slot->width;
+    if (!playpal || th < 1 || tw < 1)
+    {
+        // Degenerate: a single black entry, everything maps to it. Marks the
+        // slot inited so we never retry a broken texture every frame.
+        slot->subpal[0] = 1;        // black, opaque
+        slot->subpal_n  = 1;
+        memset(slot->remap, 0, sizeof(slot->remap));
+        slot->subpal_inited = 1;
+        return;
+    }
+
+    // Frequency histogram over exactly the texels the wall can sample.
+    memset(freq, 0, sizeof(freq));
+    for (col = 0; col < tw; col++)
+    {
+        const byte* src = R_GetColumn(texnum, col);
+        for (row = 0; row < th; row++)
+            freq[src[row]]++;
+    }
+    for (i = 0; i < 256; i++)
+    {
+        if (freq[i] > 0)
+        {
+            wpix[nuniq]  = (uint8_t)i;
+            wfreq[nuniq] = freq[i];
+            wr[nuniq] = gammatable[usegamma][playpal[i*3+0]];
+            wg[nuniq] = gammatable[usegamma][playpal[i*3+1]];
+            wb[nuniq] = gammatable[usegamma][playpal[i*3+2]];
+            nuniq++;
+        }
+    }
+    if (nuniq == 0)
+    {
+        slot->subpal[0] = 1;
+        slot->subpal_n  = 1;
+        memset(slot->remap, 0, sizeof(slot->remap));
+        slot->subpal_inited = 1;
+        return;
+    }
+
+    if (nuniq <= 16)
+    {
+        // Lossless: the distinct colours ARE the sub-palette.
+        for (i = 0; i < nuniq; i++)
+        {
+            pal_r[i] = wr[i]; pal_g[i] = wg[i]; pal_b[i] = wb[i];
+        }
+        slot->subpal_n = (uint8_t)nuniq;
+    }
+    else
+    {
+        // Frequency-weighted median-cut to 16 boxes. boxes hold index ranges
+        // into the w* working arrays, which we reorder in place per split.
+        boxes[0].lo = 0; boxes[0].hi = nuniq;    // [lo,hi)
+        nboxes = 1;
+        while (nboxes < 16)
+        {
+            int   best = -1;
+            long  bestscore = -1;
+            int   lo, hi, axis, mid;
+            long  wsum, half, cum;
+            int   rmin,rmax,gmin,gmax,bmin,bmax;
+            // pick the box with the largest (longest-axis-range * weight)
+            for (k = 0; k < nboxes; k++)
+            {
+                int n = boxes[k].hi - boxes[k].lo;
+                long w = 0, rng;
+                int j;
+                if (n <= 1) continue;
+                rmin=gmin=bmin=255; rmax=gmax=bmax=0;
+                for (j = boxes[k].lo; j < boxes[k].hi; j++)
+                {
+                    if (wr[j]<rmin) rmin=wr[j];
+                    if (wr[j]>rmax) rmax=wr[j];
+                    if (wg[j]<gmin) gmin=wg[j];
+                    if (wg[j]>gmax) gmax=wg[j];
+                    if (wb[j]<bmin) bmin=wb[j];
+                    if (wb[j]>bmax) bmax=wb[j];
+                    w += wfreq[j];
+                }
+                rng = (rmax-rmin);
+                if ((gmax-gmin) > rng) rng = (gmax-gmin);
+                if ((bmax-bmin) > rng) rng = (bmax-bmin);
+                {
+                    long score = rng * w;
+                    if (score > bestscore) { bestscore = score; best = k; }
+                }
+            }
+            if (best < 0) break;     // no splittable box (all singletons)
+
+            lo = boxes[best].lo; hi = boxes[best].hi;
+            // longest axis of the chosen box
+            rmin=gmin=bmin=255; rmax=gmax=bmax=0;
+            for (i = lo; i < hi; i++)
+            {
+                if (wr[i]<rmin) rmin=wr[i];
+                if (wr[i]>rmax) rmax=wr[i];
+                if (wg[i]<gmin) gmin=wg[i];
+                if (wg[i]>gmax) gmax=wg[i];
+                if (wb[i]<bmin) bmin=wb[i];
+                if (wb[i]>bmax) bmax=wb[i];
+            }
+            axis = 0;
+            { int rr=rmax-rmin, gg=gmax-gmin, bb=bmax-bmin;
+              if (gg>=rr && gg>=bb) axis=1; else if (bb>=rr && bb>=gg) axis=2; }
+            // insertion-sort the box's slice by the chosen axis (n is small)
+            for (i = lo+1; i < hi; i++)
+            {
+                int kr=wr[i],kg=wg[i],kb=wb[i],kp=wpix[i],kf=wfreq[i];
+                int kv=(axis==0)?kr:(axis==1)?kg:kb;
+                int j=i-1;
+                while (j>=lo)
+                {
+                    int jv=(axis==0)?wr[j]:(axis==1)?wg[j]:wb[j];
+                    if (jv<=kv) break;
+                    wr[j+1]=wr[j]; wg[j+1]=wg[j]; wb[j+1]=wb[j];
+                    wpix[j+1]=wpix[j]; wfreq[j+1]=wfreq[j];
+                    j--;
+                }
+                wr[j+1]=kr; wg[j+1]=kg; wb[j+1]=kb; wpix[j+1]=kp; wfreq[j+1]=kf;
+            }
+            // split at the weighted median
+            wsum = 0;
+            for (i = lo; i < hi; i++) wsum += wfreq[i];
+            half = wsum / 2; cum = 0; mid = lo;
+            for (i = lo; i < hi; i++)
+            {
+                cum += wfreq[i];
+                if (cum >= half) { mid = i+1; break; }
+            }
+            if (mid <= lo) mid = lo+1;
+            if (mid >= hi) mid = hi-1;
+            // replace best box with [lo,mid); append [mid,hi)
+            boxes[best].hi = mid;
+            boxes[nboxes].lo = mid; boxes[nboxes].hi = hi;
+            nboxes++;
+        }
+        // Extract each box's frequency-weighted centroid, snap to PLAYPAL.
+        for (k = 0; k < nboxes; k++)
+        {
+            long sr=0,sg=0,sb=0,sw=0;
+            int  bestidx=0, bestd=0x7fffffff;
+            int  cr,cg,cb;
+            for (i = boxes[k].lo; i < boxes[k].hi; i++)
+            {
+                sr += (long)wr[i]*wfreq[i];
+                sg += (long)wg[i]*wfreq[i];
+                sb += (long)wb[i]*wfreq[i];
+                sw += wfreq[i];
+            }
+            if (sw < 1) sw = 1;
+            cr = (int)(sr/sw); cg = (int)(sg/sw); cb = (int)(sb/sw);
+            // nearest PLAYPAL entry (gamma-applied, squared RGB)
+            for (i = 0; i < 256; i++)
+            {
+                int pr=gammatable[usegamma][playpal[i*3+0]];
+                int pg=gammatable[usegamma][playpal[i*3+1]];
+                int pb=gammatable[usegamma][playpal[i*3+2]];
+                int d=DL_RGBdist2(cr,cg,cb,pr,pg,pb);
+                if (d<bestd) { bestd=d; bestidx=i; }
+            }
+            pal_r[k]=gammatable[usegamma][playpal[bestidx*3+0]];
+            pal_g[k]=gammatable[usegamma][playpal[bestidx*3+1]];
+            pal_b[k]=gammatable[usegamma][playpal[bestidx*3+2]];
+        }
+        slot->subpal_n = (uint8_t)nboxes;
+    }
+
+    // Pack the final sub-palette as RGBA5551 (alpha=1, opaque -- walls are
+    // never the transparency key; the key only matters for the CI8 overlay).
+    for (k = 0; k < slot->subpal_n; k++)
+    {
+        slot->subpal[k] = (uint16_t)(((pal_r[k] >> 3) << 11) |
+                                     ((pal_g[k] >> 3) << 6)  |
+                                     ((pal_b[k] >> 3) << 1)  | 1);
+    }
+    for (; k < 16; k++)
+        slot->subpal[k] = slot->subpal[0];
+
+    // remap[]: every PLAYPAL index -> nearest sub-palette slot (squared RGB on
+    // gamma-applied colours). Unused indices still get a valid slot (harmless;
+    // they are never sampled). Used indices snap to the closest of the <=16.
+    for (i = 0; i < 256; i++)
+    {
+        int pr=gammatable[usegamma][playpal[i*3+0]];
+        int pg=gammatable[usegamma][playpal[i*3+1]];
+        int pb=gammatable[usegamma][playpal[i*3+2]];
+        int bestslot=0, bestd=0x7fffffff;
+        for (k = 0; k < slot->subpal_n; k++)
+        {
+            int d=DL_RGBdist2(pr,pg,pb, pal_r[k],pal_g[k],pal_b[k]);
+            if (d<bestd) { bestd=d; bestslot=k; }
+        }
+        slot->remap[i] = (uint8_t)bestslot;
+    }
+
+    slot->subpal_inited = 1;
 }
 
 // Produce (or fetch) the full-height row-major CI8 block for texnum.
@@ -266,32 +534,60 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     tw = texturewidthmask[texnum] + 1;
     if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
-
-    // PU_STATIC until DL_PresentEnd demotes it (see lifetime note above); user
-    // ptr back-references the cache slot so a zone reclaim of the demoted block
-    // NULLs slot->raw and the next touch re-transposes. Over-allocate by 7
-    // bytes so the row-major view can be 8-byte aligned -- the RDP DMA that
-    // loads this block into TMEM (rdpq_tex_upload) requires an 8-byte-aligned
-    // source, and Z_Malloc only guarantees 4-byte alignment (size rounded to 4,
-    // z_zone.c:195). A misaligned source silently corrupts the tile.
-    slot->raw = Z_Malloc(tw * th + 7, PU_STATIC, (void**)&slot->raw);
-    if (!slot->raw)
-        return NULL;
-    block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
-
-    for (col = 0; col < tw; col++)
-    {
-        // R_GetColumn masks the column into the texture's pow2 period, so col
-        // 0..tw-1 enumerates exactly the columns software can ever sample.
-        const byte* src = R_GetColumn(texnum, col);
-        for (row = 0; row < th; row++)
-            block[row * tw + col] = src[row];
-    }
-
-    data_cache_hit_writeback(block, tw * th);
-    slot->block = block;
-    slot->height = th;
     slot->width = tw;
+
+    // CI4 row pitch is tw/2 bytes (2 indices/byte), and the RDP requires every
+    // tile pitch be a multiple of 8 bytes. tw is a power of two (texturewidthmask
+    // = pow2-1), so tw/2 is a multiple of 8 for tw >= 16; only tw==8 (4 bytes)
+    // is short. PAD the stored row to a 16-texel period (8 bytes) for tw==8 --
+    // the extra 8 texels are never sampled because the hardware S-wrap mask is
+    // log2(tw) (the REAL period), which folds every S into [0,tw). pad_w is the
+    // stored period (texels/row); the row pitch is pad_w/2 bytes.
+    {
+        int pad_w = (tw < 16) ? 16 : tw;
+        int pitch = pad_w / 2;          // bytes/row (multiple of 8)
+
+        // Build this texture's <=16-colour CI4 sub-palette + 256->slot remap
+        // ONCE, at first touch (lossless if it already has <=16 distinct
+        // colours). Needs slot->width/height set.
+        slot->height = th;
+        DL_BuildSubPalette(texnum, slot);
+
+        // PU_STATIC until DL_PresentEnd demotes it (lifetime note above); user
+        // ptr back-references the slot so a zone reclaim NULLs slot->raw and the
+        // next touch re-transposes. The CI4 block is pitch*th bytes (HALF of the
+        // CI8 block at pad_w==tw -- the headline TMEM/band win). Over-allocate by
+        // 7 so the view is 8-byte aligned (the RDP DMA into TMEM needs an
+        // 8-byte-aligned source; Z_Malloc guarantees only 4).
+        {
+            int ci4_bytes = pitch * th;
+            slot->raw = Z_Malloc(ci4_bytes + 7, PU_STATIC, (void**)&slot->raw);
+            if (!slot->raw)
+                return NULL;
+            block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
+            memset(block, 0, ci4_bytes);    // pad texels = slot 0 (never sampled)
+
+            // Transpose column-major posts -> row-major AND pack to CI4 nibbles.
+            // Even column -> high nibble, odd column -> low nibble (RDP CI4 byte
+            // order; matches mksprite's (ix0<<4)|ix1). remap[] turns each PLAYPAL
+            // index into its 0..15 sub-palette slot.
+            for (col = 0; col < tw; col++)
+            {
+                const byte* src = R_GetColumn(texnum, col);
+                byte*       dstcol = block + (col >> 1);
+                int         shift  = (col & 1) ? 0 : 4;
+                for (row = 0; row < th; row++)
+                {
+                    byte nib = slot->remap[src[row]] & 0x0F;
+                    byte* d  = dstcol + row * pitch;
+                    if (shift) *d = (byte)((*d & 0x0F) | (nib << 4));
+                    else       *d = (byte)((*d & 0xF0) | nib);
+                }
+            }
+            data_cache_hit_writeback(block, ci4_bytes);
+        }
+    }
+    slot->block = block;
     // Fresh blocks are born PU_STATIC: record that as a pin in the current
     // present generation so DL_PresentEnd's sweep demotes them on the same
     // schedule as re-pinned blocks (see the in-flight tracking below).
@@ -1270,12 +1566,12 @@ static int         dl_last_tile_wrap;
 // entries are colormap brightness and the unlit fallback is 0xFFFFFFFF).
 static uint32_t    dl_last_prim;
 
-static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
+static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
+                         int pal_slot)
 {
-    int     cap;            // max tile rows fitting the lower TMEM half
-    int     lw;             // adaptive S window width (texels; pow2 <= blkw)
-    int     c0;             // S window origin within the period (0 if full)
-    int     wrap;           // 1: full-period tile, hardware S wrap
+    int     cap;            // max CI4 tile rows fitting the lower TMEM half
+    int     pad_w;          // stored CI4 period (texels/row; >=16 for pitch)
+    int     pitchb;         // CI4 row pitch in bytes (pad_w/2)
     uint32_t prim;
     float   xl, xr;
     float   s_l, s_r;       // S endpoints, period-bias-reduced (BUG D)
@@ -1312,80 +1608,49 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
         s_r = w->s_r - bias;
     }
 
-    // ADAPTIVE S WINDOW (band/triangle collapse). The TMEM band cap is
-    // 2048/tile_width rows, so wide textures band-split aggressively (a
-    // 128-wide texture caps at 16 rows: a full-height wall = 8 bands = 16
-    // triangles PER RECORD), and the triangle/band volume -- not the upload
-    // helper -- is what keeps DL_BUILD heavy. Most records sample a NARROW S
-    // range (run width in columns ~ texels at normal angles), so when the
-    // biased S range [smin,smax] fits inside one texture period, load only a
-    // power-of-two S window [c0, c0+lw) of the block instead of full rows:
-    // cap doubles per halving of lw, collapsing the band count (typical
-    // 30-px run on a 128-wide texture: 8 bands -> 2). Sampling is identical:
-    // the window covers [floor(smin)-1, ceil(smax)+1] (a margin texel each
-    // side), the tile CLAMPS S at the window edges it never reaches, and
-    // triangle S values are unchanged (LOAD_TILE keeps original coords).
-    // Records whose S range crosses a period seam need the hardware wrap and
-    // keep the full-width path (mask = log2(blkw)).
-    {
-        float smin = (s_l < s_r) ? s_l : s_r;
-        float smax = (s_l < s_r) ? s_r : s_l;
-        int   ilo = (int)floorf(smin) - 1;
-        int   ihi = (int)ceilf(smax) + 1;
+    // CI4 HARDWARE S-WRAP (the headline one-quad-per-wall lever). The whole
+    // texture width is one tile and the RDP S-mask (= log2(blkw)) wraps S in
+    // HARDWARE -- no adaptive S window, no S-split bands. The CI4 row is half
+    // the bytes of CI8, so the TMEM cap DOUBLES: 64-wide caps at 4096/64 = 64
+    // rows (a 64x64 texture = ONE quad; a 64x128 = 2 T-bands vs CI8's 4),
+    // 128-wide caps at 32, 256-wide at 16. pad_w pads tw<16 up to a 16-texel
+    // (8-byte) row so the tile pitch is legal; the pad texels are never sampled
+    // (S-mask folds into [0,blkw)).
+    pad_w  = (blkw < 16) ? 16 : blkw;
+    pitchb = pad_w / 2;     // bytes/row (multiple of 8)
 
-        lw = blkw;
-        c0 = 0;
-        wrap = 1;
-        if (ilo < 0)
-            ilo = 0;
-        if (ihi < blkw)
-        {
-            int need = ihi - ilo + 1;
-            int w2 = 8;
-            while (w2 < need)
-                w2 <<= 1;
-            if (w2 < blkw)
-            {
-                lw = w2;
-                wrap = 0;
-                c0 = ilo;
-                if (c0 + lw > blkw)
-                    c0 = blkw - lw;
-            }
-        }
-    }
-
-    // Per-width TMEM tile cap: lw bytes/row (CI8) against the lower 2 KB TMEM
-    // half beside the resident TLUT (64-wide: 32 rows, 128-wide: 16,
-    // 256-wide: 8 -- Q7; the adaptive window above raises it further).
-    cap = DL_TMEM_HALF / lw;
+    cap = DL_TMEM_HALF / pitchb;
     if (cap < 1)
         return 0;
 
-    // Configure TILE0 for this record's window geometry (deduped: most
-    // consecutive records of a texture share lw/wrap). Pitch = lw bytes
-    // (pow2 >= 8). Wrap mode masks S with the texture period; window mode
-    // clamps (mask 0 forces clamp). T always clamps at the loaded band rows.
-    // A tile change invalidates the resident band (TMEM layout changed).
-    if (lw != dl_last_tile_lw || wrap != dl_last_tile_wrap)
+    // Configure the CI4 draw tile (TILE0) + the internal I8 load tile (TILE1)
+    // once per (texture period, palette slot). 4-bit textures cannot be
+    // LOAD_TILE'd directly: the RDP loads them through a byte (I8) view at half
+    // the S width (2 CI4 texels = 1 byte), then a separate CI4 tile descriptor
+    // (with the palette) is used for DRAWING -- this is libdragon's own CI4
+    // pattern (texload_tile_4bpp). TILE0 (CI4): pitch = pad_w/2 bytes, hardware
+    // S-wrap (mask = log2(blkw)), T clamps at the loaded band rows (vertical
+    // wrap is done by the T-band walk, which also handles non-pow2 heights -- so
+    // hardware T-mask is NOT used), palette = the frame's assigned CI4 sub-
+    // palette slot (0..15) in the 256-entry TLUT region. TILE1 (I8): same TMEM
+    // addr + byte pitch, used only as the LOAD_TILE target. dl_last_tile_lw/wrap
+    // reused as the dedup key: lw <- blkw (period), wrap <- pal_slot.
+    if (blkw != dl_last_tile_lw || pal_slot != dl_last_tile_wrap)
     {
         rdpq_tileparms_t tp;
+        int maskbits = 0;
+        int wbit;
 
         memset(&tp, 0, sizeof(tp));
-        if (wrap)
-        {
-            int maskbits = 0;
-            int wbit;
-            for (wbit = blkw; wbit > 1; wbit >>= 1)
-                maskbits++;
-            tp.s.mask = maskbits;
-        }
-        else
-            tp.s.clamp = true;
+        for (wbit = blkw; wbit > 1; wbit >>= 1)
+            maskbits++;
+        tp.s.mask = maskbits;
         tp.t.clamp = true;
-        rdpq_set_tile(TILE0, FMT_CI8, 0, lw, &tp);
-        dl_last_tile_lw   = lw;
-        dl_last_tile_wrap = wrap;
+        tp.palette = pal_slot;
+        rdpq_set_tile(TILE1, FMT_I8, 0, pitchb, NULL);      // internal load tile
+        rdpq_set_tile(TILE0, FMT_CI4, 0, pitchb, &tp);      // draw tile
+        dl_last_tile_lw   = blkw;
+        dl_last_tile_wrap = pal_slot;
         dl_last_up_block  = NULL;
     }
 
@@ -1478,18 +1743,26 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
         // triangles below use base=period_base (not band-local rows) and the
         // sampled texels are unchanged.
         // Skip the load (and its autosync) when the identical band is already
-        // resident from the previous record's draw (UPLOAD DEDUP above).
-        bandsrc = block + (src_lo * blkw);
+        // resident from the previous record's draw (UPLOAD DEDUP above). The
+        // band is the FULL texture width [0, blkw) loaded as CI4; the row pitch
+        // in RDRAM is pitchb bytes (= pad_w/2). CI4 LOAD goes through the I8 view
+        // (TILE1) at HALF the S width (2 CI4 texels/byte), then the CI4 draw tile
+        // (TILE0) gets the full CI4 texel extents via SET_TILE_SIZE -- the same
+        // two-step the libdragon tex-loader uses for 4-bit. The DRAW T is
+        // period-relative (base=period_base) so set the tile T0 to src_lo (the
+        // band's first source row), matching the loaded rows.
+        bandsrc = block + (src_lo * pitchb);
         if (bandsrc != dl_last_up_block
             || src_lo != dl_last_up_lo
             || rows_up != dl_last_up_rows
-            || c0 != dl_last_up_c0)
+            || blkw != dl_last_up_c0)
         {
-            rdpq_load_tile(TILE0, c0, src_lo, c0 + lw, src_lo + rows_up);
+            rdpq_load_tile(TILE1, 0, src_lo, blkw / 2, src_lo + rows_up);
+            rdpq_set_tile_size(TILE0, 0, src_lo, blkw, src_lo + rows_up);
             dl_last_up_block = bandsrc;
             dl_last_up_lo    = src_lo;
             dl_last_up_rows  = rows_up;
-            dl_last_up_c0    = c0;
+            dl_last_up_c0    = blkw;
         }
 
         // Slice corners. T iso-lines of the wall's projective map are straight
@@ -1876,39 +2149,71 @@ void DL_Flush(void)
         // Once per texture, not once per record (Stage 2 over-pinned per seg).
         DL_MarkInFlight(tex);
 
-        // Point the RDP at the FULL row-major block ONCE per texture (the
-        // raw-tile DL_BUILD collapse; see the band-load note in
-        // DL_DrawRecord). The TILE0 descriptor itself is configured inside
-        // the band path -- its pitch and S clamp/wrap depend on the record's
-        // adaptive S window -- and deduped there; invalidate that state here
-        // because the wrap mask is per-texture-period.
+        // TMEM PALETTE STRATEGY (CI4, spec A+B). Assign this texture a CI4
+        // palette slot in the 256-entry TLUT region and upload its 16-colour
+        // sub-palette there. Slot = touch-order mod 16: the first <=16 textures
+        // each get a distinct slot (one upload apiece, no mid-frame swap). On
+        // tail frames with >16 distinct textures the slot RE-USES an earlier
+        // one, and we re-upload that slot's sub-palette here, immediately before
+        // drawing this texture's bucket (the bucket walk draws all of a
+        // texture's records consecutively, so the slot's colours are valid for
+        // exactly this texture's draws). Sub-palette = 16 RGBA5551 entries
+        // (32 B) -> rdpq_tex_upload_tlut at slot*16. The master 256-TLUT is
+        // re-asserted after the whole wall pass (I_N64ForceTLUTReupload).
         {
+            dl_rowmajor_t* slot = &dl_rowmajor[tex];
+            int pal_slot = ti & 15;
             surface_t texsurf;
 
-            texsurf = surface_make_linear(block, FMT_CI8, blkw, blkh);
-            rdpq_set_texture_image(&texsurf);
+            slot->pal_slot = (uint8_t)pal_slot;
+            // Upload the sub-palette through an 8-byte-aligned scratch so
+            // rdpq_tex_upload_tlut's init_offset is 0 (it reads the TLUT buffer
+            // via set_texture_image_raw; a misaligned source shifts the load).
+            memcpy(dl_subpal_up, slot->subpal, sizeof(slot->subpal));
+            data_cache_hit_writeback(dl_subpal_up, sizeof(slot->subpal));
+            rdpq_tex_upload_tlut(dl_subpal_up, pal_slot * 16, 16);
+
+            // Point the RDP at the FULL row-major CI4 block ONCE per texture,
+            // interpreted as an I8 byte image (the CI4 LOAD goes through the I8
+            // view at half the S width -- see DL_DrawRecord). Width = the CI4 row
+            // pitch in bytes (pad_w/2); height = blkh. The TILE0/TILE1 descriptors
+            // are configured + deduped inside the band path; invalidate that
+            // state here because the period/palette is per-texture.
+            {
+                int pad_w  = (blkw < 16) ? 16 : blkw;
+                int pitchb = pad_w / 2;
+                texsurf = surface_make_linear(block, FMT_I8, pitchb, blkh);
+                rdpq_set_texture_image(&texsurf);
+            }
             dl_last_tile_lw   = -1;
             dl_last_tile_wrap = -1;
             dl_last_up_block  = NULL;
-        }
 
-        for (ridx = dl_bucket_head[tex]; ridx >= 0;
-             ridx = dl_walls[ridx].bucket_next)
-        {
-            const rdp_wall_t* w = &dl_walls[ridx];
+            for (ridx = dl_bucket_head[tex]; ridx >= 0;
+                 ridx = dl_walls[ridx].bucket_next)
+            {
+                const rdp_wall_t* w = &dl_walls[ridx];
 #if DL_DEBUG_TRACE
-            debugf("DL_TRACE p=%d rec=%d tex=%d w=%d h=%d x=%d..%d "
-                   "y=%d.%d/%d.%d tl=%d..%d tr=%d..%d s=%d..%d lit=%d\n",
-                   dl_present_no, ridx, tex, blkw, blkh,
-                   (int)w->x1, (int)w->x2,
-                   (int)w->ytop_l, (int)w->ytop_r, (int)w->ybot_l, (int)w->ybot_r,
-                   (int)w->t_top_l, (int)w->t_bot_l,
-                   (int)w->t_top_r, (int)w->t_bot_r,
-                   (int)w->s_l, (int)w->s_r, (int)w->light);
+                debugf("DL_TRACE p=%d rec=%d tex=%d w=%d h=%d x=%d..%d "
+                       "y=%d.%d/%d.%d tl=%d..%d tr=%d..%d s=%d..%d lit=%d\n",
+                       dl_present_no, ridx, tex, blkw, blkh,
+                       (int)w->x1, (int)w->x2,
+                       (int)w->ytop_l, (int)w->ytop_r, (int)w->ybot_l, (int)w->ybot_r,
+                       (int)w->t_top_l, (int)w->t_bot_l,
+                       (int)w->t_top_r, (int)w->t_bot_r,
+                       (int)w->s_l, (int)w->s_r, (int)w->light);
 #endif
-            DL_DrawRecord(w, block, blkh, blkw);
+                DL_DrawRecord(w, block, blkh, blkw, pal_slot);
+            }
         }
     }
+
+    // The wall pass overwrote the 256-entry TLUT region with CI4 sub-palettes;
+    // re-assert the master 256-TLUT before the present blit so CI8 sprites/HUD/
+    // overlay sample the right colours (TMEM palette strategy B). Only when
+    // walls actually drew -- a planes-only frame never touched the TLUT.
+    if (dl_touched_count > 0)
+        I_N64ForceTLUTReupload();
 
     // Overflow fallback (design risk table "DL arena overflow on tail frames").
     // If the arena filled, records past DL_WALL_ARENA were never queued (their

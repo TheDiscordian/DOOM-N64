@@ -88,6 +88,13 @@ extern int n64_rdp_key_index;
 // which changes the key index's alpha bit).
 void I_N64MarkPaletteDirty(void);
 
+// Force the MASTER 256-entry TLUT to be re-uploaded before the present blit
+// (does NOT touch the key alpha -- the master is already correct). The CI4 wall
+// pass overwrites the 256-entry TLUT region with per-texture 16-colour sub-
+// palettes; this re-asserts the master so the present blit + CI8 sprites/HUD
+// sample the right colours. Called by DL_Flush at the end of the wall pass.
+void I_N64ForceTLUTReupload(void);
+
 // Scrub transparency-key pixels out of a wipe-captured CI8 screen (replace
 // each with the pixel above; top row falls back to palette 0). The wipe
 // captures recycle buffers that contain the routed seg's key-suppressed
