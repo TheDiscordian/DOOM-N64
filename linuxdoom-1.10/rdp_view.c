@@ -700,23 +700,29 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
         int   x;
 
         {
-            // GLANCING-WALL SMEAR FIX. The threshold must NOT scale with the
-            // per-column step. The deviation scan exists to split a piece where
-            // the linear-S/W trapezoid drifts from software's hyperbolic
-            // per-column texturecolumn; making the tolerance grow with maxstep
-            // (the old 0.51*maxstep) DISABLED the scan exactly at glancing
-            // angles, where maxstep is huge -- a 57-texel step permitted a
-            // ~28-texel S error per pixel, sampling a quarter-texture away from
-            // software and washing discrete texel columns into the long
-            // horizontal grey-green runs Ryan reported. Measured (DL_SDEV
-            // trace): residual scaled with maxstep, up to 18 texels at
-            // maxstep~101. A FIXED sub-texel tolerance forces glancing pieces to
-            // keep splitting until each sub-piece's perspective S tracks
-            // software within ~1 texel (the recursion's fixed point is the
-            // width-1 piece, which samples one source column = software-exact).
-            // Cost is bounded: only the few hundred glancing pieces/frame split
-            // further; normal-angle pieces (maxstep small) are unaffected.
-            sthresh = DL_SPLIT_DEVS;
+            // S split tolerance scales with the run's max per-column S step
+            // (0.51*maxstep), floored at DL_SPLIT_DEVS. RATIONALE (orchestrator
+            // pixel A/B, post-c1849d6): tightening this to a FIXED sub-texel
+            // tolerance (c1849d6) shattered glancing pieces to width-1 to chase
+            // a trace metric (S residual 18->1.5 texel) but produced ZERO
+            // visible change on the glancing-wall smear -- pre/post-ON A/B of
+            // the SAME scene+marker (frame-4096, bottom-right 3x crop) measured
+            // 0.53/255 mean abs diff, i.e. the optimized metric did not
+            // correspond to the visible defect. c1849d6 cost +1091us and +3.6%
+            // emit volume for no benefit, so the adaptive threshold is restored
+            // (visually free per the A/B, recovers the emit/dlbuild cost it
+            // added). The smear remains an OPEN S-domain item independent of
+            // this threshold; this change does not make it worse.
+            fixed_t maxstep = 1;
+            for (x = xa; x < xb; x++)
+            {
+                fixed_t st = t_scol[x + 1] - t_scol[x];
+                if (st < 0) st = -st;
+                if (st > maxstep) maxstep = st;
+            }
+            sthresh = 0.51f * (float)maxstep;
+            if (sthresh < DL_SPLIT_DEVS)
+                sthresh = DL_SPLIT_DEVS;
         }
 
         for (x = xa; x <= xb; x++)
@@ -761,34 +767,9 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
         if (dT2 > devtop) devtop = dT2;
         if (dB > devbot) devbot = dB;
         if (dB2 > devbot) devbot = dB2;
-
-        // GLANCING-WALL SMEAR FIX (width-2 S check). S is NOT exact by
-        // construction here: the corners are LINEARLY extrapolated half a pixel
-        // outward, but software's per-column texturecolumn is hyperbolic, so at
-        // glancing angles the perspective S at the two pixel centers can miss
-        // software by several texels (DL_SDEV trace: up to ~3 texels on width-2
-        // glancing pieces). Scan both centers; if either S deviates past the
-        // fixed sub-texel tolerance, split to two width-1 pieces -- each then
-        // samples its single source column exactly like software's drawcolumn.
-        if (depth < 10)
-        {
-            float swl = s_l * invw_l, swr = s_r * invw_r;
-            float w0 = invw_l + (invw_r - invw_l) * 0.25f;
-            float w1 = invw_l + (invw_r - invw_l) * 0.75f;
-            float sp0, sp1, aS0, aS1;
-            if (w0 < 1e-9f) w0 = 1e-9f;
-            if (w1 < 1e-9f) w1 = 1e-9f;
-            sp0 = (swl + (swr - swl) * 0.25f) / w0;
-            sp1 = (swl + (swr - swl) * 0.75f) / w1;
-            aS0 = sp0 - (float)t_scol[xa]; if (aS0 < 0.0f) aS0 = -aS0;
-            aS1 = sp1 - (float)t_scol[xb]; if (aS1 < 0.0f) aS1 = -aS1;
-            if (aS0 > DL_SPLIT_DEVS || aS1 > DL_SPLIT_DEVS)
-            {
-                DL_EmitRunPiece(tier, xa, xa, mid, texnum, cy, k, depth + 1);
-                DL_EmitRunPiece(tier, xb, xb, mid, texnum, cy, k, depth + 1);
-                return;
-            }
-        }
+        // (c1849d6's width-2 S-split removed with the adaptive-threshold
+        // restore above: it shattered glancing width-2 pieces to two width-1
+        // pieces for the same trace metric that showed no visible change.)
     }
 
     // Coverage bias: raise/lower the whole edge by the measured worst
