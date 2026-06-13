@@ -64,6 +64,14 @@ extern int*         texturewidthmask;
 extern fixed_t*     textureheight;
 extern lighttable_t* colormaps;
 
+// Flat system globals (r_data.c) -- Stage 4 plane path. firstflat is the lump
+// number of the first flat; numflats the count. A flat is a 64x64 row-major CI8
+// lump (4096 bytes). The plane emit keys its cache by the resolved lump number
+// (firstflat+flattranslation[picnum], animation-correct), reduced to a flat
+// index (lump-firstflat) for the parallel [numflats] cache.
+extern int          firstflat;
+extern int          numflats;
+
 byte* R_GetColumn(int tex, int col);
 
 // --- per-seg A/B toggle (graft #4) -----------------------------------------
@@ -110,6 +118,30 @@ static uint32_t     dl_frame_gen;           // bumped each DL_BeginFrame
 static int          dl_buckets_inited;
 static uint16_t     dl_touched[DL_WALL_ARENA]; // texnums touched this frame (deduped)
 static int          dl_touched_count;
+
+// --- Stage-4 plane span arena + per-flat buckets ---------------------------
+// Mirrors the wall arena/bucket machinery for floor/ceiling spans. Sized from
+// real visplane/span counts (brief primitive_estimate): typical ~240 spans,
+// tail ~950, worst ~1850. Design says size for tail x2 -> 4096 records. One
+// rdp_span_t ~= 28 B, so 4096 x 28 ~= 112 KB static. Overflow drops a span (it
+// stays key-index -- a punched hole over stale fb, the bounded class), same
+// discipline as walls.
+#define DL_SPAN_ARENA   4096
+
+static rdp_span_t   dl_spans[DL_SPAN_ARENA];
+static int          dl_span_count;
+static int          dl_span_overflow;       // 1 if a span was dropped this frame
+
+// Per-flat buckets: each flat lump used this frame keeps a chain of its spans
+// through the arena (rdp_span_t.bucket_next). Heads kept dense in a [numflats]
+// array, invalidated lazily by the SAME per-frame dl_frame_gen stamp the wall
+// buckets use (so BeginFrame stays O(touched)). dl_flat_touched[] is the sparse
+// set of flat indices used this frame, so DL_FlushSpans walks O(spans), not
+// O(numflats). Indexed by FLAT INDEX (lump - firstflat), 0..numflats-1.
+static int32_t*     dl_flat_bucket_head;    // [numflats] first span idx, -1 none
+static uint32_t*    dl_flat_bucket_gen;     // [numflats] frame stamp of head
+static uint16_t     dl_flat_touched[DL_SPAN_ARENA]; // flat indices touched (deduped)
+static int          dl_flat_touched_count;
 
 // Free-W proportionality constant for this frame (Q1). INV_W = rw_scale * k.
 // The absolute scale cancels in the RDP's hyperbolic divide, so any positive k
@@ -304,6 +336,112 @@ static void DL_MarkInFlight(int texnum)
     slot->lastuse = dl_present_gen;
 }
 
+// --- Stage-4 flat row-major CI8 cache --------------------------------------
+// Flats are ALREADY 64x64 row-major CI8 (4096-byte lumps; r_draw.c spot formula
+// confirms flat[V*64+U]), so unlike walls there is NO transpose -- the cache is
+// a memcpy of the flat lump bytes into an 8-byte-aligned PU_STATIC block plus a
+// cache writeback (cheaper than DL_RowMajorBlock's transpose loop). Keyed by
+// FLAT INDEX (lump - firstflat), animation-correct because R_DrawPlanes resolves
+// firstflat+flattranslation[picnum] before emitting.
+//
+// LIFETIME: identical to the wall transpose cache (DL_RowMajorBlock note) -- the
+// RDP reads this block ASYNCHRONOUSLY after rdpq_detach_cb, so it is PU_STATIC
+// until DL_PresentEnd demotes it once the using present provably drained. The
+// reload-survival lesson (DEFECTS.md Stage-3) applies: a slot whose raw the zone
+// reclaimed (NULLs the back-reference) re-copies on next touch, and DL_BeginFrame
+// resets the generation stamps so nothing crosses a P_SetupLevel wrongly.
+#define DL_FLAT_BYTES   4096    // 64x64 CI8
+
+typedef struct
+{
+    void*    raw;       // Z_Malloc'd allocation (back-referenced by zone)
+    byte*    block;     // 8-byte-aligned 64x64 row-major CI8 view into raw
+    uint32_t lastuse;   // present generation of the last DL_FlatMarkInFlight
+    uint8_t  pinned;    // currently PU_STATIC for an in-flight window
+} dl_flat_t;
+
+static dl_flat_t*   dl_flat;            // [numflats]
+static int          dl_flat_inited;
+
+static void DL_InitFlatCache(void)
+{
+    if (dl_flat_inited)
+        return;
+    if (numflats <= 0)
+        return;
+    dl_flat = (dl_flat_t*)Z_Malloc(numflats * sizeof(dl_flat_t), PU_STATIC, 0);
+    memset(dl_flat, 0, numflats * sizeof(dl_flat_t));
+    dl_flat_inited = 1;
+}
+
+// Produce (or fetch) the row-major CI8 block for a flat index (lump-firstflat).
+// Copies the flat lump bytes once, caches PU_STATIC, returns the 8-byte-aligned
+// block (always 64x64). NULL on a bad index or alloc failure.
+static byte* DL_FlatBlock(int flatidx)
+{
+    dl_flat_t*  slot;
+    byte*       block;
+    const byte* src;
+
+    if (flatidx < 0 || flatidx >= numflats)
+        return NULL;
+
+    DL_InitFlatCache();
+    if (!dl_flat)
+        return NULL;
+
+    slot = &dl_flat[flatidx];
+    // A demoted (PU_CACHE) block may be reclaimed by the zone LRU; it NULLs
+    // slot->raw (the back-referenced user ptr) when it does, so re-derive
+    // slot->block from raw each touch and re-copy if raw is gone.
+    if (slot->raw && slot->block)
+        return slot->block;
+    slot->block = NULL;
+
+    // Over-allocate by 7 bytes so the row-major view is 8-byte aligned (the RDP
+    // DMA into TMEM requires an 8-byte-aligned source; Z_Malloc only guarantees
+    // 4). User ptr back-references the slot so a zone reclaim NULLs slot->raw.
+    slot->raw = Z_Malloc(DL_FLAT_BYTES + 7, PU_STATIC, (void**)&slot->raw);
+    if (!slot->raw)
+        return NULL;
+    block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
+
+    // Copy the flat lump bytes (already row-major CI8). Cache PU_CACHE during
+    // the copy then writeback; the block stays PU_STATIC (slot->raw) so the
+    // copy source can be released immediately.
+    src = (const byte*)W_CacheLumpNum(firstflat + flatidx, PU_CACHE);
+    if (!src)
+    {
+        Z_Free(slot->raw);
+        slot->raw = NULL;
+        return NULL;
+    }
+    memcpy(block, src, DL_FLAT_BYTES);
+    data_cache_hit_writeback(block, DL_FLAT_BYTES);
+
+    slot->block  = block;
+    slot->pinned = 1;       // born PU_STATIC; demoted on the wall schedule
+    slot->lastuse = dl_present_gen;
+    return block;
+}
+
+static void DL_FlatMarkInFlight(int flatidx)
+{
+    dl_flat_t* slot;
+
+    if (!dl_flat)
+        return;
+    slot = &dl_flat[flatidx];
+    if (!slot->raw)
+        return;
+    if (!slot->pinned)
+    {
+        Z_ChangeTag(slot->raw, PU_STATIC);
+        slot->pinned = 1;
+    }
+    slot->lastuse = dl_present_gen;
+}
+
 // --- PRIM light LUT (Q8) ---------------------------------------------------
 // 32 entries (one per colormap level 0..NUMCOLORMAPS-1). The PRIM colour is the
 // colormap's darkening of a near-white reference index, read back through the
@@ -368,6 +506,15 @@ static void DL_InitBuckets(void)
     dl_bucket_gen  = (uint32_t*)Z_Malloc(numtextures * sizeof(uint32_t),
                                          PU_STATIC, 0);
     memset(dl_bucket_gen, 0, numtextures * sizeof(uint32_t));
+    // Flat buckets (Stage 4) share the dl_frame_gen stamp; allocate alongside.
+    if (numflats > 0)
+    {
+        dl_flat_bucket_head = (int32_t*)Z_Malloc(numflats * sizeof(int32_t),
+                                                 PU_STATIC, 0);
+        dl_flat_bucket_gen  = (uint32_t*)Z_Malloc(numflats * sizeof(uint32_t),
+                                                  PU_STATIC, 0);
+        memset(dl_flat_bucket_gen, 0, numflats * sizeof(uint32_t));
+    }
     dl_frame_gen = 1;   // 0 is the cleared-stamp sentinel; start at 1
     dl_buckets_inited = 1;
 }
@@ -378,16 +525,24 @@ void DL_BeginFrame(void)
     dl_arena_overflow = 0;
     dl_touched_count = 0;
 
+    // Stage-4 plane span arena reset.
+    dl_span_count = 0;
+    dl_span_overflow = 0;
+    dl_flat_touched_count = 0;
+
     // Per-frame generation bump invalidates every bucket head/tail in O(1):
     // a bucket whose gen stamp != dl_frame_gen is treated as empty, so the
     // numtextures-sized head/tail arrays never need a per-frame memset (only
     // the small dl_touched[] list is walked at flush). Wrap is benign: gen 0
     // is the sentinel, so on the rare 2^32 wrap we re-base to 1 and clear once.
+    // The flat bucket gen array shares dl_frame_gen, so clear it on the same wrap.
     DL_InitBuckets();
     if (++dl_frame_gen == 0)
     {
         if (dl_bucket_gen)
             memset(dl_bucket_gen, 0, numtextures * sizeof(uint32_t));
+        if (dl_flat_bucket_gen)
+            memset(dl_flat_bucket_gen, 0, numflats * sizeof(uint32_t));
         dl_frame_gen = 1;
     }
 
@@ -452,8 +607,38 @@ uint8_t DL_WallLightLevel(const void* const* walllights, unsigned index)
     return (uint8_t)level;
 }
 
+// Plane light level (Stage 4). R_MapPlane resolves ds_colormap = planezlight[
+// index] (or fixedcolormap for invuln/light-amp), a pointer into the colormap
+// ramp == colormaps + level*256. Reduce it to the same level index the walls'
+// dl_prim_lut is keyed on, so flats and walls share ONE baked PRIM LUT. Own
+// one-entry memo (adjacent spans of a visplane at the same distance share a cm).
+static const lighttable_t* dl_pll_cm    = NULL;
+static uint8_t             dl_pll_level = 0;
+
+uint8_t DL_PlaneLightLevel(const void* colormap)
+{
+    const lighttable_t* cm = (const lighttable_t*)colormap;
+    long level;
+
+    if (!cm || !colormaps)
+        return 0;
+    if (cm == dl_pll_cm)
+        return dl_pll_level;
+
+    level = (cm - colormaps) / 256;
+    if (level < 0)
+        level = 0;
+    if (level >= NUMCOLORMAPS)
+        level = NUMCOLORMAPS - 1;
+
+    dl_pll_cm    = cm;
+    dl_pll_level = (uint8_t)level;
+    return (uint8_t)level;
+}
+
 #if DL_DEBUG_TRACE
 static int dl_drop_count;       // records dropped on arena overflow this frame
+static int dl_span_drop_count;  // spans dropped on arena overflow this frame
 static int dl_present_no;       // diagnostic present counter
 #endif
 
@@ -515,6 +700,73 @@ int DL_EmitWallTier(const rdp_wall_t* w)
         }
     }
     return 1;
+}
+
+// --- Stage-4 plane span emit -----------------------------------------------
+// Called from R_MapPlane's leaf instead of spanfunc() when DL_PlaneRouteOn().
+// Appends ONE rdp_span_t to the arena and chains it into the flat's bucket so
+// DL_FlushSpans uploads each flat once then draws all its spans (the autosync
+// collapse, mirrored from walls). LOW primitive count is the whole experiment:
+// one record per span run, one tri-pair at draw time (no band multiplication --
+// a span samples one thin V-slice of the 64x64 flat). Overflow drops the span
+// (it stays key-index -- a punched hole over stale fb, the bounded class).
+void DL_EmitSpan(int y, int x1, int x2,
+                 fixed_t xfrac, fixed_t yfrac, fixed_t xstep, fixed_t ystep,
+                 int flatlump, const void* colormap)
+{
+    int         idx;
+    int         flatidx;
+    rdp_span_t* sp;
+
+    if (x2 < x1)
+        return;
+    if (dl_span_count >= DL_SPAN_ARENA)
+    {
+        dl_span_overflow = 1;
+#if DL_DEBUG_TRACE
+        dl_span_drop_count++;
+#endif
+        return;         // arena full: drop (span stays key-index)
+    }
+
+    idx = dl_span_count++;
+    sp = &dl_spans[idx];
+    sp->y     = (int16_t)y;
+    sp->x1    = (int16_t)x1;
+    sp->x2    = (int16_t)x2;
+    sp->u0    = xfrac;
+    sp->v0    = yfrac;
+    sp->ustep = xstep;
+    sp->vstep = ystep;
+    sp->flatlump    = (uint16_t)flatlump;
+    sp->light       = DL_PlaneLightLevel(colormap);
+    sp->bucket_next = -1;
+
+    // Chain into the flat's bucket (indexed by flat index = lump-firstflat).
+    flatidx = flatlump - firstflat;
+    if (dl_flat_bucket_head && flatidx >= 0 && flatidx < numflats)
+    {
+        if (dl_flat_bucket_gen[flatidx] != dl_frame_gen)
+        {
+            dl_flat_bucket_gen[flatidx]  = dl_frame_gen;
+            dl_flat_bucket_head[flatidx] = idx;
+            if (dl_flat_touched_count < DL_SPAN_ARENA)
+                dl_flat_touched[dl_flat_touched_count++] = (uint16_t)flatidx;
+        }
+        else
+        {
+            // Head-insert: order within a flat's bucket does not matter for
+            // planes (spans never overlap -- each owns its own screen row), so
+            // the cheaper head-insert is used. Draw order is irrelevant.
+            sp->bucket_next = dl_flat_bucket_head[flatidx];
+            dl_flat_bucket_head[flatidx] = idx;
+        }
+    }
+}
+
+int DL_SpanCount(void)
+{
+    return dl_span_count;
 }
 
 // --- routed per-tier per-column capture ------------------------------------
@@ -1298,6 +1550,198 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
     return 1;
 }
 
+// --- Stage-4 plane span draw -----------------------------------------------
+// Draw ONE plane span as a single affine textured tri-pair (persp OFF, set by
+// the caller). The flat is 64x64 row-major CI8 sampling the resident master
+// TLUT (DL_FlatBlock). A span is a 1px-tall screen rect [x1..x2+1] x [y..y+1];
+// U/V are affine in column (DOOM constant-z floors), constant down the 1px
+// height. U(column) <- xfrac, V(row) <- yfrac (r_draw.c spot formula), both wrap
+// mod 64.
+//
+// TMEM: a 64-wide CI8 flat caps at DL_TMEM_HALF/64 = 32 rows in the lower TMEM
+// half (the master TLUT owns the upper half), so the full 64-row flat does NOT
+// fit at once. A single span samples a NARROW V slice (one distance-slice of the
+// flat), so we load just the V-window the span touches -- bias both endpoints
+// into the period and load [vlo, vlo+rows) with rows <= 32, then ONE tri-pair.
+// This is the LOW-primitive shape that keeps planes off the RSP-triangle floor
+// that sank walls (no per-row band multiplication: a span is one primitive).
+//
+// block is the flat's row-major block (already fetched + pinned by the caller).
+// The PRIM/tile-dedup statics (dl_last_*) are shared with DL_DrawRecord and were
+// reset at the top of DL_Flush; DL_FlushSpans resets the tile/upload dedup again
+// at its head because the flat tile geometry differs from the wall tiles.
+static const uint32_t dl_unlit_prim = 0xFFFFFFFFu;
+
+static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
+{
+    uint32_t prim;
+    int   nx = sp->x2 - sp->x1 + 1;     // columns in the run
+    float ua, ub, va, vb;               // texel U/V at the rect's left/right edge
+    int   vlo, vhi, rows;               // V window (texel rows) to upload
+    int   ulo, uhi;                     // U extent (for the period bias only)
+    int   vbias, ubias;                 // shared period biases (texels)
+    float xl, xr, yt, yb;
+
+    if (nx < 1)
+        return;
+
+    // PRIM = colormap-level brightness (Q8), shared LUT with the walls. Deduped.
+    prim = (sp->light < NUMCOLORMAPS) ? dl_prim_lut[sp->light] : dl_unlit_prim;
+    if (prim != dl_last_prim)
+    {
+        rdpq_set_prim_color(color_from_packed32(prim));
+        dl_last_prim = prim;
+    }
+
+    // Texel U/V at the rect's screen edges. The rect spans columns [x1, x2+1) in
+    // screen space; the per-column affine step maps column -> texel. U/V at the
+    // LEFT edge (x1) are u0/v0; at the RIGHT edge (x2+1) they are u0/v0 advanced
+    // by nx steps. 16.16 fixed -> float texels.
+    ua = (float)sp->u0 * (1.0f / 65536.0f);
+    va = (float)sp->v0 * (1.0f / 65536.0f);
+    ub = (float)(sp->u0 + sp->ustep * nx) * (1.0f / 65536.0f);
+    vb = (float)(sp->v0 + sp->vstep * nx) * (1.0f / 65536.0f);
+
+    // Period-bias V into a small window so the upload fits the 32-row cap. The
+    // tile wraps T with mask 6 (64 period), so subtracting a SHARED whole number
+    // of periods from both V endpoints is sampling-identical. After the bias the
+    // smaller endpoint lands in [0,64) and the window is [floor(vmin), ceil(vmax)].
+    {
+        float vmin = (va < vb) ? va : vb;
+        vbias = (int)floorf(vmin / 64.0f) * 64;
+    }
+    va -= (float)vbias;
+    vb -= (float)vbias;
+    {
+        float vmin = (va < vb) ? va : vb;
+        float vmax = (va < vb) ? vb : va;
+        vlo = (int)floorf(vmin);
+        vhi = (int)ceilf(vmax);
+    }
+    if (vlo < 0) vlo = 0;
+    // Window must fit the TMEM 32-row cap. A span whose V extent exceeds 32
+    // texel rows is a very near, steep floor (rare); clamp the window to 32 rows
+    // -- the over-extent texels wrap and re-sample within the loaded window, a
+    // bounded minification artifact on extreme near floors (accepted; the
+    // overflow class is documented). Most spans are << 32 rows (one band).
+    rows = vhi - vlo + 1;
+    if (rows > 32) rows = 32;
+    if (rows < 1)  rows = 1;
+    vhi = vlo + rows - 1;
+
+    // U period bias (keep S endpoints in a sane fixed-point range; the tile
+    // wraps S with mask 6, so a shared period subtraction is sampling-identical).
+    ulo = (int)floorf((ua < ub) ? ua : ub);
+    uhi = (int)ceilf((ua > ub) ? ua : ub);
+    ubias = (ulo / 64) * 64;
+    if (ulo < 0) ubias = ((ulo - 63) / 64) * 64;    // floor toward -inf
+    (void)uhi;
+    ua -= (float)ubias;
+    ub -= (float)ubias;
+
+    // Tile descriptor: full 64-period wrap on BOTH S and T (mask 6). Deduped --
+    // every flat span shares the same tile geometry (64-wide, mask 6), so this
+    // SET_TILE is issued once per flush, not per span.
+    if (dl_last_tile_lw != 64 || dl_last_tile_wrap != 2)
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;          // 64-texel S period
+        tp.t.mask = 6;          // 64-texel T period
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+        dl_last_tile_lw   = 64;
+        dl_last_tile_wrap = 2;   // sentinel != wall wrap values (0/1)
+        dl_last_up_block  = NULL;
+    }
+
+    // Load the V window [vlo, vhi] across the full 64-texel width. Period-
+    // relative coords (T offset by vbias is folded into the triangle T below).
+    // Deduped: consecutive spans of a flat at the same distance share a window.
+    if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
+    {
+        rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
+        dl_last_up_block = block;
+        dl_last_up_lo    = vlo;
+        dl_last_up_rows  = rows;
+        dl_last_up_c0    = 0;
+    }
+
+    // Screen rect: 1px-tall row at y, columns [x1, x2+1). Affine S/T per corner
+    // (persp OFF, INV_W ignored -> linear interpolation == DOOM's span stepping,
+    // exact). Top and bottom corners of a column share the same texel (V constant
+    // down the 1px height). Tri-pair: (tl,tr,bl),(tr,br,bl).
+    xl = (float)sp->x1;
+    xr = (float)sp->x2 + 1.0f;
+    yt = (float)sp->y;
+    yb = (float)sp->y + 1.0f;
+    {
+        float tl[5] = { xl, yt, ua, va, 1.0f };
+        float tr[5] = { xr, yt, ub, vb, 1.0f };
+        float bl[5] = { xl, yb, ua, va, 1.0f };
+        float br[5] = { xr, yb, ub, vb, 1.0f };
+        rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
+        rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+    }
+}
+
+// Drain the frame's plane spans into the attached display fb (Stage 4). A
+// per-FLAT bucket walk mirroring the wall flush: for each flat used this frame,
+// copy + pin its row-major block ONCE, point the RDP at it, then draw every
+// span in that flat's bucket. Caller has set standard mode + TEX_FLAT combiner +
+// TLUT; this function sets persp OFF (flats are affine) for its draws. The
+// upload/tile/PRIM dedup statics are shared with the wall path; reset them here
+// because the flat tile geometry (64-wide, mask-6 wrap) differs from wall tiles.
+static void DL_FlushSpans(void)
+{
+    int fi;
+
+    if (dl_span_count <= 0)
+        return;
+
+    // Flats are affine (constant-z); turn perspective OFF so S/T interpolate
+    // linearly (== DOOM's span stepping, exact). The walls left persp ON.
+    rdpq_mode_persp(false);
+
+    // Reset the dedup caches: the flat tile geometry differs from the wall tiles
+    // the wall flush left resident, so no flat band is loaded yet.
+    dl_last_up_block  = NULL;
+    dl_last_up_lo     = -1;
+    dl_last_up_rows   = -1;
+    dl_last_up_c0     = -1;
+    dl_last_tile_lw   = -1;
+    dl_last_tile_wrap = -1;
+
+    for (fi = 0; fi < dl_flat_touched_count; fi++)
+    {
+        int   flatidx = dl_flat_touched[fi];
+        int   sidx;
+        byte* block;
+
+        block = DL_FlatBlock(flatidx);
+        if (!block)
+            continue;       // no usable flat block: spans stay key
+
+        DL_FlatMarkInFlight(flatidx);
+
+        // Point the RDP at this flat's 64x64 row-major block once. The TILE0
+        // descriptor (64-wide, mask-6 wrap) is configured in DL_DrawSpan and
+        // deduped; invalidate the resident band when the source image changes.
+        {
+            surface_t fs = surface_make_linear(block, FMT_CI8, 64, 64);
+            rdpq_set_texture_image(&fs);
+            dl_last_up_block  = NULL;
+            dl_last_tile_lw   = -1;
+            dl_last_tile_wrap = -1;
+        }
+
+        for (sidx = dl_flat_bucket_head[flatidx]; sidx >= 0;
+             sidx = dl_spans[sidx].bucket_next)
+        {
+            DL_DrawSpan(&dl_spans[sidx], block);
+        }
+    }
+}
+
 // Drain the emitted wall records into the attached display fb. Stage 3: a
 // per-TEXTURE bucket walk -- for each touched texture, fetch + pin its transpose
 // block ONCE, then draw every record in that texture's bucket (DL_DrawRecord)
@@ -1449,6 +1893,15 @@ void DL_Flush(void)
     // that DID fit. The flag exists so a future tail-frame can be detected and
     // the arena grown if it ever bites; with DL_WALL_ARENA=512 it should not.
     (void)dl_arena_overflow;
+
+    // Stage-4: drain plane spans (floors/ceilings) after the walls, same rspq
+    // stream, still scissored to the view window. DL_FlushSpans sets persp OFF
+    // (flats are affine) -- the caller's post-flush persp(false) for the blit is
+    // then redundant but harmless. A planes-only frame (0 walls) enters DL_Flush
+    // via the DL_SpanCount() OR in the present gate, runs the empty wall walk
+    // above (dl_touched_count==0), and draws its floors here.
+    DL_FlushSpans();
+    (void)dl_span_overflow;
 }
 
 // Retire per-present RDP world state. MUST be called at the end of the present
@@ -1545,9 +1998,34 @@ void DL_PresentEnd(void)
             }
         }
     }
+
+    // Stage-4: same demote sweep for the flat cache (shares dl_present_gen).
+    if (dl_flat)
+    {
+        for (i = 0; i < numflats; i++)
+        {
+            dl_flat_t* slot = &dl_flat[i];
+
+            if (!slot->pinned)
+                continue;
+            if (!slot->raw)
+            {
+                slot->pinned = 0;
+                continue;
+            }
+            if (slot->lastuse != dl_present_gen)
+            {
+                Z_ChangeTag(slot->raw, PU_CACHE);
+                slot->pinned = 0;
+            }
+        }
+    }
     dl_present_gen++;
 
     dl_wall_count = 0;      // consumed: never re-flush stale records
+    dl_span_count = 0;      // Stage 4: same -- never re-flush stale spans (an
+                            // automap/wipe present must not re-draw last world
+                            // frame's floors; risk 7 stale-rectangle class)
 }
 
 #endif // N64

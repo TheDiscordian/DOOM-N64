@@ -66,6 +66,32 @@ typedef struct
     uint8_t  light;             // colormap level 0..NUMCOLORMAPS-1 (PRIM index)
 } rdp_wall_t;
 
+// One emitted plane span (Stage 4). A floor/ceiling span is ONE horizontal run
+// at screen row y, columns [x1..x2], drawn as a SINGLE affine textured primitive
+// (one tri-pair, NOT a band-split stack -- a span samples one thin V-slice of
+// the 64x64 flat, so there is no per-row band multiplication, which is the trap
+// that floored walls). Flats are 64x64 row-major CI8 sampling the master TLUT
+// (NOT CI4 sub-palettes -- they share the same 2 KB TMEM region as the master).
+//
+// UV is AFFINE and EXACT for planes (constant-z by construction; DOOM uses spans
+// precisely because affine is exact). The DOOM span sampler is
+//   spot = ((yfrac>>10)&(63*64)) + ((xfrac>>16)&63)   (r_draw.c)
+// i.e. U(column) = (xfrac>>16)&63, V(row) = (yfrac>>16)&63, flat[V*64+U]. So
+// xfrac drives U, yfrac drives V. We carry the 16.16 fixed-point origin + step
+// straight from R_MapPlane (ds_xfrac/ds_yfrac at x1, ds_xstep/ds_ystep per
+// column) and convert to texel-space at draw time. No perspective, no per-corner
+// T -- one rect covers the whole run.
+typedef struct
+{
+    int16_t  y;                 // screen row
+    int16_t  x1, x2;            // screen column span (inclusive)
+    int32_t  u0, v0;            // 16.16 texel U/V at column x1 (ds_xfrac/ds_yfrac)
+    int32_t  ustep, vstep;      // 16.16 per-column U/V step (ds_xstep/ds_ystep)
+    int32_t  bucket_next;       // next span idx in this flat's bucket (-1 end)
+    uint16_t flatlump;          // flat lump number (firstflat+flattranslation)
+    uint8_t  light;             // colormap level 0..NUMCOLORMAPS-1 (PRIM index)
+} rdp_span_t;
+
 // Per-frame emit reset. Called from R_SetupFrame after the camera is set up;
 // also derives the free-W proportionality constant k for this frame (Q1).
 void DL_BeginFrame(void);
@@ -74,6 +100,29 @@ void DL_BeginFrame(void);
 // already in screen space (computed by the unchanged R_RenderSegLoop math).
 // No-op if the arena is full. Returns nonzero if the record was emitted.
 int DL_EmitWallTier(const rdp_wall_t* w);
+
+// Emit one plane span (Stage 4). Called from R_MapPlane's leaf in place of
+// spanfunc() when DL_PlaneRouteOn(). y/x1/x2 are the span's screen row + column
+// range; xfrac/yfrac are ds_xfrac/ds_yfrac (16.16 texel U/V at x1); xstep/ystep
+// are ds_xstep/ds_ystep (16.16 per-column step). flatlump is the resolved flat
+// lump number (firstflat+flattranslation[picnum]); colormap is ds_colormap (the
+// span's resolved light table, reduced to a PRIM level here). No-op if the arena
+// is full (the span stays key-index -- a punched hole over stale fb, the bounded
+// overflow class). Buckets the span by flat lump so DL_FlushSpans uploads each
+// flat once then draws all its spans.
+void DL_EmitSpan(int y, int x1, int x2,
+                 fixed_t xfrac, fixed_t yfrac, fixed_t xstep, fixed_t ystep,
+                 int flatlump, const void* colormap);
+
+// How many plane spans are queued this frame (0 if no plane routed). The present
+// world-flush gate (i_video_n64.c) ORs this with DL_Count() so a planes-only
+// frame (0 walls, N spans) still enters the flush.
+int DL_SpanCount(void);
+
+// Convert a plane's resolved colormap pointer (ds_colormap) to the colormap
+// level used as the PRIM index, shared with the walls' baked dl_prim_lut. Kept
+// here so the R_MapPlane emit site stays a pure data feed.
+uint8_t DL_PlaneLightLevel(const void* colormap);
 
 // --- routed-seg per-column capture -----------------------------------------
 // All routed capture state + the post-loop run-coalescing emit live HERE, out
@@ -111,11 +160,14 @@ float DL_InvWScale(void);
 // Drain the frame's emitted records into the attached 16bpp display fb. Must be
 // called inside the present seam AFTER rdpq_attach and the view scissor is set,
 // BEFORE the overlay blit (same rspq stream). Stage 3: per-texture bucket walk
-// -- one rdpq_tex_upload per texture per band-set, then all its quads.
+// -- one rdpq_tex_upload per texture per band-set, then all its quads. Stage 4:
+// after the walls, DL_Flush drains plane spans too (per-flat bucket walk, persp
+// OFF for the affine flat pass), so a planes-only frame still fills its floors.
 void DL_Flush(void);
 
-// How many records are queued this frame (0 if no wall tier routed). Lets the
-// present seam skip the flush plumbing when empty.
+// How many WALL records are queued this frame (0 if no wall tier routed). Lets
+// the present seam skip the flush plumbing when empty. The world-flush gate ORs
+// this with DL_SpanCount() so a planes-only frame still enters DL_Flush.
 int DL_Count(void);
 
 // Retire per-present RDP world state. Call at the END of the present seam,

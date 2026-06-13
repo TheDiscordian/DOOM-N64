@@ -39,6 +39,10 @@ rcsid[] = "$Id: r_plane.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
 #include "r_local.h"
 #include "r_sky.h"
 
+#ifdef N64
+#include "rdp_view.h"   // Stage-4 RDP plane span emit (DL_PlaneRouteOn/DL_EmitSpan)
+#endif
+
 
 
 planefunction_t		floorfunc;
@@ -86,6 +90,15 @@ int			spanstop[SCREENHEIGHT];
 //
 lighttable_t**		planezlight;
 fixed_t			planeheight;
+
+#ifdef N64
+// Stage-4 RDP plane path: the resolved flat lump number for the visplane
+// currently being filled (firstflat+flattranslation[picnum]), set in
+// R_DrawPlanes alongside ds_source and read by R_MapPlane's emit dispatch so
+// the span carries an animation-correct flat key. Sky visplanes never set this
+// (they take the colfunc branch and continue before reaching R_MakeSpans).
+static int		ds_flatlump;
+#endif
 
 fixed_t			yslope[SCREENHEIGHT];
 fixed_t			distscale[SCREENWIDTH];
@@ -235,8 +248,23 @@ R_MapPlane
     ds_x1 = x1;
     ds_x2 = x2;
 
+#ifdef N64
+    // Stage-4 dispatch: route this span to the RDP (emit one affine textured
+    // primitive) when planes route, else run the CPU spanfunc exactly as
+    // before. The visplane bookkeeping and all the affine ds_* math above are
+    //100% unchanged -- only the leaf fill is replaced. ds_colormap is the
+    // resolved per-span light table (planezlight[index] or fixedcolormap),
+    // reduced to a PRIM level inside DL_EmitSpan.
+    if (DL_PlaneRouteOn())
+	DL_EmitSpan(ds_y, ds_x1, ds_x2,
+		    ds_xfrac, ds_yfrac, ds_xstep, ds_ystep,
+		    ds_flatlump, ds_colormap);
+    else
+	spanfunc ();
+#else
     // high or low detail
-    spanfunc ();	
+    spanfunc ();
+#endif
 }
 
 
@@ -499,7 +527,15 @@ void R_DrawPlanes (void)
 	ds_source = W_CacheLumpNum(firstflat +
 				   flattranslation[pl->picnum],
 				   PU_STATIC);
-	
+#ifdef N64
+	// Stage-4: remember the resolved flat lump for R_MapPlane's RDP emit
+	// (animation-correct -- flattranslation advances per tic). The RDP path
+	// re-caches the lump bytes itself in DL_FlatBlock at flush time; this
+	// CPU cache stays exactly as software needs (spanfunc still reads it when
+	// planes are on the CPU, and the Z_ChangeTag below releases it either way).
+	ds_flatlump = firstflat + flattranslation[pl->picnum];
+#endif
+
 	planeheight = abs(pl->height-viewz);
 	light = (pl->lightlevel >> LIGHTSEGSHIFT)+extralight;
 

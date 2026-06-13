@@ -110,7 +110,7 @@ if [ -z "$RUN_ROM" ]; then
     # later non-BENCH build (the linker pulls in any stale .o left on disk).
     docker run --rm -v "$REPO":/doom -w /doom -e N64_INST=/n64_toolchain \
         "$DOCKER_IMAGE" bash -c \
-        "rm -rf filesystem build && make BENCH=1 ${BENCH_MP:+BENCH_MP=$BENCH_MP }${BENCH_FORCE_RDP:+BENCH_FORCE_RDP=$BENCH_FORCE_RDP }${BENCH_MARKS:+BENCH_MARKS=$BENCH_MARKS }-j4" \
+        "rm -rf filesystem build && make BENCH=1 ${BENCH_MP:+BENCH_MP=$BENCH_MP }${BENCH_FORCE_RDP:+BENCH_FORCE_RDP=$BENCH_FORCE_RDP }${BENCH_FORCE_PLANES_ONLY:+BENCH_FORCE_PLANES_ONLY=$BENCH_FORCE_PLANES_ONLY }${BENCH_FORCE_WALLS_ONLY:+BENCH_FORCE_WALLS_ONLY=$BENCH_FORCE_WALLS_ONLY }${BENCH_MARKS:+BENCH_MARKS=$BENCH_MARKS }-j4" \
         >"$WORKDIR/build.log" 2>&1 \
         || { cat "$WORKDIR/build.log" >&2; fail "build failed"; }
 
