@@ -403,6 +403,19 @@ float DL_InvWScale(void)
     return dl_invw_k;
 }
 
+// One-entry memo on the resolved colormap pointer. The per-column light level
+// is a pointer-difference DIVIDE (cm - colormaps)/256; within a seg the scale
+// (hence index, hence cm) is monotonic and changes only at LIGHTSCALESHIFT
+// quantization boundaries, so adjacent drawn columns repeatedly resolve to the
+// SAME cm. Caching the last (cm -> level) skips the divide for every column in
+// a light-level run -- byte-identical output (the cached level is exactly what
+// the divide would recompute), and the cache is keyed on cm so a colormap or
+// walllights change (NULL cm, palette reload) misses and recomputes. Reset on
+// numtextures setup is unnecessary: cm pointers are stable for the level's
+// lifetime and a stale-but-equal pointer would yield the same level anyway.
+static const lighttable_t* dl_lll_cm    = NULL;
+static uint8_t             dl_lll_level = 0;
+
 uint8_t DL_WallLightLevel(const void* const* walllights, unsigned index)
 {
     const lighttable_t* cm;
@@ -418,12 +431,18 @@ uint8_t DL_WallLightLevel(const void* const* walllights, unsigned index)
     if (!cm)
         return 0;
 
+    if (cm == dl_lll_cm)
+        return dl_lll_level;
+
     // walllights[index] == colormaps + level*256.
     level = (cm - colormaps) / 256;
     if (level < 0)
         level = 0;
     if (level >= NUMCOLORMAPS)
         level = NUMCOLORMAPS - 1;
+
+    dl_lll_cm    = cm;
+    dl_lll_level = (uint8_t)level;
     return (uint8_t)level;
 }
 
@@ -514,23 +533,36 @@ static unsigned char dl_rt_drawn[DL_TIER_COUNT][SCREENWIDTH];   // 1 if drawn he
 static int           dl_rt_first[DL_TIER_COUNT];                // first drawn col (-1)
 static int           dl_rt_last [DL_TIER_COUNT];                // last drawn col
 
+// SEG_RASTER capture-bookkeeping tax cut: clear only the PREVIOUS seg's drawn
+// span per tier, not the full ~960 bytes/tier every seg. The only cells that
+// can be stale are those a prior DL_RouteCapture set to 1, and capture sets
+// drawn=1 strictly inside that seg's recorded [first..last]; clearing that span
+// is equivalent to the old full-width memset (every other cell is already 0).
 void DL_RouteBeginSeg(void)
 {
     int t;
     for (t = 0; t < DL_TIER_COUNT; t++)
     {
+        // Clear only the PREVIOUS seg's drawn span for this tier. A column the
+        // upcoming seg skips (yl > yh, never captured) would otherwise keep a
+        // STALE drawn=1 (and stale yl/yh/scale/texturecolumn) from an earlier
+        // seg -- the emit walk reads those stale cells for run-break decisions
+        // and as run endpoints, producing warped/misplaced quads. Only cells a
+        // prior DL_RouteCapture set to 1 can be stale, and capture sets drawn=1
+        // strictly inside that seg's recorded [first..last], so clearing that
+        // span is equivalent to the old full-width memset (every other cell is
+        // already 0) at a fraction of the cost. Per-seg (not per-frame) so runs
+        // from segs drawn earlier this frame never bleed into a later seg.
+        // The prior seg's drawn span for this tier is exactly its [first..last]
+        // (capture advances last only on drawn=1 columns). Clear that, then arm
+        // the precondition for the upcoming seg.
+        if (dl_rt_first[t] >= 0)
+        {
+            int span = dl_rt_last[t] - dl_rt_first[t] + 1;
+            memset(&dl_rt_drawn[t][dl_rt_first[t]], 0, (size_t)span);
+        }
         dl_rt_first[t] = -1;
         dl_rt_last[t]  = -1;
-        // Clear the drawn flags for the whole width. The seg loop only calls
-        // DL_RouteCapture for columns that actually draw (yl <= yh), so a
-        // column skipped this seg/tier would otherwise keep a STALE drawn=1
-        // (and stale yl/yh/scale/texturecolumn) from an earlier seg's tier. The
-        // emit walk reads those stale cells for run-break decisions and (worse)
-        // as run endpoints, producing quads at the wrong screen coordinates --
-        // visible as warped / misplaced wall pieces. Per-seg reset (not
-        // per-frame) so tier runs from segs drawn earlier this frame never
-        // bleed into a later seg. ~960 bytes once per seg, flag-on only.
-        memset(dl_rt_drawn[t], 0, sizeof(dl_rt_drawn[t]));
     }
 }
 
