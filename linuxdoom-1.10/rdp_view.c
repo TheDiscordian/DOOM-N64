@@ -668,16 +668,23 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
         int   x;
 
         {
-            fixed_t maxstep = 1;
-            for (x = xa; x < xb; x++)
-            {
-                fixed_t st = t_scol[x + 1] - t_scol[x];
-                if (st < 0) st = -st;
-                if (st > maxstep) maxstep = st;
-            }
-            sthresh = 0.51f * (float)maxstep;
-            if (sthresh < DL_SPLIT_DEVS)
-                sthresh = DL_SPLIT_DEVS;
+            // GLANCING-WALL SMEAR FIX. The threshold must NOT scale with the
+            // per-column step. The deviation scan exists to split a piece where
+            // the linear-S/W trapezoid drifts from software's hyperbolic
+            // per-column texturecolumn; making the tolerance grow with maxstep
+            // (the old 0.51*maxstep) DISABLED the scan exactly at glancing
+            // angles, where maxstep is huge -- a 57-texel step permitted a
+            // ~28-texel S error per pixel, sampling a quarter-texture away from
+            // software and washing discrete texel columns into the long
+            // horizontal grey-green runs Ryan reported. Measured (DL_SDEV
+            // trace): residual scaled with maxstep, up to 18 texels at
+            // maxstep~101. A FIXED sub-texel tolerance forces glancing pieces to
+            // keep splitting until each sub-piece's perspective S tracks
+            // software within ~1 texel (the recursion's fixed point is the
+            // width-1 piece, which samples one source column = software-exact).
+            // Cost is bounded: only the few hundred glancing pieces/frame split
+            // further; normal-angle pieces (maxstep small) are unaffected.
+            sthresh = DL_SPLIT_DEVS;
         }
 
         for (x = xa; x <= xb; x++)
@@ -712,7 +719,7 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
     else if (xb > xa)
     {
         // Width-2: the corner extrapolation makes the edge lerps pass through
-        // both column samples exactly; only the half-row sampling margin
+        // both column samples exactly for Y; only the half-row sampling margin
         // remains, which the 0.49 coverage slack absorbs.
         float dT = ytl + (ytr - ytl) * 0.25f - (float)t_yl[xa];
         float dB = ((float)t_yh[xa] + 1.0f) - (ybl + (ybr - ybl) * 0.25f);
@@ -722,6 +729,34 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
         if (dT2 > devtop) devtop = dT2;
         if (dB > devbot) devbot = dB;
         if (dB2 > devbot) devbot = dB2;
+
+        // GLANCING-WALL SMEAR FIX (width-2 S check). S is NOT exact by
+        // construction here: the corners are LINEARLY extrapolated half a pixel
+        // outward, but software's per-column texturecolumn is hyperbolic, so at
+        // glancing angles the perspective S at the two pixel centers can miss
+        // software by several texels (DL_SDEV trace: up to ~3 texels on width-2
+        // glancing pieces). Scan both centers; if either S deviates past the
+        // fixed sub-texel tolerance, split to two width-1 pieces -- each then
+        // samples its single source column exactly like software's drawcolumn.
+        if (depth < 10)
+        {
+            float swl = s_l * invw_l, swr = s_r * invw_r;
+            float w0 = invw_l + (invw_r - invw_l) * 0.25f;
+            float w1 = invw_l + (invw_r - invw_l) * 0.75f;
+            float sp0, sp1, aS0, aS1;
+            if (w0 < 1e-9f) w0 = 1e-9f;
+            if (w1 < 1e-9f) w1 = 1e-9f;
+            sp0 = (swl + (swr - swl) * 0.25f) / w0;
+            sp1 = (swl + (swr - swl) * 0.75f) / w1;
+            aS0 = sp0 - (float)t_scol[xa]; if (aS0 < 0.0f) aS0 = -aS0;
+            aS1 = sp1 - (float)t_scol[xb]; if (aS1 < 0.0f) aS1 = -aS1;
+            if (aS0 > DL_SPLIT_DEVS || aS1 > DL_SPLIT_DEVS)
+            {
+                DL_EmitRunPiece(tier, xa, xa, mid, texnum, cy, k, depth + 1);
+                DL_EmitRunPiece(tier, xb, xb, mid, texnum, cy, k, depth + 1);
+                return;
+            }
+        }
     }
 
     // Coverage bias: raise/lower the whole edge by the measured worst
