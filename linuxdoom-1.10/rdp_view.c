@@ -567,24 +567,225 @@ void DL_RouteCapture(int tier, int x, int yl, int yh, fixed_t scale,
 // -- exactly the per-column [yl..yh] spans, with software's own >>HEIGHTBITS
 // truncation -- MUST be covered by an emitted quad, or it stays key-index and
 // the keyed present blit punches a hole at the junction (green/stale gap rows
-// between the wall and its CPU-drawn ceiling/floor). A quad whose edges lerp
-// yl/yh between the run's endpoint columns can land sub-row SHORT of the
-// truncated per-column spans in between. Instead each run emits its full
-// bounding RECTANGLE: ytop = min(yl), ybot = max(yh)+1 over the run. OVER-
-// coverage is harmless by construction: every overdrawn pixel outside the
-// suppressed spans holds non-key software art in the CI8 overlay, so the
-// present blit (keyed inside the box, opaque outside) repaints it -- only
-// key pixels ever reveal the RDP layer. UNDER-coverage is the only sin.
+// between the wall and its CPU-drawn ceiling/floor). OVER-coverage outside
+// the suppressed spans is repainted by the blit wherever the CI8 holds
+// non-key art -- but where it lands on ANOTHER record's key-revealed span,
+// painter order decides whose texels survive, so over-coverage must be SMALL.
+// UNDER-coverage is the only sin; large over-coverage is the second sin (the
+// Stage-3 bounding-RECTANGLE emit over-covered by the full per-run yl/yh
+// variation -- tens of rows on stacked stair/pillar micro-tiers -- and its
+// far-record stomps read as vanished geometry).
+//
+// DL_EmitRunPiece (below) emits each run as a TRAPEZOID through the run's
+// endpoint-column samples (corners extrapolated half a pixel outward so the
+// rasterizer's interpolation passes through the sampled values at the end
+// columns' centers), VERIFIES per column that the quad's interpolation tracks
+// the captured yl/yh (rows) and texturecolumn (S, projectively), SPLITS the
+// run where it deviates (clip-deformed spans, scale-clamp plateaus on
+// glancing walls), and biases the final edges by the measured deviation so
+// coverage of every captured span is guaranteed with over-coverage bounded by
+// the split thresholds (~1-2 rows).
 //
 // T is computed PER CORNER from that corner's own 1/scale (T at a shared
 // screen row differs between edges when scale differs). With per-corner T and
 // INV_W = scale*k, T/W and 1/W are affine in screen space, so the perspective
 // interpolation reproduces software's per-column T = mid + (y-cy)/scale(x)
-// exactly (DOOM itself lerps scale linearly per column); rect corners above/
-// below a column's drawn span just extend the same projective map, so texel
-// rows stay aligned with software wherever pixels survive the blit. The 16.16
-// fraction is kept (divide, not >>FRACBITS) so band slicing in DL_Flush never
-// mis-seats a seam.
+// exactly (DOOM itself lerps scale linearly per column); corners above/below
+// a column's drawn span just extend the same projective map, so texel rows
+// stay aligned with software wherever pixels survive the blit. T is float
+// end-to-end (texel units), which also removes the 32-bit (y-cy)*iscale
+// overflow class the old fixed-point corner math inherited from vanilla.
+
+// Split thresholds. Y: deviation beyond ~a row means the lerped edge cannot
+// represent the truncated/clipped span shape -- split. S: the floor admits
+// the sub-texel residue of projective math; the 0.51*step term admits the
+// irreducible half-column anchor uncertainty at glancing minification (an S
+// error under half the local per-column S step shifts sampling by less than
+// software's own column quantization).
+#define DL_SPLIT_DEVY   1.25f
+#define DL_SPLIT_DEVS   1.5f
+
+static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
+                            int cy, float k, int depth)
+{
+    const short*   t_yl    = dl_rt_yl[tier];
+    const short*   t_yh    = dl_rt_yh[tier];
+    const fixed_t* t_scale = dl_rt_scale[tier];
+    const fixed_t* t_scol  = dl_rt_scol[tier];
+
+    float s_l, s_r;             // corner S (texels)
+    float invw_l, invw_r;       // corner 1/w
+    float ytl, ytr, ybl, ybr;   // corner Y edges, pre-bias (ybot is yh+1)
+    float width = (float)(xb + 1 - xa);
+    float devtop = 0.0f;        // max signed under-coverage at the top edge
+    float devbot = 0.0f;        // max signed under-coverage at the bottom edge
+    rdp_wall_t w;
+
+    // Corner attributes. Per-column samples apply at pixel CENTERS (x+0.5);
+    // the quad corners sit at the pixel EDGES xa and xb+1, half a pixel
+    // outward, so extrapolate each corner along its end column's local
+    // per-column step. A width-1 run gets the column's own constant values --
+    // exactly software's single source column.
+    {
+        float sl0 = (float)t_scol[xa],          sr0 = (float)t_scol[xb];
+        float wl0 = (float)t_scale[xa] * k,     wr0 = (float)t_scale[xb] * k;
+        float tl0 = (float)t_yl[xa],            tr0 = (float)t_yl[xb];
+        float bl0 = (float)t_yh[xa] + 1.0f,     br0 = (float)t_yh[xb] + 1.0f;
+
+        if (xb > xa)
+        {
+            sl0 -= 0.5f * ((float)t_scol[xa + 1] - sl0);
+            sr0 += 0.5f * (sr0 - (float)t_scol[xb - 1]);
+            wl0 -= 0.5f * ((float)t_scale[xa + 1] * k - wl0);
+            wr0 += 0.5f * (wr0 - (float)t_scale[xb - 1] * k);
+            tl0 -= 0.5f * ((float)t_yl[xa + 1] - tl0);
+            tr0 += 0.5f * (tr0 - (float)t_yl[xb - 1]);
+            bl0 -= 0.5f * (((float)t_yh[xa + 1] + 1.0f) - bl0);
+            br0 += 0.5f * (br0 - ((float)t_yh[xb - 1] + 1.0f));
+        }
+        if (wl0 < 1e-6f) wl0 = 1e-6f;
+        if (wr0 < 1e-6f) wr0 = 1e-6f;
+        s_l = sl0;  s_r = sr0;
+        invw_l = wl0;  invw_r = wr0;
+        ytl = tl0;  ytr = tr0;
+        ybl = bl0;  ybr = br0;
+    }
+
+    // Deviation scan: compare the quad's interpolation (Y edges linear, S
+    // projective via s/w over 1/w -- exactly what the rasterizer computes) at
+    // every pixel center against the captured per-column values.
+    if (xb > xa)
+    {
+        float swl = s_l * invw_l, swr = s_r * invw_r;
+        float maxstep = 1.0f;
+        float worstS = 0.0f, worstY = 0.0f;
+        float sthresh;
+        int   x;
+
+        for (x = xa; x <= xb; x++)
+        {
+            float f  = ((float)x + 0.5f - (float)xa) / width;
+            float wm = invw_l + (invw_r - invw_l) * f;
+            float sp = (swl + (swr - swl) * f) / wm;
+            float lt = ytl + (ytr - ytl) * f;
+            float lb = ybl + (ybr - ybl) * f;
+            float dS = sp - (float)t_scol[x];
+            float dT = lt - (float)t_yl[x];                 // >0: edge too low
+            float dB = ((float)t_yh[x] + 1.0f) - lb;        // >0: edge too high
+            float aS = (dS < 0.0f) ? -dS : dS;
+            float aT = (dT < 0.0f) ? -dT : dT;
+            float aB = (dB < 0.0f) ? -dB : dB;
+
+            if (dT > devtop) devtop = dT;
+            if (dB > devbot) devbot = dB;
+            if (aT > worstY) worstY = aT;
+            if (aB > worstY) worstY = aB;
+            if (aS > worstS) worstS = aS;
+            if (x < xb)
+            {
+                float st = (float)t_scol[x + 1] - (float)t_scol[x];
+                if (st < 0.0f) st = -st;
+                if (st > maxstep) maxstep = st;
+            }
+        }
+
+        sthresh = 0.51f * maxstep;
+        if (sthresh < DL_SPLIT_DEVS)
+            sthresh = DL_SPLIT_DEVS;
+
+        if ((worstY > DL_SPLIT_DEVY || worstS > sthresh) && depth < 10)
+        {
+            // Split at the worst column (second pass; splits are the rare
+            // path) and recurse. Convergence: pieces shrink every level and
+            // a width-1 piece is exact by construction.
+            int   xm = xa;
+            float bad_best = -1.0f;
+
+            for (x = xa; x <= xb; x++)
+            {
+                float f  = ((float)x + 0.5f - (float)xa) / width;
+                float wm = invw_l + (invw_r - invw_l) * f;
+                float sp = (swl + (swr - swl) * f) / wm;
+                float lt = ytl + (ytr - ytl) * f;
+                float lb = ybl + (ybr - ybl) * f;
+                float dS = sp - (float)t_scol[x];
+                float dT = lt - (float)t_yl[x];
+                float dB = ((float)t_yh[x] + 1.0f) - lb;
+                float bad;
+                if (dS < 0.0f) dS = -dS;
+                if (dT < 0.0f) dT = -dT;
+                if (dB < 0.0f) dB = -dB;
+                bad = dS / sthresh;
+                if (dT / DL_SPLIT_DEVY > bad) bad = dT / DL_SPLIT_DEVY;
+                if (dB / DL_SPLIT_DEVY > bad) bad = dB / DL_SPLIT_DEVY;
+                if (bad > bad_best)
+                {
+                    bad_best = bad;
+                    xm = x;
+                }
+            }
+            if (xm >= xb)
+                xm = xb - 1;
+            if (xm < xa)
+                xm = xa;
+            DL_EmitRunPiece(tier, xa, xm, mid, texnum, cy, k, depth + 1);
+            DL_EmitRunPiece(tier, xm + 1, xb, mid, texnum, cy, k, depth + 1);
+            return;
+        }
+    }
+
+    // Coverage bias: raise/lower the whole edge by the measured worst
+    // under-coverage so every captured span row is rasterized (pixel-center
+    // rule: top edge <= yl+0.5, bottom edge > yh+0.5). Over-coverage stays
+    // bounded by the split thresholds (~1-2 rows) -- small enough that a
+    // neighbouring tier's key span loses at most an edge row to painter
+    // order (drawn back-to-front, the nearer record wins).
+    {
+        float bias_top = devtop - 0.49f;
+        float bias_bot = devbot - 0.49f;
+
+        if (bias_top < 0.0f) bias_top = 0.0f;
+        if (bias_bot < 0.0f) bias_bot = 0.0f;
+        ytl -= bias_top;
+        ytr -= bias_top;
+        ybl += bias_bot;
+        ybr += bias_bot;
+    }
+    // Degenerate-edge guard (wild clip steps at a piece boundary could fold
+    // an extrapolated edge): keep each edge's T span strictly positive for
+    // the per-edge T division and the band-slice lerps.
+    if (ybl < ytl + 0.05f) ybl = ytl + 0.05f;
+    if (ybr < ytr + 0.05f) ybr = ytr + 0.05f;
+
+    w.x1 = (int16_t)xa;
+    w.x2 = (int16_t)xb;
+    w.ytop_l = ytl;
+    w.ybot_l = ybl;
+    w.ytop_r = ytr;
+    w.ybot_r = ybr;
+    w.s_l = s_l;
+    w.s_r = s_r;
+    w.invw_l = invw_l;
+    w.invw_r = invw_r;
+
+    // Per-corner T through each edge's own 1/scale, float end-to-end in texel
+    // units (65536/scale = texels per screen row; no 32-bit overflow).
+    {
+        float midf = (float)mid * (1.0f / (float)FRACUNIT);
+        float il = 65536.0f / (float)t_scale[xa];
+        float ir = 65536.0f / (float)t_scale[xb];
+
+        w.t_top_l = midf + (ytl - (float)cy) * il;
+        w.t_bot_l = midf + (ybl - (float)cy) * il;
+        w.t_top_r = midf + (ytr - (float)cy) * ir;
+        w.t_bot_r = midf + (ybr - (float)cy) * ir;
+    }
+
+    w.texid = (uint16_t)texnum;
+    w.light = dl_rt_lit[tier][xa];
+
+    DL_EmitWallTier(&w);
+}
 void DL_RouteEmit(int tier, fixed_t mid, int texnum, int centery)
 {
     const float     k = dl_invw_k;
@@ -592,11 +793,10 @@ void DL_RouteEmit(int tier, fixed_t mid, int texnum, int centery)
     int             run0 = -1;
     int             x;
 
-    // This tier's per-column capture arrays. A two-sided seg emits its top and
-    // bottom tiers from independent streams; a single-sided seg only its mid.
-    const short*         t_yl    = dl_rt_yl[tier];
-    const short*         t_yh    = dl_rt_yh[tier];
-    const fixed_t*       t_scale = dl_rt_scale[tier];
+    // This tier's per-column capture arrays (run-break inputs only; the
+    // geometry arrays are read by DL_EmitRunPiece). A two-sided seg emits its
+    // top and bottom tiers from independent streams; a single-sided seg only
+    // its mid.
     const fixed_t*       t_scol  = dl_rt_scol[tier];
     const unsigned char* t_lit   = dl_rt_lit[tier];
     const unsigned char* t_drawn = dl_rt_drawn[tier];
@@ -639,51 +839,10 @@ void DL_RouteEmit(int tier, fixed_t mid, int texnum, int centery)
 
         if (breakrun)
         {
-            int         xa = run0;
-            int         xb = x - 1;      // inclusive last column of the run
-            fixed_t     sca = t_scale[xa];
-            fixed_t     scb = t_scale[xb];
-            fixed_t     isca = 0xffffffffu / (unsigned)sca;
-            fixed_t     iscb = 0xffffffffu / (unsigned)scb;
-            int         ytop, ybot;
-            int         xi;
-            rdp_wall_t  w;
-
-            // Run bounding rectangle: cover every column's truncated
-            // [yl..yh] span exactly (see COVERAGE RULE above).
-            ytop = t_yl[xa];
-            ybot = t_yh[xa];
-            for (xi = xa + 1; xi <= xb; xi++)
-            {
-                if (t_yl[xi] < ytop) ytop = t_yl[xi];
-                if (t_yh[xi] > ybot) ybot = t_yh[xi];
-            }
-            ybot += 1;                  // span is inclusive
-
-            w.x1 = (int16_t)xa;
-            w.x2 = (int16_t)xb;
-            w.ytop_l = (float)ytop;
-            w.ybot_l = (float)ybot;
-            w.ytop_r = (float)ytop;
-            w.ybot_r = (float)ybot;
-            w.s_l = (float)t_scol[xa];
-            w.s_r = (float)t_scol[xb];
-            w.invw_l = (float)sca * k;
-            w.invw_r = (float)scb * k;
-            // Per-corner T at the rect's shared top/bottom rows, through each
-            // edge's own 1/scale (see the T note above).
-            w.t_top_l = (float)(mid + (ytop - cy) * isca)
-                        * (1.0f / (float)FRACUNIT);
-            w.t_bot_l = (float)(mid + (ybot - cy) * isca)
-                        * (1.0f / (float)FRACUNIT);
-            w.t_top_r = (float)(mid + (ytop - cy) * iscb)
-                        * (1.0f / (float)FRACUNIT);
-            w.t_bot_r = (float)(mid + (ybot - cy) * iscb)
-                        * (1.0f / (float)FRACUNIT);
-            w.texid = (uint16_t)texnum;
-            w.light = t_lit[xa];
-
-            DL_EmitWallTier(&w);
+            // Emit the run [run0 .. x-1] as one or more verified trapezoids
+            // (DL_EmitRunPiece: deviation-checked, split where the captured
+            // spans deviate, coverage-biased -- see the COVERAGE RULE above).
+            DL_EmitRunPiece(tier, run0, x - 1, mid, texnum, cy, k, 0);
 
             // Start a new run at the current column if it still draws.
             run0 = drawn ? x : -1;
