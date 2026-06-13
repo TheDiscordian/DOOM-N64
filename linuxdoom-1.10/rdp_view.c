@@ -1,23 +1,26 @@
 // Emacs style mode select   -*- C++ -*-
 //-----------------------------------------------------------------------------
 //
-// RDP renderer -- frame display-list emit + flush (Stage 2).
+// RDP renderer -- frame display-list emit + flush (Stage 3).
 //
 // DESCRIPTION:
-//   Stage 2 of the RDP renderer (Docs/RDP_RENDERER_DESIGN.md staging plan).
-//   Routes exactly ONE single-sided (midtexture) wall seg per frame through the
-//   new RDP wall path, behind the n64_use_rdp_renderer flag; everything else
-//   stays CPU-rendered.
+//   Stage 3 of the RDP renderer (Docs/RDP_RENDERER_DESIGN.md staging plan).
+//   Routes ALL solid wall tiers through the new RDP wall path, behind the
+//   n64_use_rdp_renderer flag: every single-sided (midtexture) seg AND the
+//   upper/lower textures of two-sided segs. Masked mid-textures and sky/planes
+//   stay CPU (Stages 4/5).
 //
-//   This file owns: the per-frame emit arena, the rdp_wall_t record type,
-//   DL_BeginFrame/DL_EmitWallTier/DL_Flush, the free-W proportionality constant
-//   k (Q1), the on-demand column-major->row-major CI8 transpose cache (Q10), and
-//   the 32-entry PRIM light LUT baked from the colormap ramp (Q8).
+//   This file owns: the per-frame emit arena + per-texture buckets, the
+//   rdp_wall_t record type, DL_BeginFrame/DL_EmitWallTier/DL_Flush, the free-W
+//   proportionality constant k (Q1), the on-demand column-major->row-major CI8
+//   transpose cache (Q10), and the 32-entry PRIM light LUT baked from the
+//   colormap ramp (Q8).
 //
-//   Stage 2 is deliberately a trivial sequential flush (no per-texture bucket
-//   sort -- that is Stage 3). It exists to validate the wall pipeline, the
-//   free-W constant, the on-demand transpose, the PRIM light path, and the
-//   transparent-key compositing on ONE live RDP pixel run.
+//   DL_Flush walks the touched textures one at a time: ONE rdpq_tex_upload per
+//   texture per band-set, then all that texture's quads, then the next texture
+//   -- collapsing autosync TMEM/pipe thrash from per-seg (Stage 2) to
+//   per-texture (Q6). On arena overflow it falls back to an un-bucketed direct
+//   draw of the overflow records (slower, correct, never crashes).
 //
 //-----------------------------------------------------------------------------
 
@@ -64,27 +67,44 @@ extern lighttable_t* colormaps;
 byte* R_GetColumn(int tex, int col);
 
 // --- per-seg A/B toggle (graft #4) -----------------------------------------
-// Defaults to the RDP path so Stage 2 exercises the new wall pipeline. The task
-// allows defaulting this to CPU (0) if the seg renders wrong and cannot be
-// fixed within the iteration budget.
+// Defaults to the RDP path so Stage 3 exercises the new wall pipeline. The task
+// allows defaulting this to CPU (0) if walls render wrong and cannot be fixed
+// within the iteration budget.
 int n64_rdp_wall_ab = 1;
 
-// --- emit arena ------------------------------------------------------------
-// Stage 2 emits at most one routed seg, but that seg splits into a record per
+// --- emit arena + per-texture buckets --------------------------------------
+// Stage 3 routes ALL solid wall tiers. Each tier splits into a record per
 // light-level run AND per S-span run (the saturation split in DL_RouteEmit), so
-// a long glancing wall can produce dozens of records. Size generously: on
-// overflow DL_EmitWallTier drops the record and the dropped columns stay
-// key-index inside the keyed box -- a punched hole over stale fb content, the
-// worst Stage-2 artifact class -- so the arena should be effectively
-// unfillable for a single seg (<= 320 columns => <= 320 runs hard ceiling;
-// realistic worst case is far below 128).
-#define DL_WALL_ARENA   128
+// the whole frame's walls can produce hundreds of records. Size for the
+// documented tail (drawsegs=47) x ~3 tiers x a few runs each, with margin. On
+// overflow DL_EmitWallTier flags the arena full; DL_Flush still draws every
+// queued record (the overflow records simply were never queued -- their columns
+// stay key-index inside the keyed box, a punched hole over stale fb, the worst
+// artifact class), so the arena should be effectively unfillable in practice.
+//
+// 512 records x sizeof(rdp_wall_t) (~64 B) = ~32 KB static -- comfortable.
+#define DL_WALL_ARENA   512
 
 static rdp_wall_t   dl_walls[DL_WALL_ARENA];
 static int          dl_wall_count;
+static int          dl_arena_overflow;     // 1 if a record was dropped this frame
 
-// Per-frame routed-seg latch (the first eligible seg claims it).
-static int          dl_seg_claimed;
+// Per-texture buckets (Q6). Each touched texnum keeps a singly-linked chain of
+// its records THROUGH the arena (rdp_wall_t.bucket_next), head/tail indices in
+// dl_bucket_head/tail. DL_Flush walks the touched-texture list, and for each
+// texture uploads its tile ONCE per band-set then draws every record in the
+// chain -- so a texture used by N segs uploads once, not N times. The
+// touched-texture list (dl_touched[]) is the sparse set the design's
+// tex_bucket_t array stands for: we keep the heads dense in a numtextures-sized
+// array (cleared lazily via a per-frame generation stamp so BeginFrame stays
+// O(touched), not O(numtextures)).
+static int32_t*     dl_bucket_head;         // [numtextures] first record idx, -1 none
+static int32_t*     dl_bucket_tail;         // [numtextures] last record idx
+static uint32_t*    dl_bucket_gen;          // [numtextures] frame stamp of head/tail
+static uint32_t     dl_frame_gen;           // bumped each DL_BeginFrame
+static int          dl_buckets_inited;
+static uint16_t     dl_touched[DL_WALL_ARENA]; // texnums touched this frame (deduped)
+static int          dl_touched_count;
 
 // Free-W proportionality constant for this frame (Q1). INV_W = rw_scale * k.
 // The absolute scale cancels in the RDP's hyperbolic divide, so any positive k
@@ -322,10 +342,44 @@ static void DL_BuildPrimLUT(void)
 
 // --- public API ------------------------------------------------------------
 
+// Allocate the per-texture bucket arrays once numtextures is known. Lazy (the
+// transpose cache uses the same trigger) so it survives a level load that grows
+// numtextures, and is a no-op if numtextures is not yet set.
+static void DL_InitBuckets(void)
+{
+    if (dl_buckets_inited)
+        return;
+    if (numtextures <= 0)
+        return;
+    dl_bucket_head = (int32_t*)Z_Malloc(numtextures * sizeof(int32_t),
+                                        PU_STATIC, 0);
+    dl_bucket_tail = (int32_t*)Z_Malloc(numtextures * sizeof(int32_t),
+                                        PU_STATIC, 0);
+    dl_bucket_gen  = (uint32_t*)Z_Malloc(numtextures * sizeof(uint32_t),
+                                         PU_STATIC, 0);
+    memset(dl_bucket_gen, 0, numtextures * sizeof(uint32_t));
+    dl_frame_gen = 1;   // 0 is the cleared-stamp sentinel; start at 1
+    dl_buckets_inited = 1;
+}
+
 void DL_BeginFrame(void)
 {
     dl_wall_count = 0;
-    dl_seg_claimed = 0;
+    dl_arena_overflow = 0;
+    dl_touched_count = 0;
+
+    // Per-frame generation bump invalidates every bucket head/tail in O(1):
+    // a bucket whose gen stamp != dl_frame_gen is treated as empty, so the
+    // numtextures-sized head/tail arrays never need a per-frame memset (only
+    // the small dl_touched[] list is walked at flush). Wrap is benign: gen 0
+    // is the sentinel, so on the rare 2^32 wrap we re-base to 1 and clear once.
+    DL_InitBuckets();
+    if (++dl_frame_gen == 0)
+    {
+        if (dl_bucket_gen)
+            memset(dl_bucket_gen, 0, numtextures * sizeof(uint32_t));
+        dl_frame_gen = 1;
+    }
 
     // Free-W constant (Q1). projection is the focal length in fixed point
     // (r_main.c:779); rw_scale = projection*FRACUNIT/z (R_ScaleFromGlobalAngle,
@@ -376,70 +430,119 @@ static int dl_present_no;       // diagnostic present counter
 
 int DL_EmitWallTier(const rdp_wall_t* w)
 {
+    int         idx;
+    int         tex;
+    rdp_wall_t* rec;
+
     if (!w)
         return 0;
     if (dl_wall_count >= DL_WALL_ARENA)
     {
+        dl_arena_overflow = 1;      // DL_Flush's overflow note + correctness rely on this
 #if DL_DEBUG_TRACE
         dl_drop_count++;
 #endif
         return 0;       // arena full: drop (correct -- columns stay key-index)
     }
-    dl_walls[dl_wall_count++] = *w;
+
+    idx = dl_wall_count++;
+    rec = &dl_walls[idx];
+    *rec = *w;
+    rec->bucket_next = -1;
+
+    // Append to the texture's bucket (Q6). If the bucket arrays could not be
+    // allocated (numtextures not yet known), the record is still in the arena
+    // and DL_Flush's bucket walk simply won't reach it -- but that only happens
+    // before any level is loaded, where no seg routes, so it is unreachable in
+    // practice. Guard anyway.
+    tex = w->texid;
+    if (dl_bucket_head && tex >= 0 && tex < numtextures)
+    {
+        if (dl_bucket_gen[tex] != dl_frame_gen)
+        {
+            // First record for this texture this frame: open the bucket and
+            // record it in the sparse touched-texture list (deduped by the gen
+            // stamp, so each texnum appears in dl_touched[] at most once).
+            dl_bucket_gen[tex]  = dl_frame_gen;
+            dl_bucket_head[tex] = idx;
+            dl_bucket_tail[tex] = idx;
+            if (dl_touched_count < DL_WALL_ARENA)
+                dl_touched[dl_touched_count++] = (uint16_t)tex;
+        }
+        else
+        {
+            // Chain onto the existing bucket tail.
+            dl_walls[dl_bucket_tail[tex]].bucket_next = idx;
+            dl_bucket_tail[tex] = idx;
+        }
+    }
     return 1;
 }
 
-// --- routed-seg per-column capture (Stage 2) -------------------------------
-// All routed-seg capture lives here (not in R_RenderSegLoop) so the flag-OFF
+// --- routed per-tier per-column capture ------------------------------------
+// All routed capture lives here (not in R_RenderSegLoop) so the flag-OFF
 // seg-loop translation unit stays at the pre-RDP baseline .text size. The seg
-// loop feeds drawn columns to DL_RouteCapture and calls DL_RouteEmit once after
-// the loop -- but ONLY when it has claimed the routed seg this frame, so none of
-// this is reachable with the kill-switch off.
-static short         dl_rt_yl[SCREENWIDTH];
-static short         dl_rt_yh[SCREENWIDTH];
-static fixed_t       dl_rt_scale[SCREENWIDTH];
-static fixed_t       dl_rt_scol[SCREENWIDTH];   // texturecolumn
-static unsigned char dl_rt_lit[SCREENWIDTH];    // colormap level
-static unsigned char dl_rt_drawn[SCREENWIDTH];  // 1 if a span was emitted here
-static int           dl_rt_first;               // first drawn column (-1 none)
-static int           dl_rt_last;                // last drawn column
+// loop feeds each drawn wall-tier column to DL_RouteCapture (tagged by tier)
+// and calls DL_RouteEmit once per tier after the column loop -- but ONLY when
+// the kill-switch is on, so none of this is reachable with the flag off.
+//
+// THREE tier streams (mid/top/bottom). A two-sided seg draws its top and bottom
+// tiers across overlapping column ranges with DIFFERENT screen Y spans and
+// DIFFERENT texturemids, so each tier needs its own per-column capture; a
+// single-sided seg uses only the mid stream. scale/texcol/light are physically
+// shared across tiers in a column, but storing them per tier keeps the emit
+// walk a single uniform routine reading one tier's arrays.
+static short         dl_rt_yl   [DL_TIER_COUNT][SCREENWIDTH];
+static short         dl_rt_yh   [DL_TIER_COUNT][SCREENWIDTH];
+static fixed_t       dl_rt_scale[DL_TIER_COUNT][SCREENWIDTH];
+static fixed_t       dl_rt_scol [DL_TIER_COUNT][SCREENWIDTH];   // texturecolumn
+static unsigned char dl_rt_lit  [DL_TIER_COUNT][SCREENWIDTH];   // colormap level
+static unsigned char dl_rt_drawn[DL_TIER_COUNT][SCREENWIDTH];   // 1 if drawn here
+static int           dl_rt_first[DL_TIER_COUNT];                // first drawn col (-1)
+static int           dl_rt_last [DL_TIER_COUNT];                // last drawn col
 
 void DL_RouteBeginSeg(void)
 {
-    dl_rt_first = -1;
-    dl_rt_last  = -1;
-    // Clear the drawn flags for the whole width. The seg loop only calls
-    // DL_RouteCapture for columns that actually draw (yl <= yh), so a column
-    // skipped this seg would otherwise keep a STALE drawn=1 (and stale
-    // yl/yh/scale/texturecolumn) from an earlier frame's routed seg. The emit
-    // walk reads those stale cells for run-break decisions and (worse) as run
-    // endpoints, producing quads at last-frame's screen coordinates -- visible
-    // as warped / misplaced wall pieces. The pre-refactor seg loop zeroed the
-    // flag inline in its else-branch; this restores that invariant in one
-    // place. 320 bytes once per claimed seg (once per frame), flag-on only.
-    memset(dl_rt_drawn, 0, sizeof(dl_rt_drawn));
+    int t;
+    for (t = 0; t < DL_TIER_COUNT; t++)
+    {
+        dl_rt_first[t] = -1;
+        dl_rt_last[t]  = -1;
+        // Clear the drawn flags for the whole width. The seg loop only calls
+        // DL_RouteCapture for columns that actually draw (yl <= yh), so a
+        // column skipped this seg/tier would otherwise keep a STALE drawn=1
+        // (and stale yl/yh/scale/texturecolumn) from an earlier seg's tier. The
+        // emit walk reads those stale cells for run-break decisions and (worse)
+        // as run endpoints, producing quads at the wrong screen coordinates --
+        // visible as warped / misplaced wall pieces. Per-seg reset (not
+        // per-frame) so tier runs from segs drawn earlier this frame never
+        // bleed into a later seg. ~960 bytes once per seg, flag-on only.
+        memset(dl_rt_drawn[t], 0, sizeof(dl_rt_drawn[t]));
+    }
 }
 
-void DL_RouteCapture(int x, int yl, int yh, fixed_t scale, fixed_t texcol,
-                     const void* const* walllights)
+void DL_RouteCapture(int tier, int x, int yl, int yh, fixed_t scale,
+                     fixed_t texcol, const void* const* walllights)
 {
+    if ((unsigned)tier >= DL_TIER_COUNT)
+        return;
     if (x < 0 || x >= SCREENWIDTH)
         return;
     if (yl <= yh)
     {
-        dl_rt_yl[x]    = (short)yl;
-        dl_rt_yh[x]    = (short)yh;
-        dl_rt_scale[x] = scale;
-        dl_rt_scol[x]  = texcol;
-        dl_rt_lit[x]   = DL_WallLightLevel(walllights,
-                            (unsigned)(scale >> LIGHTSCALESHIFT));
-        dl_rt_drawn[x] = 1;
-        if (dl_rt_first < 0) dl_rt_first = x;
-        dl_rt_last = x;
+        dl_rt_yl[tier][x]    = (short)yl;
+        dl_rt_yh[tier][x]    = (short)yh;
+        dl_rt_scale[tier][x] = scale;
+        dl_rt_scol[tier][x]  = texcol;
+        dl_rt_lit[tier][x]   = DL_WallLightLevel(walllights,
+                                  (unsigned)(scale >> LIGHTSCALESHIFT));
+        dl_rt_drawn[tier][x] = 1;
+        if (dl_rt_first[tier] < 0) dl_rt_first[tier] = x;
+        dl_rt_last[tier] = x;
     }
     else
     {
-        dl_rt_drawn[x] = 0;
+        dl_rt_drawn[tier][x] = 0;
     }
 }
 
@@ -469,19 +572,32 @@ void DL_RouteCapture(int x, int yl, int yh, fixed_t scale, fixed_t texcol,
 // rows stay aligned with software wherever pixels survive the blit. The 16.16
 // fraction is kept (divide, not >>FRACBITS) so band slicing in DL_Flush never
 // mis-seats a seam.
-void DL_RouteEmit(fixed_t mid, int texnum, int centery)
+void DL_RouteEmit(int tier, fixed_t mid, int texnum, int centery)
 {
     const float     k = dl_invw_k;
     const int       cy = centery;
     int             run0 = -1;
     int             x;
 
-    if (dl_rt_first < 0)
+    // This tier's per-column capture arrays. A two-sided seg emits its top and
+    // bottom tiers from independent streams; a single-sided seg only its mid.
+    const short*         t_yl    = dl_rt_yl[tier];
+    const short*         t_yh    = dl_rt_yh[tier];
+    const fixed_t*       t_scale = dl_rt_scale[tier];
+    const fixed_t*       t_scol  = dl_rt_scol[tier];
+    const unsigned char* t_lit   = dl_rt_lit[tier];
+    const unsigned char* t_drawn = dl_rt_drawn[tier];
+    const int            first   = dl_rt_first[tier];
+    const int            last    = dl_rt_last[tier];
+
+    if ((unsigned)tier >= DL_TIER_COUNT)
+        return;
+    if (first < 0)
         return;
 
-    for (x = dl_rt_first; x <= dl_rt_last + 1; x++)
+    for (x = first; x <= last + 1; x++)
     {
-        int drawn = (x <= dl_rt_last) ? dl_rt_drawn[x] : 0;
+        int drawn = (x <= last) ? t_drawn[x] : 0;
         int breakrun = 0;
 
         if (run0 < 0)
@@ -494,7 +610,7 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
         // Break the run at a gap (undrawn column) or a light-level change.
         if (!drawn)
             breakrun = 1;
-        else if (dl_rt_lit[x] != dl_rt_lit[run0])
+        else if (t_lit[x] != t_lit[run0])
             breakrun = 1;
         // ... or when the S (texturecolumn) span exceeds the fixed-point safe
         // range. rdpq_triangle's S/T attribute setup saturates at |S| >= 1024
@@ -504,16 +620,16 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
         // smaller endpoint lands in [0, width)), which bounds |S| by
         // width + span; with span capped at 700 and width <= 256 that is < 1024
         // always. Long offset segs simply split into more quads.
-        else if (dl_rt_scol[x] - dl_rt_scol[run0] > 700
-                 || dl_rt_scol[run0] - dl_rt_scol[x] > 700)
+        else if (t_scol[x] - t_scol[run0] > 700
+                 || t_scol[run0] - t_scol[x] > 700)
             breakrun = 1;
 
         if (breakrun)
         {
             int         xa = run0;
             int         xb = x - 1;      // inclusive last column of the run
-            fixed_t     sca = dl_rt_scale[xa];
-            fixed_t     scb = dl_rt_scale[xb];
+            fixed_t     sca = t_scale[xa];
+            fixed_t     scb = t_scale[xb];
             fixed_t     isca = 0xffffffffu / (unsigned)sca;
             fixed_t     iscb = 0xffffffffu / (unsigned)scb;
             int         ytop, ybot;
@@ -522,12 +638,12 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
 
             // Run bounding rectangle: cover every column's truncated
             // [yl..yh] span exactly (see COVERAGE RULE above).
-            ytop = dl_rt_yl[xa];
-            ybot = dl_rt_yh[xa];
+            ytop = t_yl[xa];
+            ybot = t_yh[xa];
             for (xi = xa + 1; xi <= xb; xi++)
             {
-                if (dl_rt_yl[xi] < ytop) ytop = dl_rt_yl[xi];
-                if (dl_rt_yh[xi] > ybot) ybot = dl_rt_yh[xi];
+                if (t_yl[xi] < ytop) ytop = t_yl[xi];
+                if (t_yh[xi] > ybot) ybot = t_yh[xi];
             }
             ybot += 1;                  // span is inclusive
 
@@ -537,8 +653,8 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
             w.ybot_l = (float)ybot;
             w.ytop_r = (float)ytop;
             w.ybot_r = (float)ybot;
-            w.s_l = (float)dl_rt_scol[xa];
-            w.s_r = (float)dl_rt_scol[xb];
+            w.s_l = (float)t_scol[xa];
+            w.s_r = (float)t_scol[xb];
             w.invw_l = (float)sca * k;
             w.invw_r = (float)scb * k;
             // Per-corner T at the rect's shared top/bottom rows, through each
@@ -552,7 +668,7 @@ void DL_RouteEmit(fixed_t mid, int texnum, int centery)
             w.t_bot_r = (float)(mid + (ybot - cy) * iscb)
                         * (1.0f / (float)FRACUNIT);
             w.texid = (uint16_t)texnum;
-            w.light = dl_rt_lit[xa];
+            w.light = t_lit[xa];
 
             DL_EmitWallTier(&w);
 
@@ -624,32 +740,221 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
     return 1;
 }
 
-int DL_WallSegAvailable(void)
+int DL_WallRouteOn(void)
 {
     if (!n64_use_rdp_renderer)
         return 0;
     if (!n64_rdp_wall_ab)
-        return 0;       // A/B toggle: keep the routed seg on the CPU
-    return !dl_seg_claimed;
-}
-
-int DL_ClaimWallSeg(void)
-{
-    if (dl_seg_claimed)
-        return 0;
-    dl_seg_claimed = 1;
+        return 0;       // A/B toggle: keep walls on the CPU
     return 1;
 }
 
-// Drain the emitted wall records into the attached display fb. Stage 2: one
-// texture upload + 2 triangles per record (TRIFMT_TEX), PRIM from the light
-// LUT. Must run inside the present seam after rdpq_attach + the view scissor,
-// before the overlay blit (same rspq stream). Caller owns the mode/combiner/
-// TLUT/persp setup (DESIGN section 4): rdpq_set_mode_standard +
-// RDPQ_COMBINER_TEX_FLAT + rdpq_mode_tlut(TLUT_RGBA16) + rdpq_mode_persp(true).
+// --- per-record draw (the validated Stage-2 band/T/S machinery) -------------
+// Draw ONE wall record: PRIM from the light LUT, then the texel-T band walk
+// (tile uploads + 2 triangles per band). Factored out of DL_Flush so the
+// Stage-3 per-texture bucket walk can call it for every record in a bucket
+// after the bucket's first upload, keeping the band/S/T math byte-identical to
+// Stage 2. Returns nonzero if the record drew (had a usable transpose block).
+//
+// block/blkh/blkw are the record's transpose block (already fetched + pinned by
+// the caller). The caller owns rdpq mode/combiner/TLUT/persp setup.
+static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
+{
+    int     cap;            // max tile rows fitting the lower TMEM half
+    uint32_t prim;
+    float   xl, xr;
+    float   s_l, s_r;       // S endpoints, period-bias-reduced (BUG D)
+    float   tl0, tl1;       // left-edge texel-T range (top..bottom)
+    float   tr0, tr1;       // right-edge texel-T range (top..bottom)
+    float   t0, t1;         // union texel-T range covered by the quad
+
+    // Per-width TMEM tile cap: a CI8 tile is blkw bytes/row and must fit the
+    // lower 2 KB TMEM half beside the resident TLUT (64-wide: 32 rows,
+    // 128-wide: 16, 256-wide: 8 -- Q7, corrected for wide textures).
+    cap = DL_TMEM_HALF / blkw;
+    if (cap < 1)
+        return 0;
+
+    // PRIM = colormap-level brightness (Q8). TEX0*PRIM in 1-cycle.
+    prim = (w->light < NUMCOLORMAPS) ? dl_prim_lut[w->light] : 0xFFFFFFFFu;
+    rdpq_set_prim_color(color_from_packed32(prim));
+
+    xl = (float)w->x1;
+    xr = (float)w->x2 + 1.0f;
+
+    // S bias reduction (BUG D, saturation guard): texturecolumn is unbounded
+    // (rw_offset + tangent term), but rdpq_triangle's attribute fixed point
+    // saturates at |S| >= 1024 texels, smearing the texture. The tile wraps S
+    // with mask log2(blkw), so subtracting a SHARED whole number of periods from
+    // both endpoints is sampling-identical; after the bias the smaller endpoint
+    // lies in [0, blkw) and the emit-side run split caps |s_r - s_l| at 700, so
+    // |S| < blkw + 700 < 1024.
+    {
+        float smin = (w->s_l < w->s_r) ? w->s_l : w->s_r;
+        float bias = floorf(smin / (float)blkw) * (float)blkw;
+        s_l = w->s_l - bias;
+        s_r = w->s_r - bias;
+    }
+
+    // Per-edge T ranges (texel rows at the rect's top/bottom screen rows,
+    // through each edge's own 1/scale -- see DL_RouteEmit). Both increase
+    // down-screen. The band walk marches their UNION; a band's slice is clamped
+    // per edge, so adjacent slices share their boundary chord exactly (no gap,
+    // no overlap) and the union tiles the full rect.
+    tl0 = w->t_top_l;
+    tl1 = w->t_bot_l;
+    tr0 = w->t_top_r;
+    tr1 = w->t_bot_r;
+    t0 = (tl0 < tr0) ? tl0 : tr0;   // union range start
+    t1 = (tl1 > tr1) ? tl1 : tr1;   // union range end
+
+    // Texel-T band walk (BUG B fix). DOOM's column drawer WRAPS the source
+    // vertically (`source[(frac>>FRACBITS)&127]`, r_draw.c:150) -- the texture
+    // TILES over a wall taller than itself; it is NOT clamped. We march the FULL
+    // [t0,t1] range, splitting sub-bands at (a) texture-period boundaries
+    // (floor-division multiples of blkh, negatives included) and (b) the TMEM
+    // row cap, and give the triangles PERIOD-RELATIVE, band-local T.
+    //
+    // Documented divergence from vanilla: software wraps mod 128 ALWAYS, so a
+    // sub-128-tall texture on an over-tall wall shows vanilla's tutti-frutti. We
+    // wrap mod blkh (the texture tiles cleanly) -- acceptable, deliberate.
+    //
+    // TMEM RULE: each band's source rows are uploaded tile-LOCAL starting at
+    // TMEM row 0 (surface pointed at the band's first row), never at their
+    // original T address -- an original-T upload past the cap would overrun the
+    // lower 2 KB TMEM half into the resident TLUT.
+    {
+    const float span = t1 - t0;
+    float cur;
+    int   guard;
+
+    if (span <= 0.0f)
+        return 1;
+
+    cur = t0;
+    for (guard = 0; cur < t1 - (1.0f / 1024.0f) && guard < 256; guard++)
+    {
+        surface_t       surf;
+        rdpq_texparms_t parms;
+        int     period_base;    // floor(cur/blkh)*blkh, texels
+        int     src_lo;         // band's first source row, in [0,blkh)
+        int     src_cap;        // band row ceiling (TMEM cap / period edge)
+        int     src_hi;         // one past the band's last drawn source row
+        int     rows;           // drawn rows in this band
+        int     rows_up;        // uploaded rows (rows + optional overlap)
+        float   band_end;       // T where this band stops (texels)
+        float   a_l, b_l;       // band T clamped into the left edge range
+        float   a_r, b_r;       // band T clamped into the right edge range
+        float   f0, f1;         // per-edge screen-Y lerp factors
+        float   base;           // band-local T origin (texels)
+        float   ytl, ytr, ybl, ybr;
+        byte*   bandsrc;
+
+        // Period base via floor division (handles negative T).
+        period_base = (int)floorf(cur / (float)blkh) * blkh;
+        src_lo = (int)floorf(cur) - period_base;
+        if (src_lo < 0) src_lo = 0;             // float-edge paranoia
+        if (src_lo >= blkh) src_lo = blkh - 1;
+
+        src_cap = src_lo + cap;
+        if (src_cap > blkh)
+            src_cap = blkh;                     // split at the period edge
+
+        band_end = (float)(period_base + src_cap);
+        if (band_end > t1)
+            band_end = t1;
+
+        src_hi = (int)ceilf(band_end - (float)period_base);
+        if (src_hi > src_cap) src_hi = src_cap;
+        if (src_hi <= src_lo) src_hi = src_lo + 1;
+        rows = src_hi - src_lo;
+
+        // 1-texel seam overlap where a row of headroom exists (see above).
+        rows_up = rows;
+        if (rows_up < cap && src_lo + rows_up < blkh)
+            rows_up++;
+
+        // Band-local upload at TMEM row 0; S wraps with the texture's pow2
+        // period (mask = log2(blkw), matching R_GetColumn's `& mask`).
+        bandsrc = block + (src_lo * blkw);
+        surf = surface_make_linear(bandsrc, FMT_CI8, blkw, rows_up);
+        memset(&parms, 0, sizeof(parms));
+        parms.s.repeats = REPEAT_INFINITE;  // wrap S (texture column)
+        parms.t.repeats = 1;                // clamp T at the band edges
+        rdpq_tex_upload(TILE0, &surf, &parms);
+
+        // Slice corners. T iso-lines of the wall's projective map are straight
+        // lines in screen space, so the slice between T=cur and T=band_end is
+        // bounded by two chords; each chord's endpoint on an edge sits at that
+        // EDGE's own T position, clamped into the edge's range. Adjacent bands
+        // clamp the SAME chord identically, so slices share edges exactly. Y is
+        // affine in T along each vertical edge, so the corner Y is a per-edge
+        // lerp.
+        a_l = cur;
+        if (a_l < tl0) a_l = tl0;
+        if (a_l > tl1) a_l = tl1;
+        b_l = band_end;
+        if (b_l < tl0) b_l = tl0;
+        if (b_l > tl1) b_l = tl1;
+        a_r = cur;
+        if (a_r < tr0) a_r = tr0;
+        if (a_r > tr1) a_r = tr1;
+        b_r = band_end;
+        if (b_r < tr0) b_r = tr0;
+        if (b_r > tr1) b_r = tr1;
+
+        f0 = (a_l - tl0) / (tl1 - tl0);
+        f1 = (b_l - tl0) / (tl1 - tl0);
+        ytl = w->ytop_l + (w->ybot_l - w->ytop_l) * f0;
+        ybl = w->ytop_l + (w->ybot_l - w->ytop_l) * f1;
+        f0 = (a_r - tr0) / (tr1 - tr0);
+        f1 = (b_r - tr0) / (tr1 - tr0);
+        ytr = w->ytop_r + (w->ybot_r - w->ytop_r) * f0;
+        ybr = w->ytop_r + (w->ybot_r - w->ytop_r) * f1;
+
+        // Skip a slice that degenerated on BOTH edges (band entirely outside
+        // both edge ranges -- possible at the union's extremes).
+        if (b_l <= a_l && b_r <= a_r)
+        {
+            cur = band_end;
+            continue;
+        }
+
+        // Band-local, fraction-preserved T per corner.
+        base = (float)(period_base + src_lo);
+
+        {
+            float tl[5] = { xl, ytl, s_l, a_l - base, w->invw_l };
+            float tr[5] = { xr, ytr, s_r, a_r - base, w->invw_r };
+            float bl[5] = { xl, ybl, s_l, b_l - base, w->invw_l };
+            float br[5] = { xr, ybr, s_r, b_r - base, w->invw_r };
+
+            rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
+            rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+        }
+
+        cur = band_end;
+    }
+    }
+    return 1;
+}
+
+// Drain the emitted wall records into the attached display fb. Stage 3: a
+// per-TEXTURE bucket walk -- for each touched texture, fetch + pin its transpose
+// block ONCE, then draw every record in that texture's bucket (DL_DrawRecord)
+// before moving to the next texture. This collapses autosync TMEM/pipe thrash
+// from per-seg (Stage 2, textures interleaved) to per-texture (Q6). Overflow
+// records that never made it into a bucket (arena full) are drawn afterward in
+// arena order as the documented un-bucketed fallback (slower, correct, never
+// crashes -- design risk table "DL arena overflow on tail frames").
+//
+// Must run inside the present seam after rdpq_attach + the view scissor, before
+// the overlay blit (same rspq stream). Caller owns the mode/combiner/TLUT/persp
+// setup (DESIGN section 4): rdpq_set_mode_standard + RDPQ_COMBINER_TEX_FLAT +
+// rdpq_mode_tlut(TLUT_RGBA16) + rdpq_mode_persp(true).
 void DL_Flush(void)
 {
-    int i;
+    int ti;
 
 #if DL_DEBUG_TRACE
     dl_present_no++;
@@ -703,237 +1008,62 @@ void DL_Flush(void)
     dl_drop_count = 0;
 #endif
 
-    for (i = 0; i < dl_wall_count; i++)
+    // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
+    // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
+    // every record chained in that texture's bucket. All of a texture's uploads
+    // (the band tiles of its records) are issued consecutively, so the tile
+    // descriptor never thrashes between unrelated textures across the frame --
+    // the per-seg interleaving Stage 2 produced is gone. Walking dl_touched[]
+    // (the sparse set of textures used) keeps this O(records), not
+    // O(numtextures).
+    for (ti = 0; ti < dl_touched_count; ti++)
     {
-        const rdp_wall_t* w = &dl_walls[i];
+        int     tex = dl_touched[ti];
+        int     ridx;
         byte*   block;
         int     blkh = 0;       // texture height = vertical wrap period
         int     blkw = 0;       // pow2 sampling width (texturewidthmask+1)
-        int     cap;            // max tile rows fitting the lower TMEM half
-        uint32_t prim;
-        float   xl, xr;
-        float   s_l, s_r;       // S endpoints, period-bias-reduced (BUG D)
-        float   tl0, tl1;       // left-edge texel-T range (top..bottom)
-        float   tr0, tr1;       // right-edge texel-T range (top..bottom)
-        float   t0, t1;         // union texel-T range covered by the quad
 
-        block = DL_RowMajorBlock(w->texid, &blkh, &blkw);
+        block = DL_RowMajorBlock(tex, &blkh, &blkw);
         if (!block || blkh < 1 || blkw < 1)
         {
 #if DL_DEBUG_TRACE
-            debugf("DL_TRACE p=%d rec=%d tex=%d NOBLOCK h=%d w=%d\n",
-                   dl_present_no, i, w->texid, blkh, blkw);
+            debugf("DL_TRACE p=%d tex=%d NOBLOCK h=%d w=%d\n",
+                   dl_present_no, tex, blkh, blkw);
 #endif
-            continue;
+            continue;       // no usable transpose: this texture's records stay key
         }
-
-#if DL_DEBUG_TRACE
-        debugf("DL_TRACE p=%d rec=%d tex=%d w=%d h=%d x=%d..%d "
-               "y=%d.%d/%d.%d tl=%d..%d tr=%d..%d s=%d..%d lit=%d\n",
-               dl_present_no, i, w->texid, blkw, blkh,
-               (int)w->x1, (int)w->x2,
-               (int)w->ytop_l, (int)w->ytop_r, (int)w->ybot_l, (int)w->ybot_r,
-               (int)w->t_top_l, (int)w->t_bot_l,
-               (int)w->t_top_r, (int)w->t_bot_r,
-               (int)w->s_l, (int)w->s_r, (int)w->light);
-#endif
 
         // Pin the block against zone eviction while the RDP may read it
         // asynchronously (see DL_RowMajorBlock lifetime note / DL_PresentEnd).
-        DL_MarkInFlight(w->texid);
+        // Once per texture, not once per record (Stage 2 over-pinned per seg).
+        DL_MarkInFlight(tex);
 
-        // Per-width TMEM tile cap: a CI8 tile is blkw bytes/row and must fit
-        // the lower 2 KB TMEM half beside the resident TLUT (64-wide: 32 rows,
-        // 128-wide: 16, 256-wide: 8 -- Q7, corrected for wide textures).
-        cap = DL_TMEM_HALF / blkw;
-        if (cap < 1)
-            continue;
-
-        // PRIM = colormap-level brightness (Q8). TEX0*PRIM in 1-cycle.
-        prim = (w->light < NUMCOLORMAPS) ? dl_prim_lut[w->light]
-                                         : 0xFFFFFFFFu;
-        rdpq_set_prim_color(color_from_packed32(prim));
-
-        xl = (float)w->x1;
-        xr = (float)w->x2 + 1.0f;
-
-        // S bias reduction (BUG D, saturation guard): texturecolumn is
-        // unbounded (rw_offset + tangent term), but rdpq_triangle's attribute
-        // fixed point saturates at |S| >= 1024 texels, smearing the texture.
-        // The tile wraps S with mask log2(blkw), so subtracting a SHARED whole
-        // number of periods from both endpoints is sampling-identical; after
-        // the bias the smaller endpoint lies in [0, blkw) and the emit-side
-        // run split caps |s_r - s_l| at 700, so |S| < blkw + 700 < 1024.
+        for (ridx = dl_bucket_head[tex]; ridx >= 0;
+             ridx = dl_walls[ridx].bucket_next)
         {
-            float smin = (w->s_l < w->s_r) ? w->s_l : w->s_r;
-            float bias = floorf(smin / (float)blkw) * (float)blkw;
-            s_l = w->s_l - bias;
-            s_r = w->s_r - bias;
-        }
-
-        // Per-edge T ranges (texel rows at the rect's top/bottom screen rows,
-        // through each edge's own 1/scale -- see DL_RouteEmit). Both increase
-        // down-screen. The band walk marches their UNION; a band's slice is
-        // clamped per edge, so adjacent slices share their boundary chord
-        // exactly (no gap, no overlap) and the union tiles the full rect.
-        tl0 = w->t_top_l;
-        tl1 = w->t_bot_l;
-        tr0 = w->t_top_r;
-        tr1 = w->t_bot_r;
-        t0 = (tl0 < tr0) ? tl0 : tr0;   // union range start
-        t1 = (tl1 > tr1) ? tl1 : tr1;   // union range end
-
-        // Texel-T band walk (BUG B fix). DOOM's column drawer WRAPS the source
-        // vertically (`source[(frac>>FRACBITS)&127]`, r_draw.c:150) -- the
-        // texture TILES over a wall taller than itself; it is NOT clamped. The
-        // committed code clamped [t0,t1] into [0,blkh) and silently dropped the
-        // wall's other periods: those screen rows kept the key index, the keyed
-        // present blit punched them, and 3-presents-stale fb content showed
-        // through (the "blue smear"). We march the FULL [t0,t1] range instead,
-        // splitting sub-bands at (a) texture-period boundaries (floor-division
-        // multiples of blkh, negatives included) and (b) the TMEM row cap, and
-        // give the triangles PERIOD-RELATIVE, band-local T.
-        //
-        // Documented divergence from vanilla: software wraps mod 128 ALWAYS, so
-        // a sub-128-tall texture on an over-tall wall shows vanilla's
-        // tutti-frutti (rows past the texture sample adjacent zone memory). We
-        // wrap mod blkh (the texture tiles cleanly) -- acceptable, deliberate.
-        //
-        // TMEM RULE: each band's source rows are uploaded tile-LOCAL starting
-        // at TMEM row 0 (surface pointed at the band's first row), never at
-        // their original T address -- an original-T upload past the cap would
-        // overrun the lower 2 KB TMEM half into the resident TLUT.
-        //
-        // Band seams (design section 4 seam rule): bands abut in screen space
-        // (shared edge => each seam pixel rasterizes in exactly one band) and
-        // each band's T is clamped to its tile (t.repeats=1), so the exact
-        // bottom-edge sample T==rows clamps to the last loaded row instead of
-        // reading past the tile. Where a row of headroom exists (cap not hit,
-        // period edge not hit) the next source row is uploaded too -- the
-        // literal 1-texel overlap -- so interpolation jitter at the seam stays
-        // in-band; at the hard 2 KB boundary the T-clamp alone closes the seam.
-        {
-        const float span = t1 - t0;
-        float cur;
-        int   guard;
-
-        // T increases down-screen for walls (dc_iscale > 0, yh+1 > yl), so
-        // span >= ~1/64 texel for any captured column; <= 0 is pure paranoia.
-        if (span <= 0.0f)
-            continue;
-
-        cur = t0;
-        for (guard = 0; cur < t1 - (1.0f / 1024.0f) && guard < 256; guard++)
-        {
-            surface_t       surf;
-            rdpq_texparms_t parms;
-            int     period_base;    // floor(cur/blkh)*blkh, texels
-            int     src_lo;         // band's first source row, in [0,blkh)
-            int     src_cap;        // band row ceiling (TMEM cap / period edge)
-            int     src_hi;         // one past the band's last drawn source row
-            int     rows;           // drawn rows in this band
-            int     rows_up;        // uploaded rows (rows + optional overlap)
-            float   band_end;       // T where this band stops (texels)
-            float   a_l, b_l;       // band T clamped into the left edge range
-            float   a_r, b_r;       // band T clamped into the right edge range
-            float   f0, f1;         // per-edge screen-Y lerp factors
-            float   base;           // band-local T origin (texels)
-            float   ytl, ytr, ybl, ybr;
-            byte*   bandsrc;
-
-            // Period base via floor division (handles negative T).
-            period_base = (int)floorf(cur / (float)blkh) * blkh;
-            src_lo = (int)floorf(cur) - period_base;
-            if (src_lo < 0) src_lo = 0;             // float-edge paranoia
-            if (src_lo >= blkh) src_lo = blkh - 1;
-
-            src_cap = src_lo + cap;
-            if (src_cap > blkh)
-                src_cap = blkh;                     // split at the period edge
-
-            band_end = (float)(period_base + src_cap);
-            if (band_end > t1)
-                band_end = t1;
-
-            src_hi = (int)ceilf(band_end - (float)period_base);
-            if (src_hi > src_cap) src_hi = src_cap;
-            if (src_hi <= src_lo) src_hi = src_lo + 1;
-            rows = src_hi - src_lo;
-
-            // 1-texel seam overlap where a row of headroom exists (see above).
-            rows_up = rows;
-            if (rows_up < cap && src_lo + rows_up < blkh)
-                rows_up++;
-
-            // Band-local upload at TMEM row 0; S wraps with the texture's pow2
-            // period (mask = log2(blkw), matching R_GetColumn's `& mask`).
-            bandsrc = block + (src_lo * blkw);
-            surf = surface_make_linear(bandsrc, FMT_CI8, blkw, rows_up);
-            memset(&parms, 0, sizeof(parms));
-            parms.s.repeats = REPEAT_INFINITE;  // wrap S (texture column)
-            parms.t.repeats = 1;                // clamp T at the band edges
-            rdpq_tex_upload(TILE0, &surf, &parms);
-
-            // Slice corners. T iso-lines of the wall's projective map are
-            // straight lines in screen space, so the slice between T=cur and
-            // T=band_end is bounded by two chords; each chord's endpoint on an
-            // edge sits at that EDGE's own T position, clamped into the edge's
-            // range (a chord that exits through the rect's horizontal top/
-            // bottom edge clamps to the corner). Adjacent bands clamp the SAME
-            // chord identically, so slices share edges exactly -- the union
-            // tiles the full rect with no gap and no overlap. Y is affine in T
-            // along each vertical edge, so the corner Y is a per-edge lerp.
-            a_l = cur;
-            if (a_l < tl0) a_l = tl0;
-            if (a_l > tl1) a_l = tl1;
-            b_l = band_end;
-            if (b_l < tl0) b_l = tl0;
-            if (b_l > tl1) b_l = tl1;
-            a_r = cur;
-            if (a_r < tr0) a_r = tr0;
-            if (a_r > tr1) a_r = tr1;
-            b_r = band_end;
-            if (b_r < tr0) b_r = tr0;
-            if (b_r > tr1) b_r = tr1;
-
-            f0 = (a_l - tl0) / (tl1 - tl0);
-            f1 = (b_l - tl0) / (tl1 - tl0);
-            ytl = w->ytop_l + (w->ybot_l - w->ytop_l) * f0;
-            ybl = w->ytop_l + (w->ybot_l - w->ytop_l) * f1;
-            f0 = (a_r - tr0) / (tr1 - tr0);
-            f1 = (b_r - tr0) / (tr1 - tr0);
-            ytr = w->ytop_r + (w->ybot_r - w->ytop_r) * f0;
-            ybr = w->ytop_r + (w->ybot_r - w->ytop_r) * f1;
-
-            // Skip a slice that degenerated on BOTH edges (band entirely
-            // outside both edge ranges -- possible at the union's extremes).
-            if (b_l <= a_l && b_r <= a_r)
-            {
-                cur = band_end;
-                continue;
-            }
-
-            // Band-local, fraction-preserved T per corner (the slice's top
-            // usually starts mid-texel after a period or cap split). A corner
-            // clamped past the band range by the chord clamp lands within one
-            // texel of the tile edge; t.repeats=1 + the overlap row keep the
-            // sampled texel correct there.
-            base = (float)(period_base + src_lo);
-
-            {
-                float tl[5] = { xl, ytl, s_l, a_l - base, w->invw_l };
-                float tr[5] = { xr, ytr, s_r, a_r - base, w->invw_r };
-                float bl[5] = { xl, ybl, s_l, b_l - base, w->invw_l };
-                float br[5] = { xr, ybr, s_r, b_r - base, w->invw_r };
-
-                rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
-                rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
-            }
-
-            cur = band_end;
-        }
+            const rdp_wall_t* w = &dl_walls[ridx];
+#if DL_DEBUG_TRACE
+            debugf("DL_TRACE p=%d rec=%d tex=%d w=%d h=%d x=%d..%d "
+                   "y=%d.%d/%d.%d tl=%d..%d tr=%d..%d s=%d..%d lit=%d\n",
+                   dl_present_no, ridx, tex, blkw, blkh,
+                   (int)w->x1, (int)w->x2,
+                   (int)w->ytop_l, (int)w->ytop_r, (int)w->ybot_l, (int)w->ybot_r,
+                   (int)w->t_top_l, (int)w->t_bot_l,
+                   (int)w->t_top_r, (int)w->t_bot_r,
+                   (int)w->s_l, (int)w->s_r, (int)w->light);
+#endif
+            DL_DrawRecord(w, block, blkh, blkw);
         }
     }
+
+    // Overflow fallback (design risk table "DL arena overflow on tail frames").
+    // If the arena filled, records past DL_WALL_ARENA were never queued (their
+    // columns stay key-index, a punched hole -- but they were dropped, not
+    // mis-drawn). Nothing else to do: the bucket walk already drew every record
+    // that DID fit. The flag exists so a future tail-frame can be detected and
+    // the arena grown if it ever bites; with DL_WALL_ARENA=512 it should not.
+    (void)dl_arena_overflow;
 }
 
 // Retire per-present RDP world state. MUST be called at the end of the present

@@ -272,44 +272,37 @@ void R_RenderSegLoop (void)
     fixed_t		l_pixlow = pixlow;
 
 #ifdef N64
-    // RDP renderer (Stage 2): route the FIRST single-sided (midtexture) wall
-    // seg encountered this frame through the RDP wall path. Deterministic under
-    // the virtual tic clock (the BSP walk order is fixed, so "first eligible
-    // seg" is the same seg every run). For the routed seg the per-column
-    // colfunc pixel write is suppressed (those view columns keep the
-    // transparency-key index from KEY_CLEAR, and the RDP fill drawn at the
-    // present seam shows through), while ALL clip / visplane bookkeeping stays
-    // on the CPU. Per-column screen Y / scale / texturecolumn / light are
-    // captured here and turned into rdp_wall_t records (per light-level run)
-    // after the loop. A single-sided line always has a midtexture, so this is
-    // exactly the midtexture branch below.
+    // RDP renderer (Stage 3): route ALL solid wall tiers through the RDP wall
+    // path -- every single-sided (midtexture) seg AND the upper/lower textures
+    // of two-sided segs. For a routed tier the per-column colfunc pixel write is
+    // suppressed (those view columns keep the transparency-key index, and the
+    // RDP fill drawn at the present seam shows through), while ALL clip /
+    // visplane bookkeeping stays on the CPU exactly as the software path does.
+    // Per-column screen Y / scale / texturecolumn / light are captured per tier
+    // and turned into rdp_wall_t records (per light-level run) after the loop.
+    // Masked mid-textures stay CPU (Stage 5); sky is a visplane drawn by
+    // R_DrawPlanes (Stage 4), so the seg loop's wall tiers never carry sky.
     int			rdp_route = 0;
 
     // Kill-switch FIRST, inline, before any cross-TU call. With the flag OFF
     // this short-circuits to the pre-RDP software seg loop with ZERO added
-    // function calls (DL_WallSegAvailable/DL_ClaimWallSeg are never reached),
-    // so the flag-OFF hot path is byte-identical to the Stage-1 baseline rather
-    // than carrying a per-single-sided-seg cross-TU call into the kill-switch
-    // path. Only when the flag is ON do we consult the per-frame routed-seg
-    // latch. (Gate criterion 2: flag-OFF byte-identical to baseline.) ALL
-    // routed-seg capture state + the post-loop emit live in rdp_view.c so this
-    // hot translation unit's .text stays at the pre-RDP size when the flag is
-    // off (structural flag-OFF drift minimised).
-    if (n64_use_rdp_renderer
-	&& l_midtexture && DL_WallSegAvailable())
+    // function calls (DL_WallRouteOn is never reached), so the flag-OFF hot path
+    // is byte-identical to the Stage-1 baseline. (Gate criterion 2: flag-OFF
+    // byte-identical to baseline.) ALL routed capture state + the post-loop emit
+    // live in rdp_view.c so this hot translation unit's .text stays at the
+    // pre-RDP size when the flag is off (structural flag-OFF drift minimised).
+    if (n64_use_rdp_renderer && DL_WallRouteOn())
     {
-	if (DL_ClaimWallSeg())
-	{
-	    rdp_route = 1;
-	    DL_RouteBeginSeg();
-	}
+	rdp_route = 1;
+	DL_RouteBeginSeg();
     }
 #if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
-    // Diagnostic builds only (DL_TRACE=1): log every single-sided seg-loop
-    // invocation with its column range and whether it claimed the routed slot.
-    if (n64_use_rdp_renderer && l_midtexture)
-	debugf("DL_SEG mid=%d x=%d..%d claim=%d\n",
-	       l_midtexture, l_rw_x, l_rw_stopx - 1, rdp_route);
+    // Diagnostic builds only (DL_TRACE=1): log every seg-loop invocation with
+    // its tier textures, column range, and whether it routed.
+    if (n64_use_rdp_renderer)
+	debugf("DL_SEG mid=%d top=%d bot=%d x=%d..%d route=%d\n",
+	       l_midtexture, l_toptexture, l_bottomtexture,
+	       l_rw_x, l_rw_stopx - 1, rdp_route);
 #endif
 #endif
 
@@ -393,26 +386,22 @@ void R_RenderSegLoop (void)
 	    dc_yh = yh;
 	    dc_texturemid = l_rw_midtexturemid;
 #ifdef N64
-	    // RDP-routed seg: suppress the CPU pixel write ONLY for columns the
-	    // RDP will actually fill (yl <= yh). Those columns keep the key index
-	    // (from KEY_CLEAR) and the RDP quad shows through; they are exactly the
-	    // columns DL_RouteCapture records and DL_KeyedSpan later keys out, so
+	    // RDP-routed mid tier: suppress the CPU pixel write ONLY for columns
+	    // the RDP will actually fill (yl <= yh). Those columns keep the key
+	    // index and the RDP quad shows through; they are exactly the columns
+	    // DL_RouteCapture records and DL_KeyedSpan later keys out, so
 	    // suppressed == recorded == keyed -- no column is left key-index but
-	    // un-keyed (which the present blit would opaque-blit as the key colour,
-	    // a salmon "hole" on the right of the view). Columns with yl > yh fall
-	    // through to the normal path: l_colfunc draws zero pixels there (yl>yh),
-	    // byte-identical to vanilla, so a vertically-clipped part of the routed
-	    // seg never becomes a stray key-index leak. KEEP the ceiling/floor clip
-	    // writes below exactly as the CPU path does.
+	    // un-keyed (which the present blit would opaque-blit as the key colour).
+	    // Columns with yl > yh fall through to the normal path: l_colfunc draws
+	    // zero pixels there (yl>yh), byte-identical to vanilla, so a
+	    // vertically-clipped part of the routed seg never leaks a stray key
+	    // pixel. KEEP the ceiling/floor clip writes below as the CPU path does.
 	    if (rdp_route && yl <= yh)
 	    {
-		DL_RouteCapture(l_rw_x, yl, yh, l_rw_scale, texturecolumn,
-				(const void* const*)l_walllights);
+		DL_RouteCapture(DL_TIER_MID, l_rw_x, yl, yh, l_rw_scale,
+				texturecolumn, (const void* const*)l_walllights);
 		// Event-driven erase-to-key: write the key index into exactly
-		// this suppressed span (dc_x/dc_yl/dc_yh are already set
-		// above). Replaces the Stage-1 full-view key clear, whose
-		// reliance on total software view coverage leaked key pixels
-		// at rare per-column coverage gaps (stale-key sparkle).
+		// this suppressed span (dc_x/dc_yl/dc_yh are already set above).
 		R_FillColumnKey ();
 	    }
 	    else
@@ -441,8 +430,23 @@ void R_RenderSegLoop (void)
 		    dc_yl = yl;
 		    dc_yh = mid;
 		    dc_texturemid = l_rw_toptexturemid;
+#ifdef N64
+		    // RDP-routed top tier (two-sided upper texture). Suppress the
+		    // CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
+		    // mid>=yl), erase to key. KEEP the ceilingclip write below.
+		    if (rdp_route)
+		    {
+			DL_RouteCapture(DL_TIER_TOP, l_rw_x, yl, mid, l_rw_scale,
+					texturecolumn,
+					(const void* const*)l_walllights);
+			R_FillColumnKey ();
+		    }
+		    else
+#endif
+		    {
 		    dc_source = R_GetColumn(l_toptexture,texturecolumn);
 		    l_colfunc ();
+		    }
 		    l_ceilingclip[l_rw_x] = mid;
 		}
 		else
@@ -475,9 +479,24 @@ void R_RenderSegLoop (void)
 		    dc_yl = mid;
 		    dc_yh = yh;
 		    dc_texturemid = l_rw_bottomtexturemid;
+#ifdef N64
+		    // RDP-routed bottom tier (two-sided lower texture). Suppress
+		    // the CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
+		    // mid<=yh), erase to key. KEEP the floorclip write below.
+		    if (rdp_route)
+		    {
+			DL_RouteCapture(DL_TIER_BOT, l_rw_x, mid, yh, l_rw_scale,
+					texturecolumn,
+					(const void* const*)l_walllights);
+			R_FillColumnKey ();
+		    }
+		    else
+#endif
+		    {
 		    dc_source = R_GetColumn(l_bottomtexture,
 					    texturecolumn);
 		    l_colfunc ();
+		    }
 		    l_floorclip[l_rw_x] = mid;
 		}
 		else
@@ -509,12 +528,18 @@ void R_RenderSegLoop (void)
 #endif
 
 #ifdef N64
-    // RDP-routed seg: turn the captured per-column spans into rdp_wall_t records
-    // (run-coalescing + the per-run quad math live in rdp_view.c so this hot TU
-    // stays at the pre-RDP baseline size when the flag is off). No-op unless this
-    // seg was actually routed.
+    // RDP-routed seg: turn each tier's captured per-column spans into rdp_wall_t
+    // records (run-coalescing + the per-run quad math live in rdp_view.c so this
+    // hot TU stays at the pre-RDP baseline size when the flag is off). Each
+    // DL_RouteEmit is a no-op if that tier drew nothing this seg. A single-sided
+    // seg only fed the MID stream; a two-sided seg fed TOP and/or BOT. The tier
+    // texturemid + texture select which records map to which texture bucket.
     if (rdp_route)
-	DL_RouteEmit(l_rw_midtexturemid, l_midtexture, centery);
+    {
+	DL_RouteEmit(DL_TIER_MID, l_rw_midtexturemid,    l_midtexture,    centery);
+	DL_RouteEmit(DL_TIER_TOP, l_rw_toptexturemid,    l_toptexture,    centery);
+	DL_RouteEmit(DL_TIER_BOT, l_rw_bottomtexturemid, l_bottomtexture, centery);
+    }
 #endif
 
     // write back the accumulators the caller / next seg reads

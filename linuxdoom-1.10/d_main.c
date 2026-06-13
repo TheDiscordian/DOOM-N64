@@ -675,13 +675,13 @@ void D_Display (void)
     if (gamestate == GS_LEVEL && !automapactive && gametic)
 	{
 #ifdef N64
-	    // RDP renderer: reset the per-frame emit arena + routed-seg latch
+	    // RDP renderer: reset the per-frame emit arena + per-texture buckets
 	    // ONCE before the player render(s). The world pass is drained later
 	    // by DL_Flush at the present seam (i_video_n64.c). DL_BeginFrame also
 	    // derives this frame's free-W constant k and bakes the PRIM LUT.
 	    //
 	    // GATED on the kill-switch: with the flag OFF the seg loop never
-	    // routes (DL_WallSegAvailable() is false), so the arena/latch/k/LUT are
+	    // routes (DL_WallRouteOn() is false), so the arena/buckets/k/LUT are
 	    // never read this frame -- calling DL_BeginFrame anyway would leak a
 	    // per-frame float divide + arena reset (+ a one-time LUT bake) into the
 	    // software path that the Stage-1 baseline did not have, drifting the
