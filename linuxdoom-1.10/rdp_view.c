@@ -214,13 +214,20 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     th = (textureheight[texnum] >> FRACBITS);
     if (th < 1)
         th = 1;
+    // The raw LOAD_TILE path addresses source rows in texture-period-relative
+    // coordinates, whose fixed-point encoding caps at 1024 texels
+    // (rdpq_load_tile); no stock DOOM texture is taller than 128, so this
+    // refusal is theoretical (custom-WAD guard).
+    if (th > 1023)
+        return NULL;
 
     // The transpose width is the texture's power-of-two sampling period
     // (R_GetColumn masks with texturewidthmask), NOT a fixed 64: see BUG-D note
-    // above. Wider periods than 2048 can't tile at even 1 TMEM row; narrower
+    // above. Wider periods than 512 can't be addressed by LOAD_TILE (S
+    // coordinate caps at 1024) and tile at <= 4 TMEM rows anyway; narrower
     // than 8 break band alignment -- both refuse to route (CPU keeps the seg).
     tw = texturewidthmask[texnum] + 1;
-    if (tw < DL_MIN_TEX_W || tw > DL_TMEM_HALF)
+    if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
 
     // PU_STATIC until DL_PresentEnd demotes it (see lifetime note above); user
@@ -847,8 +854,6 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
     cur = t0;
     for (guard = 0; cur < t1 - (1.0f / 1024.0f) && guard < 256; guard++)
     {
-        surface_t       surf;
-        rdpq_texparms_t parms;
         int     period_base;    // floor(cur/blkh)*blkh, texels
         int     src_lo;         // band's first source row, in [0,blkh)
         int     src_cap;        // band row ceiling (TMEM cap / period edge)
@@ -887,20 +892,26 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
         if (rows_up < cap && src_lo + rows_up < blkh)
             rows_up++;
 
-        // Band-local upload at TMEM row 0; S wraps with the texture's pow2
-        // period (mask = log2(blkw), matching R_GetColumn's `& mask`). Skip the
-        // upload (and its autosync) when the identical band is already resident
-        // from the previous record's draw (UPLOAD DEDUP above).
+        // Band load via the RAW tile API (the Stage-3 DL_BUILD collapse).
+        // rdpq_tex_upload costs ~50 us of CPU per call (tex-loader setup); at
+        // the measured ~150 band uploads/frame that alone was ~7.5 ms of the
+        // ~9.6 ms DL_BUILD wall. The caller (DL_Flush) now points the RDP at
+        // the FULL row-major block once per texture (rdpq_set_texture_image +
+        // rdpq_set_tile: S mask = log2(blkw) wraps like R_GetColumn's `& mask`,
+        // T clamped), and each band is a single LOAD_TILE of the band's source
+        // rows (~1 us CPU): TMEM fill is identical, the tile-size registers
+        // recorded by LOAD_TILE give the same band-edge T clamp the old
+        // per-band surface upload provided. LOAD_TILE addresses the texture in
+        // PERIOD-RELATIVE rows, so the triangles below use base=period_base
+        // (not band-local rows): the sampled texels are unchanged.
+        // Skip the load (and its autosync) when the identical band is already
+        // resident from the previous record's draw (UPLOAD DEDUP above).
         bandsrc = block + (src_lo * blkw);
         if (bandsrc != dl_last_up_block
             || src_lo != dl_last_up_lo
             || rows_up != dl_last_up_rows)
         {
-            surf = surface_make_linear(bandsrc, FMT_CI8, blkw, rows_up);
-            memset(&parms, 0, sizeof(parms));
-            parms.s.repeats = REPEAT_INFINITE;  // wrap S (texture column)
-            parms.t.repeats = 1;                // clamp T at the band edges
-            rdpq_tex_upload(TILE0, &surf, &parms);
+            rdpq_load_tile(TILE0, 0, src_lo, blkw, src_lo + rows_up);
             dl_last_up_block = bandsrc;
             dl_last_up_lo    = src_lo;
             dl_last_up_rows  = rows_up;
@@ -943,8 +954,10 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
             continue;
         }
 
-        // Band-local, fraction-preserved T per corner.
-        base = (float)(period_base + src_lo);
+        // Period-relative, fraction-preserved T per corner (LOAD_TILE records
+        // the band's tile size in period-relative rows, so T is offset by the
+        // period base only -- NOT by src_lo as the old band-local upload was).
+        base = (float)period_base;
 
         {
             float tl[5] = { xl, ytl, s_l, a_l - base, w->invw_l };
@@ -1067,6 +1080,31 @@ void DL_Flush(void)
         // asynchronously (see DL_RowMajorBlock lifetime note / DL_PresentEnd).
         // Once per texture, not once per record (Stage 2 over-pinned per seg).
         DL_MarkInFlight(tex);
+
+        // Point the RDP at the FULL row-major block and configure TILE0 ONCE
+        // per texture (the raw-tile DL_BUILD collapse; see the band-load note
+        // in DL_DrawRecord). The tile wraps S with the texture's pow2 period
+        // (mask = log2(blkw), matching R_GetColumn's `& texturewidthmask`) and
+        // clamps T (mask 0 forces clamping) at the band rows each LOAD_TILE
+        // records into the tile-size registers. tmem_addr 0 keeps every band
+        // in the lower TMEM half beside the resident TLUT; tmem_pitch = blkw
+        // bytes (CI8, pow2 >= 8, always a multiple of 8).
+        {
+            surface_t        texsurf;
+            rdpq_tileparms_t tp;
+            int              maskbits = 0;
+            int              wbit;
+
+            for (wbit = blkw; wbit > 1; wbit >>= 1)
+                maskbits++;
+
+            texsurf = surface_make_linear(block, FMT_CI8, blkw, blkh);
+            rdpq_set_texture_image(&texsurf);
+            memset(&tp, 0, sizeof(tp));
+            tp.s.mask  = maskbits;      // wrap S over the sampling period
+            tp.t.clamp = true;          // clamp T at the loaded band's rows
+            rdpq_set_tile(TILE0, FMT_CI8, 0, blkw, &tp);
+        }
 
         for (ridx = dl_bucket_head[tex]; ridx >= 0;
              ridx = dl_walls[ridx].bucket_next)
