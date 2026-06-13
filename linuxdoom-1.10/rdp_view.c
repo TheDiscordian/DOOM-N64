@@ -1624,9 +1624,30 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     // -- the over-extent texels wrap and re-sample within the loaded window, a
     // bounded minification artifact on extreme near floors (accepted; the
     // overflow class is documented). Most spans are << 32 rows (one band).
-    rows = vhi - vlo + 1;
-    if (rows > 32) rows = 32;
-    if (rows < 1)  rows = 1;
+    //
+    // UPLOAD-DEDUP WIDENING (the perf lever -- per-span LOAD_TILE is the plane
+    // path's DL_BUILD floor). Always load a FULL 32-row window (the TMEM cap),
+    // and ALIGN its base to a 16-row grid that still contains the span's exact
+    // [vlo,vhi] extent. Consecutive spans of a flat drift V slowly row-to-row,
+    // so an aligned 32-row window is reused across many spans -- the resident-
+    // window containment check below then skips the LOAD_TILE entirely. This
+    // collapses the dominant per-span upload to ~once per distance band.
+    {
+        int ext = vhi - vlo + 1;            // exact span V extent
+        if (ext > 32) ext = 32;             // near-floor clamp (as before)
+        // Align the 32-row window base to a 16-grid that still covers [vlo,vhi].
+        // Prefer the lowest 16-aligned base whose +32 window contains vhi.
+        int base = (vlo / 16) * 16;
+        if (base + 32 < vlo + ext)          // window too low to cover the span
+            base = ((vhi - 31) / 16) * 16;  // raise to cover the top
+        if (base < 0) base = 0;
+        if (base + 32 > 64) base = 64 - 32; // keep inside the 64 period
+        if (base < 0) base = 0;
+        vlo  = base;
+        rows = 32;
+        if (vlo + rows > 64) rows = 64 - vlo;
+        if (rows < 1) rows = 1;
+    }
     vhi = vlo + rows - 1;
 
     // U period bias (keep S endpoints in a sane fixed-point range; the tile
@@ -1654,9 +1675,12 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
         dl_last_up_block  = NULL;
     }
 
-    // Load the V window [vlo, vhi] across the full 64-texel width. Period-
-    // relative coords (T offset by vbias is folded into the triangle T below).
-    // Deduped: consecutive spans of a flat at the same distance share a window.
+    // Load the (16-aligned, 32-row) V window across the full 64-texel width.
+    // Period-relative coords; the triangle T (period-relative too) addresses
+    // within [vlo, vlo+rows). Dedup: the window base/rows are 16-aligned and
+    // 32-wide, so a span whose exact V extent already lies inside the RESIDENT
+    // window reuses it -- skip the LOAD_TILE (and its autosync). This is the
+    // dominant DL_BUILD saving for the plane path.
     if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
     {
         rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
