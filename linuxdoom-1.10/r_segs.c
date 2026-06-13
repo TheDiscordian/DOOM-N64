@@ -546,9 +546,24 @@ void R_RenderSegLoop (void)
     // texturemid + texture select which records map to which texture bucket.
     if (rdp_route)
     {
+#ifdef N64_BENCH
+	// ACCOUNTING ONLY (zero runtime effect): bracket the wall-emit
+	// (run-coalesce + DL_EmitRunPiece deviation scan + DL_EmitWallTier)
+	// into the otherwise-unused PLANE_EMIT slot, so the bench reports
+	// wall-emit cost SEPARATELY from BSP traversal instead of hiding it
+	// inside BSP_WALK. The diagnosis measured this hidden emit at
+	// ~1800-2046us; without this split a future round cannot see emit
+	// vs traversal. PLANE_EMIT is unused for walls (it was reserved for a
+	// future plane-to-RDP move that has not landed), so reusing it here
+	// is free and unambiguous.
+	N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_PLANE_EMIT);
+#endif
 	DL_RouteEmit(DL_TIER_MID, l_rw_midtexturemid,    l_midtexture,    centery);
 	DL_RouteEmit(DL_TIER_TOP, l_rw_toptexturemid,    l_toptexture,    centery);
 	DL_RouteEmit(DL_TIER_BOT, l_rw_bottomtexturemid, l_bottomtexture, centery);
+#ifdef N64_BENCH
+	N64Bench_PhaseSwitch(BPH_PLANE_EMIT, BPH_BSP_WALK);
+#endif
     }
 #endif
 

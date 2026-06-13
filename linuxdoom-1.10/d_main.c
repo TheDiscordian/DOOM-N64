@@ -907,12 +907,19 @@ void D_DoomLoop (void)
 	                        // pass, so newtics has a fixed host-independent
 	                        // cadence and the scripted playthrough never forks.
 	N64Bench_LoopBegin();   // brackets the whole iteration (sim+audio+display)
-	// RDP_BUSY brackets the async-RDP busy window read at frame top. Once the
-	// world renders on the RDP, the RDP-done timestamp (via detach_cb) is read
-	// here non-serializing so a too-slow RDP surfaces as rising counted time
-	// (Q9). ~0 in this stage (RDP draws only the present blit, as today).
-	N64Bench_PhaseBegin(BPH_RDP_BUSY);
-	N64Bench_PhaseEnd(BPH_RDP_BUSY);
+	// (ACCOUNTING HONESTY) The old empty BPH_RDP_BUSY Begin/End pair here
+	// measured NOTHING -- it bracketed zero work at frame top and reported a
+	// spurious ~4-5us. RDP_BUSY is ALREADY measured where it actually occurs:
+	// the buffer-flip busy-spin in I_FinishUpdate (i_video_n64.c, around the
+	// `while (doom_screen8_rdp_busy[next_idx]) ;` loop), which is the only
+	// point the CPU can wait on a too-slow async RDP. The overlap diagnosis
+	// confirmed that spin is ~0 (spin_hits=0): the RDP drains inside the CPU
+	// residual, so a near-zero RDP_BUSY is the CORRECT reading, not a missing
+	// one. The empty frame-top pair is removed so the phase reflects only the
+	// real spin. (A serializing post-flush RDP-done read would inflate the
+	// very overlap it measures and break determinism, so it is deliberately
+	// NOT added to the shipping bench path -- that read lives only in the
+	// throwaway DL_DIAG diagnostic build.)
 #endif
 
 	// process one or more tics

@@ -360,16 +360,19 @@ void N64Bench_DisplayEnd(void)
     // together replace the old single BSP phase. KEY_CLEAR is a standalone
     // bracket at the view-render entry (not nested in another subtracted
     // phase), so it is subtracted here -- otherwise its cost would leak into
-    // HUD. The RDP renderer's emit phases (PLANE_EMIT/MASKED_EMIT) are nested
-    // inside PLANES/MASKED so they are not subtracted (doing so would
-    // double-count). DL_BUILD and RDP_BUSY are DISJOINT from PRESENT:
-    // I_FinishUpdate PAUSES the PRESENT bracket around DL_Flush and around the
-    // buffer-flip busy spin via PhaseSwitch (the Stage-3 attribution fix --
-    // previously PRESENT contained DL_BUILD and the phase table double-counted
-    // ~10 ms), so both must be subtracted here or their time leaks into HUD.
+    // HUD. PLANE_EMIT now carries the RDP wall-emit (run-coalesce +
+    // DL_EmitRunPiece), bracketed in r_segs.c by SWITCHING OUT of BSP_WALK --
+    // so it is DISJOINT from BSP_WALK (and does not run inside PLANES), and MUST
+    // be subtracted here or the emit cost would leak into HUD. MASKED_EMIT stays
+    // unused (sprites are not RDP-routed) and reads 0. DL_BUILD and RDP_BUSY are
+    // DISJOINT from PRESENT: I_FinishUpdate PAUSES the PRESENT bracket around
+    // DL_Flush and around the buffer-flip busy spin via PhaseSwitch (the Stage-3
+    // attribution fix -- previously PRESENT contained DL_BUILD and the phase
+    // table double-counted ~10 ms), so both must be subtracted here too.
     display_tk = (uint32_t)(get_ticks() - display_start_ticks);
     inside_tk = cur_phase_tk[BPH_BSP_WALK] + cur_phase_tk[BPH_SEG_RASTER]
               + cur_phase_tk[BPH_PLANES] + cur_phase_tk[BPH_MASKED]
+              + cur_phase_tk[BPH_PLANE_EMIT] + cur_phase_tk[BPH_MASKED_EMIT]
               + cur_phase_tk[BPH_KEY_CLEAR] + cur_phase_tk[BPH_PRESENT]
               + cur_phase_tk[BPH_DL_BUILD] + cur_phase_tk[BPH_RDP_BUSY];
     cur_phase_tk[BPH_HUD] = (display_tk > inside_tk) ? (display_tk - inside_tk) : 0;
