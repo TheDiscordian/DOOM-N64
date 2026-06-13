@@ -197,10 +197,17 @@ typedef struct
 static dl_rowmajor_t* dl_rowmajor;      // [numtextures]
 static int            dl_rowmajor_inited;
 
-// 8-byte-aligned scratch for CI4 sub-palette TLUT uploads (rdpq_tex_upload_tlut
-// reads the source via set_texture_image_raw; a misaligned source shifts the
-// load by init_offset). 16 RGBA5551 entries = 32 bytes.
-static uint16_t       dl_subpal_up[16] __attribute__((aligned(8)));
+// Per-slot 8-byte-aligned scratch for CI4 sub-palette TLUT uploads. ONE buffer
+// per palette slot (16), NOT a single shared one: rdpq_tex_upload_tlut records
+// the source's PHYSICAL address into the rspq stream and the LOAD_TLUT reads it
+// ASYNCHRONOUSLY when the RDP processes the command -- long after DL_Flush has
+// returned. A single shared scratch overwritten per texture had every LOAD_TLUT
+// read the SAME (last-written) buffer, so all walls sampled one texture's
+// palette (the whole-frame colour-swap bug: grey STARTAN3 walls rendered brown,
+// blue COMPTILE rendered green). Each slot keeps its own buffer alive for the
+// frame's async window; 16 slots x 16 RGBA5551 = 512 B. 8-byte aligned so
+// rdpq_tex_upload_tlut's init_offset is 0.
+static uint16_t       dl_subpal_up[16][16] __attribute__((aligned(8)));
 
 // Diagnostic: count LOAD_TILE band loads emitted this present (the headline
 // CI4 lever -- CI8 band-split ran ~150/frame; CI4 should be far fewer). Summed
@@ -2176,12 +2183,19 @@ void DL_Flush(void)
             surface_t texsurf;
 
             slot->pal_slot = (uint8_t)pal_slot;
-            // Upload the sub-palette through an 8-byte-aligned scratch so
-            // rdpq_tex_upload_tlut's init_offset is 0 (it reads the TLUT buffer
-            // via set_texture_image_raw; a misaligned source shifts the load).
-            memcpy(dl_subpal_up, slot->subpal, sizeof(slot->subpal));
-            data_cache_hit_writeback(dl_subpal_up, sizeof(slot->subpal));
-            rdpq_tex_upload_tlut(dl_subpal_up, pal_slot * 16, 16);
+            // Copy this texture's sub-palette into ITS slot's persistent scratch
+            // (the LOAD_TLUT reads it asynchronously; per-slot buffers keep each
+            // alive through the frame's async window). Tail frames with >16
+            // distinct textures reuse a slot: the prior owner's triangles must
+            // have drained before the buffer is overwritten, so sync there.
+            if (ti >= 16)
+            {
+                rdpq_sync_tile();
+                rdpq_sync_load();
+            }
+            memcpy(dl_subpal_up[pal_slot], slot->subpal, sizeof(slot->subpal));
+            data_cache_hit_writeback(dl_subpal_up[pal_slot], sizeof(slot->subpal));
+            rdpq_tex_upload_tlut(dl_subpal_up[pal_slot], pal_slot * 16, 16);
 
             // Point the RDP at the FULL row-major CI4 block ONCE per texture,
             // interpreted as an I8 byte image (the CI4 LOAD goes through the I8
