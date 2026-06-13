@@ -758,14 +758,10 @@ void D_Display (void)
 	}
 
 
-#ifdef N64_BENCH
-    // DL_BUILD brackets the RDP renderer's display-list flush (DL_Flush:
-    // per-texture upload + triangle/rect emit into the rspq stream), which
-    // lands here after the player loop and before the HUD overlay once the
-    // world moves to the RDP. ~0 in this stage (no display list yet).
-    N64Bench_PhaseBegin(BPH_DL_BUILD);
-    N64Bench_PhaseEnd(BPH_DL_BUILD);
-#endif
+    // (The DL_BUILD bench bracket lives in I_FinishUpdate around DL_Flush --
+    // the flush runs inside the present seam, not here. A stale zero-length
+    // placeholder bracket here was removed with the Stage-3 phase-attribution
+    // fix.)
 
     if (gamestate == GS_LEVEL && gametic && splitplayers < 2)
 	HU_Drawer ();

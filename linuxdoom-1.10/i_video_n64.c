@@ -1142,11 +1142,19 @@ void I_FinishUpdate(void)
             rdpq_set_scissor(vx0, vy0, vx1, vy1);
 
 #ifdef N64_BENCH
-            N64Bench_PhaseBegin(BPH_DL_BUILD);
+            // PAUSE the enclosing PRESENT bracket (d_main.c wraps the whole
+            // I_FinishUpdate) while DL_Flush runs, so DL_BUILD and PRESENT are
+            // DISJOINT accumulators. Bracketing DL_BUILD inside an open
+            // PRESENT (the previous code) double-counted the entire flush in
+            // both phases -- the Stage-3 phase table showed present=11.9ms of
+            // which ~10ms was DL_BUILD again. The wipe melt loop calls
+            // I_FinishUpdate with NO open PRESENT bracket; the open-mask guard
+            // in N64Bench_PhaseSwitch makes the pause a safe no-op there.
+            N64Bench_PhaseSwitch(BPH_PRESENT, BPH_DL_BUILD);
 #endif
             DL_Flush();
 #ifdef N64_BENCH
-            N64Bench_PhaseEnd(BPH_DL_BUILD);
+            N64Bench_PhaseSwitch(BPH_DL_BUILD, BPH_PRESENT);
 #endif
 
             // Restore full-screen scissor + persp off for the overlay COPY blit.
@@ -1314,13 +1322,16 @@ void I_FinishUpdate(void)
     // time, non-serializing (we never force an rspq_wait here). It stays ~0 as
     // long as the RDP drains inside the CPU residual.
 #ifdef N64_BENCH
-    N64Bench_PhaseBegin(BPH_RDP_BUSY);
+    // Pause PRESENT around the spin so RDP_BUSY is disjoint from it (same
+    // attribution rule as the DL_BUILD pause above; safe no-op when the wipe
+    // loop calls I_FinishUpdate outside a PRESENT bracket).
+    N64Bench_PhaseSwitch(BPH_PRESENT, BPH_RDP_BUSY);
 #endif
     next_idx = n64_draw_idx ^ 1;
     while (doom_screen8_rdp_busy[next_idx])
         ;
 #ifdef N64_BENCH
-    N64Bench_PhaseEnd(BPH_RDP_BUSY);
+    N64Bench_PhaseSwitch(BPH_RDP_BUSY, BPH_PRESENT);
 #endif
 
     // Retire the RDP world state for this present. Sits AFTER the busy spin

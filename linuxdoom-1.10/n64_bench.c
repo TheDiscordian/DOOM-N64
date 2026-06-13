@@ -112,6 +112,7 @@ static unsigned long    bench_frame_count;     // retained records (capped)
 
 static uint32_t         cur_phase_tk[BPH_COUNT];   // accumulates over a frame
 static uint64_t         phase_begin_ticks[BPH_COUNT];
+static uint32_t         phase_open_mask;           // bit n: phase n bracket open
 static uint64_t         loop_start_ticks;          // whole-iteration wall clock
 static int              loop_open;
 static uint64_t         display_start_ticks;       // D_Display wall clock
@@ -286,6 +287,7 @@ void N64Bench_PhaseBegin(int id)
     if (!loop_open || id < 0 || id >= BPH_COUNT)
         return;
     phase_begin_ticks[id] = get_ticks();
+    phase_open_mask |= (1u << id);
 }
 
 void N64Bench_PhaseEnd(int id)
@@ -294,7 +296,15 @@ void N64Bench_PhaseEnd(int id)
         return;
     // Accumulate RAW ticks (no divide): TICKS_TO_US is deferred to commit so
     // the per-phase hot path is only a CP0 read plus an add. Audio brackets
-    // fire twice per frame, hence +=.
+    // fire twice per frame, hence +=. The open-mask guard makes every bracket
+    // safe against unpaired calls: I_FinishUpdate carries PhaseSwitch brackets
+    // that pause/resume PRESENT around DL_BUILD/RDP_BUSY, but the wipe melt
+    // loop calls I_FinishUpdate OUTSIDE any PRESENT bracket -- closing a phase
+    // that was never opened would accumulate a garbage delta from a stale
+    // begin tick.
+    if (!(phase_open_mask & (1u << id)))
+        return;
+    phase_open_mask &= ~(1u << id);
     cur_phase_tk[id] += (uint32_t)(get_ticks() - phase_begin_ticks[id]);
 }
 
@@ -304,10 +314,17 @@ void N64Bench_PhaseSwitch(int end_id, int begin_id)
     if (!loop_open)
         return;
     now = get_ticks();   // single read marks both the close and the open
-    if (end_id >= 0 && end_id < BPH_COUNT)
+    if (end_id >= 0 && end_id < BPH_COUNT
+        && (phase_open_mask & (1u << end_id)))
+    {
+        phase_open_mask &= ~(1u << end_id);
         cur_phase_tk[end_id] += (uint32_t)(now - phase_begin_ticks[end_id]);
+    }
     if (begin_id >= 0 && begin_id < BPH_COUNT)
+    {
         phase_begin_ticks[begin_id] = now;
+        phase_open_mask |= (1u << begin_id);
+    }
 }
 
 void N64Bench_SetTicsRan(int tics)
@@ -344,13 +361,17 @@ void N64Bench_DisplayEnd(void)
     // bracket at the view-render entry (not nested in another subtracted
     // phase), so it is subtracted here -- otherwise its cost would leak into
     // HUD. The RDP renderer's emit phases (PLANE_EMIT/MASKED_EMIT) are nested
-    // inside PLANES/MASKED and DL_BUILD/RDP_BUSY are ~0 in this stage, so they
-    // are not subtracted here (doing so would double-count once they carry
-    // real time).
+    // inside PLANES/MASKED so they are not subtracted (doing so would
+    // double-count). DL_BUILD and RDP_BUSY are DISJOINT from PRESENT:
+    // I_FinishUpdate PAUSES the PRESENT bracket around DL_Flush and around the
+    // buffer-flip busy spin via PhaseSwitch (the Stage-3 attribution fix --
+    // previously PRESENT contained DL_BUILD and the phase table double-counted
+    // ~10 ms), so both must be subtracted here or their time leaks into HUD.
     display_tk = (uint32_t)(get_ticks() - display_start_ticks);
     inside_tk = cur_phase_tk[BPH_BSP_WALK] + cur_phase_tk[BPH_SEG_RASTER]
               + cur_phase_tk[BPH_PLANES] + cur_phase_tk[BPH_MASKED]
-              + cur_phase_tk[BPH_KEY_CLEAR] + cur_phase_tk[BPH_PRESENT];
+              + cur_phase_tk[BPH_KEY_CLEAR] + cur_phase_tk[BPH_PRESENT]
+              + cur_phase_tk[BPH_DL_BUILD] + cur_phase_tk[BPH_RDP_BUSY];
     cur_phase_tk[BPH_HUD] = (display_tk > inside_tk) ? (display_tk - inside_tk) : 0;
 }
 
