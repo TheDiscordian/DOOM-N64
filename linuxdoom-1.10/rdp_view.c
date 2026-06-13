@@ -758,6 +758,19 @@ int DL_WallRouteOn(void)
 //
 // block/blkh/blkw are the record's transpose block (already fetched + pinned by
 // the caller). The caller owns rdpq mode/combiner/TLUT/persp setup.
+//
+// UPLOAD DEDUP (Stage-3 autosync collapse): the band walk uploads a tile-local
+// CI8 strip per band. Within a texture's bucket many records sit at similar
+// depth/T and resolve to the SAME source band (same block ptr + first row +
+// row count), so the previous band already loaded into TMEM is reusable. We
+// cache the last upload's signature and skip the redundant rdpq_tex_upload (and
+// its AUTOSYNC_TILE/LOAD) when it matches -- the single largest DL_BUILD cost.
+// The cache is reset at the top of every DL_Flush (dl_last_up_block=NULL) so it
+// never carries a stale TMEM assumption across present seams.
+static const byte* dl_last_up_block;
+static int         dl_last_up_lo;
+static int         dl_last_up_rows;
+
 static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
 {
     int     cap;            // max tile rows fitting the lower TMEM half
@@ -875,13 +888,23 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
             rows_up++;
 
         // Band-local upload at TMEM row 0; S wraps with the texture's pow2
-        // period (mask = log2(blkw), matching R_GetColumn's `& mask`).
+        // period (mask = log2(blkw), matching R_GetColumn's `& mask`). Skip the
+        // upload (and its autosync) when the identical band is already resident
+        // from the previous record's draw (UPLOAD DEDUP above).
         bandsrc = block + (src_lo * blkw);
-        surf = surface_make_linear(bandsrc, FMT_CI8, blkw, rows_up);
-        memset(&parms, 0, sizeof(parms));
-        parms.s.repeats = REPEAT_INFINITE;  // wrap S (texture column)
-        parms.t.repeats = 1;                // clamp T at the band edges
-        rdpq_tex_upload(TILE0, &surf, &parms);
+        if (bandsrc != dl_last_up_block
+            || src_lo != dl_last_up_lo
+            || rows_up != dl_last_up_rows)
+        {
+            surf = surface_make_linear(bandsrc, FMT_CI8, blkw, rows_up);
+            memset(&parms, 0, sizeof(parms));
+            parms.s.repeats = REPEAT_INFINITE;  // wrap S (texture column)
+            parms.t.repeats = 1;                // clamp T at the band edges
+            rdpq_tex_upload(TILE0, &surf, &parms);
+            dl_last_up_block = bandsrc;
+            dl_last_up_lo    = src_lo;
+            dl_last_up_rows  = rows_up;
+        }
 
         // Slice corners. T iso-lines of the wall's projective map are straight
         // lines in screen space, so the slice between T=cur and T=band_end is
@@ -1008,14 +1031,20 @@ void DL_Flush(void)
     dl_drop_count = 0;
 #endif
 
+    // Reset the upload-dedup cache: no band is resident in TMEM at the start of
+    // a flush (the caller just set up the world mode/combiner/tile state).
+    dl_last_up_block = NULL;
+    dl_last_up_lo    = -1;
+    dl_last_up_rows  = -1;
+
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
     // every record chained in that texture's bucket. All of a texture's uploads
     // (the band tiles of its records) are issued consecutively, so the tile
     // descriptor never thrashes between unrelated textures across the frame --
-    // the per-seg interleaving Stage 2 produced is gone. Walking dl_touched[]
-    // (the sparse set of textures used) keeps this O(records), not
-    // O(numtextures).
+    // the per-seg interleaving Stage 2 produced is gone, and consecutive records
+    // sharing a band skip the re-upload. Walking dl_touched[] (the sparse set of
+    // textures used) keeps this O(records), not O(numtextures).
     for (ti = 0; ti < dl_touched_count; ti++)
     {
         int     tex = dl_touched[ti];
