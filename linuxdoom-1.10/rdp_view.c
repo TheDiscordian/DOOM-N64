@@ -777,10 +777,21 @@ int DL_WallRouteOn(void)
 static const byte* dl_last_up_block;
 static int         dl_last_up_lo;
 static int         dl_last_up_rows;
+static int         dl_last_up_c0;      // S window origin of the resident band
+// Tile-descriptor state (ADAPTIVE S WINDOW): the tile pitch/clamp now vary per
+// record (see the window note in DL_DrawRecord), so SET_TILE moved from
+// per-texture (DL_Flush) into the band path, deduped on (width, wrap). Reset
+// alongside the upload dedup at every flush and at every texture switch (the
+// wrap mask depends on the texture period).
+static int         dl_last_tile_lw;
+static int         dl_last_tile_wrap;
 
 static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
 {
     int     cap;            // max tile rows fitting the lower TMEM half
+    int     lw;             // adaptive S window width (texels; pow2 <= blkw)
+    int     c0;             // S window origin within the period (0 if full)
+    int     wrap;           // 1: full-period tile, hardware S wrap
     uint32_t prim;
     float   xl, xr;
     float   s_l, s_r;       // S endpoints, period-bias-reduced (BUG D)
@@ -788,11 +799,7 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
     float   tr0, tr1;       // right-edge texel-T range (top..bottom)
     float   t0, t1;         // union texel-T range covered by the quad
 
-    // Per-width TMEM tile cap: a CI8 tile is blkw bytes/row and must fit the
-    // lower 2 KB TMEM half beside the resident TLUT (64-wide: 32 rows,
-    // 128-wide: 16, 256-wide: 8 -- Q7, corrected for wide textures).
-    cap = DL_TMEM_HALF / blkw;
-    if (cap < 1)
+    if (blkw < 1)
         return 0;
 
     // PRIM = colormap-level brightness (Q8). TEX0*PRIM in 1-cycle.
@@ -814,6 +821,83 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
         float bias = floorf(smin / (float)blkw) * (float)blkw;
         s_l = w->s_l - bias;
         s_r = w->s_r - bias;
+    }
+
+    // ADAPTIVE S WINDOW (band/triangle collapse). The TMEM band cap is
+    // 2048/tile_width rows, so wide textures band-split aggressively (a
+    // 128-wide texture caps at 16 rows: a full-height wall = 8 bands = 16
+    // triangles PER RECORD), and the triangle/band volume -- not the upload
+    // helper -- is what keeps DL_BUILD heavy. Most records sample a NARROW S
+    // range (run width in columns ~ texels at normal angles), so when the
+    // biased S range [smin,smax] fits inside one texture period, load only a
+    // power-of-two S window [c0, c0+lw) of the block instead of full rows:
+    // cap doubles per halving of lw, collapsing the band count (typical
+    // 30-px run on a 128-wide texture: 8 bands -> 2). Sampling is identical:
+    // the window covers [floor(smin)-1, ceil(smax)+1] (a margin texel each
+    // side), the tile CLAMPS S at the window edges it never reaches, and
+    // triangle S values are unchanged (LOAD_TILE keeps original coords).
+    // Records whose S range crosses a period seam need the hardware wrap and
+    // keep the full-width path (mask = log2(blkw)).
+    {
+        float smin = (s_l < s_r) ? s_l : s_r;
+        float smax = (s_l < s_r) ? s_r : s_l;
+        int   ilo = (int)floorf(smin) - 1;
+        int   ihi = (int)ceilf(smax) + 1;
+
+        lw = blkw;
+        c0 = 0;
+        wrap = 1;
+        if (ilo < 0)
+            ilo = 0;
+        if (ihi < blkw)
+        {
+            int need = ihi - ilo + 1;
+            int w2 = 8;
+            while (w2 < need)
+                w2 <<= 1;
+            if (w2 < blkw)
+            {
+                lw = w2;
+                wrap = 0;
+                c0 = ilo;
+                if (c0 + lw > blkw)
+                    c0 = blkw - lw;
+            }
+        }
+    }
+
+    // Per-width TMEM tile cap: lw bytes/row (CI8) against the lower 2 KB TMEM
+    // half beside the resident TLUT (64-wide: 32 rows, 128-wide: 16,
+    // 256-wide: 8 -- Q7; the adaptive window above raises it further).
+    cap = DL_TMEM_HALF / lw;
+    if (cap < 1)
+        return 0;
+
+    // Configure TILE0 for this record's window geometry (deduped: most
+    // consecutive records of a texture share lw/wrap). Pitch = lw bytes
+    // (pow2 >= 8). Wrap mode masks S with the texture period; window mode
+    // clamps (mask 0 forces clamp). T always clamps at the loaded band rows.
+    // A tile change invalidates the resident band (TMEM layout changed).
+    if (lw != dl_last_tile_lw || wrap != dl_last_tile_wrap)
+    {
+        rdpq_tileparms_t tp;
+
+        memset(&tp, 0, sizeof(tp));
+        if (wrap)
+        {
+            int maskbits = 0;
+            int wbit;
+            for (wbit = blkw; wbit > 1; wbit >>= 1)
+                maskbits++;
+            tp.s.mask = maskbits;
+        }
+        else
+            tp.s.clamp = true;
+        tp.t.clamp = true;
+        rdpq_set_tile(TILE0, FMT_CI8, 0, lw, &tp);
+        dl_last_tile_lw   = lw;
+        dl_last_tile_wrap = wrap;
+        dl_last_up_block  = NULL;
     }
 
     // Per-edge T ranges (texel rows at the rect's top/bottom screen rows,
@@ -895,26 +979,28 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
         // Band load via the RAW tile API (the Stage-3 DL_BUILD collapse).
         // rdpq_tex_upload costs ~50 us of CPU per call (tex-loader setup); at
         // the measured ~150 band uploads/frame that alone was ~7.5 ms of the
-        // ~9.6 ms DL_BUILD wall. The caller (DL_Flush) now points the RDP at
-        // the FULL row-major block once per texture (rdpq_set_texture_image +
-        // rdpq_set_tile: S mask = log2(blkw) wraps like R_GetColumn's `& mask`,
-        // T clamped), and each band is a single LOAD_TILE of the band's source
-        // rows (~1 us CPU): TMEM fill is identical, the tile-size registers
-        // recorded by LOAD_TILE give the same band-edge T clamp the old
-        // per-band surface upload provided. LOAD_TILE addresses the texture in
-        // PERIOD-RELATIVE rows, so the triangles below use base=period_base
-        // (not band-local rows): the sampled texels are unchanged.
+        // ~9.6 ms DL_BUILD wall. DL_Flush points the RDP at the FULL
+        // row-major block once per texture (rdpq_set_texture_image); the
+        // TILE0 descriptor is configured above per record-window (deduped),
+        // and each band is a single LOAD_TILE of the band's source rows and
+        // the record's S window (~1 us CPU): the tile-size registers recorded
+        // by LOAD_TILE give the same band-edge T clamp the old per-band
+        // surface upload provided, in PERIOD-RELATIVE coordinates -- so the
+        // triangles below use base=period_base (not band-local rows) and the
+        // sampled texels are unchanged.
         // Skip the load (and its autosync) when the identical band is already
         // resident from the previous record's draw (UPLOAD DEDUP above).
         bandsrc = block + (src_lo * blkw);
         if (bandsrc != dl_last_up_block
             || src_lo != dl_last_up_lo
-            || rows_up != dl_last_up_rows)
+            || rows_up != dl_last_up_rows
+            || c0 != dl_last_up_c0)
         {
-            rdpq_load_tile(TILE0, 0, src_lo, blkw, src_lo + rows_up);
+            rdpq_load_tile(TILE0, c0, src_lo, c0 + lw, src_lo + rows_up);
             dl_last_up_block = bandsrc;
             dl_last_up_lo    = src_lo;
             dl_last_up_rows  = rows_up;
+            dl_last_up_c0    = c0;
         }
 
         // Slice corners. T iso-lines of the wall's projective map are straight
@@ -1049,6 +1135,9 @@ void DL_Flush(void)
     dl_last_up_block = NULL;
     dl_last_up_lo    = -1;
     dl_last_up_rows  = -1;
+    dl_last_up_c0    = -1;
+    dl_last_tile_lw   = -1;
+    dl_last_tile_wrap = -1;
 
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
@@ -1081,29 +1170,20 @@ void DL_Flush(void)
         // Once per texture, not once per record (Stage 2 over-pinned per seg).
         DL_MarkInFlight(tex);
 
-        // Point the RDP at the FULL row-major block and configure TILE0 ONCE
-        // per texture (the raw-tile DL_BUILD collapse; see the band-load note
-        // in DL_DrawRecord). The tile wraps S with the texture's pow2 period
-        // (mask = log2(blkw), matching R_GetColumn's `& texturewidthmask`) and
-        // clamps T (mask 0 forces clamping) at the band rows each LOAD_TILE
-        // records into the tile-size registers. tmem_addr 0 keeps every band
-        // in the lower TMEM half beside the resident TLUT; tmem_pitch = blkw
-        // bytes (CI8, pow2 >= 8, always a multiple of 8).
+        // Point the RDP at the FULL row-major block ONCE per texture (the
+        // raw-tile DL_BUILD collapse; see the band-load note in
+        // DL_DrawRecord). The TILE0 descriptor itself is configured inside
+        // the band path -- its pitch and S clamp/wrap depend on the record's
+        // adaptive S window -- and deduped there; invalidate that state here
+        // because the wrap mask is per-texture-period.
         {
-            surface_t        texsurf;
-            rdpq_tileparms_t tp;
-            int              maskbits = 0;
-            int              wbit;
-
-            for (wbit = blkw; wbit > 1; wbit >>= 1)
-                maskbits++;
+            surface_t texsurf;
 
             texsurf = surface_make_linear(block, FMT_CI8, blkw, blkh);
             rdpq_set_texture_image(&texsurf);
-            memset(&tp, 0, sizeof(tp));
-            tp.s.mask  = maskbits;      // wrap S over the sampling period
-            tp.t.clamp = true;          // clamp T at the loaded band's rows
-            rdpq_set_tile(TILE0, FMT_CI8, 0, blkw, &tp);
+            dl_last_tile_lw   = -1;
+            dl_last_tile_wrap = -1;
+            dl_last_up_block  = NULL;
         }
 
         for (ridx = dl_bucket_head[tex]; ridx >= 0;
