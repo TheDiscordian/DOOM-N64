@@ -598,19 +598,27 @@ present blit runs `rdpq_set_mode_copy(true)`, whose alpha-compare discards the a
 underneath in the same rspq stream. The **same index doubles** as the sprite/masked-texture
 transparent-gap index: alpha-compare ON for masked draws keys out the gaps, OFF for opaque
 walls/flats — so opaque world art may legitimately *contain* the key index without being keyed out.
-**Erase-to-key is event-driven (landed in the Stage-2 closure round, earlier than planned).** The
-original scaffolding — a full-view key pre-clear each frame — relied on "software covers every view
-pixel", which vanilla does not guarantee: rare per-column coverage gaps (e.g. a 1-px seg whose
-plane rows go unmarked) left key pixels OUTSIDE the keyed box, and the present blitted them opaque
-as the key colour during normal play (the stale-key sparkle, 28-px class). The seg loop now writes
-the key into exactly the routed seg's suppressed column spans (`R_FillColumnKey`, r_segs.c);
-`I_N64KeyClearView` is retired. Companion rule: **any consumer that recycles CI8 screen content
-must scrub key pixels first** — the wipe melt captures (start = previously presented buffer, end =
-the freshly rendered draw buffer) carry the suppression holes, whose backing RDP fill exists only
-in the 16bpp display fb; unscrubbed they repaint as opaque key colour for the whole melt
-(`I_N64WipeScrubKey`, f_wipe.c — replaces key pixels with the pixel above; safe because the key is
-reserved out of the colormap-output closure, so during level play only suppression holes can hold
-it). The KEY_CLEAR bench phase remains in the enum and reads 0.
+**Erase-to-key is the BATCHED VIEW CLEAR + FULL-VIEW keyed box (Stage 3; supersedes the Stage-2
+event-driven per-column erase).** History: Stage 1 used a full-view pre-clear paired with a
+*dynamic* keyed box (the record bbox); key pixels outside that box blitted opaque as the key
+colour (the stale-key sparkle, 28-px class), so the Stage-2 closure round retired the clear for an
+event-driven per-column erase (`R_FillColumnKey` at exactly the routed seg's suppressed spans).
+That was sized for ONE routed seg: at Stage-3 all-walls scale it wrote ~1 uncached byte per wall
+pixel per frame — the same store count as the colfunc it replaced, ~3.5–4 ms of the 5.2 ms flag-ON
+`seg_rast` wall. Stage 3 therefore resurrects the batched clear (`I_N64KeyClearView`, ~54 KB in
+64-bit stores, ~0.34 ms in the named KEY_CLEAR phase) and closes the sparkle mechanism
+*structurally* instead: the present's keyed box is the **whole view window** whenever the clear
+armed it this frame, so a view-window key pixel is always alpha-compare-revealed, never
+opaque-blitted. Vanilla per-column coverage gaps now reveal 3-presents-old display-fb content (the
+composited previous frame — the same stale-content artifact class as vanilla's own unwritten
+pixels). With the wall A/B toggle on CPU no clear runs and no key pixels exist (single opaque
+software-identical blit). `R_FillColumnKey` is deleted. Companion rule unchanged: **any consumer
+that recycles CI8 screen content must scrub key pixels first** — the wipe melt captures carry the
+suppression holes, whose backing RDP fill exists only in the 16bpp display fb; unscrubbed they
+repaint as opaque key colour for the whole melt (`I_N64WipeScrubKey`, f_wipe.c — replaces key
+pixels with the pixel above; safe because the key is reserved out of the colormap-output closure).
+The clear runs at buffer-acquisition time (view-render entry), so the buffer `I_ReadScreen` reads
+for the wipe start capture keeps its content until reuse — no new wipe hazard.
 
 **Present-blit carving (Stage-2 closure note) — sub-rect blits are LOAD-BEARING; never carve a
 COPY-mode blit with the scissor.** The keyed box + 4 opaque bands were originally full-surface
