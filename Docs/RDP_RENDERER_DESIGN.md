@@ -582,14 +582,48 @@ present blit runs `rdpq_set_mode_copy(true)`, whose alpha-compare discards the a
 underneath in the same rspq stream. The **same index doubles** as the sprite/masked-texture
 transparent-gap index: alpha-compare ON for masked draws keys out the gaps, OFF for opaque
 walls/flats — so opaque world art may legitimately *contain* the key index without being keyed out.
-**Temporary scaffolding:** while the view-window CPU drawers are being removed stage-by-stage, the
-frame begins (when `n64_use_rdp_renderer` is ON) with a batched 64-bit key-clear of the 3D-view
-region of the CI8 surface (~54 KB, the 320×~168 window) so any pixel the CPU drawers no longer write
-becomes the key and reveals the world. Cost basis: a full-region uncached CI8 fill is the same class
-of write the round-2 "Narrow visplane top[] clear to spanned columns" commit (`0d2ea28`) reduced —
-~54 KB of uncached RDRAM ≈ **0.3–0.6 ms**. This clear is **removed in the final stage** when
-view-window CI8 writes become event-driven erase-to-key. The key-clear lands in a **named bench
-phase** so its cost is visible.
+**Erase-to-key is event-driven (landed in the Stage-2 closure round, earlier than planned).** The
+original scaffolding — a full-view key pre-clear each frame — relied on "software covers every view
+pixel", which vanilla does not guarantee: rare per-column coverage gaps (e.g. a 1-px seg whose
+plane rows go unmarked) left key pixels OUTSIDE the keyed box, and the present blitted them opaque
+as the key colour during normal play (the stale-key sparkle, 28-px class). The seg loop now writes
+the key into exactly the routed seg's suppressed column spans (`R_FillColumnKey`, r_segs.c);
+`I_N64KeyClearView` is retired. Companion rule: **any consumer that recycles CI8 screen content
+must scrub key pixels first** — the wipe melt captures (start = previously presented buffer, end =
+the freshly rendered draw buffer) carry the suppression holes, whose backing RDP fill exists only
+in the 16bpp display fb; unscrubbed they repaint as opaque key colour for the whole melt
+(`I_N64WipeScrubKey`, f_wipe.c — replaces key pixels with the pixel above; safe because the key is
+reserved out of the colormap-output closure, so during level play only suppression holes can hold
+it). The KEY_CLEAR bench phase remains in the enum and reads 0.
+
+**Present-blit carving (Stage-2 closure note) — sub-rect blits are LOAD-BEARING; never carve a
+COPY-mode blit with the scissor.** The keyed box + 4 opaque bands were originally full-surface
+`rdpq_tex_blit(surf, 0, 0, NULL)` calls carved by `rdpq_set_scissor`. Empirically, every
+scissor-carved region painted SOURCE content from x=0 at the region's left edge — i.e. the
+texrect's S anchors at the scissor-clipped span start instead of stepping from the rectangle's own
+edge. Measured twice independently: the fable2-era capture's duplicated HU text sat at x=273 ==
+the trace-known keyed-box kx0=273 exactly; the freeze-aligned revert experiment reproduced a
+duplicate anchored at the box edge (~202, red-profile correlation peak 206) plus an opaque
+key-colour block (an alpha-OFF band's shifted window covering the suppressed key columns). The
+mechanism is NOT in libdragon's CPU layer — `rdpq_rect.h:57-66` compensates `s0` only for `x0<0`
+(command-encoding clamp) and nothing adjusts for scissor; the anchoring is rasterizer-side
+behaviour as emulated by ares' RDP module (vendored paraLLEl-RDP). Real-hardware behaviour is
+unverified here; the sub-rect carving (each region an explicit `rdpq_blitparms_t` s0/t0/width/
+height drawn at its own screen origin) is correct under either reading because it never relies on
+scissor clipping. Reverting ONLY the carving commit on the closure tree brings the whole
+DEFECT-8/9 duplication family back at freeze-aligned frames: 2.5–48% pixel divergence on every
+marker frame, opaque key blocks up to ~13.7k px. The blend-colour alpha threshold is a separate
+load-bearing piece (alpha-compare threshold; see the keyed-box comment in `I_FinishUpdate`) and is
+NOT the duplication mechanism — duplication persisted with the threshold fix in place and vanished
+only with the carving.
+
+**Per-corner T + run-bounding-rect coverage (9173be4) — load-bearing, quantified.** Reverting only
+that commit on the closure tree (freeze-aligned series vs the frozen 25c6ce5 software ground
+truth): 12/16 marker frames track software CLOSER with it, decisively on glancing/clipped walls —
+frame-4096: 7.3% pixel divergence from software with it vs 32.3% without; frame-2560: 13.8% vs
+33.8%; frame-3840: 6.7% vs 15.7% (methodology floor from window-scale normalization is ~3-4%).
+Keep both halves: exact truncated-span coverage prevents keyed-blit punch-through at wall/plane
+junctions, per-corner T reproduces software's texel rows on clipped walls.
 
 - **UI/menus/HUD** (`V_DrawPatch` family `v_video.c:239-407`, `m_menu.c:1437-1528`,
   `hu_lib.c:122-165`): unchanged; write into the overlay surface. Native-RDP text is an optional
