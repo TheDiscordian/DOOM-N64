@@ -991,22 +991,36 @@ void R_RenderPlayerView (player_t* player)
     R_SetupFrame (player);
 
     // RDP renderer dispatch (kill-switch). n64_use_rdp_renderer selects the
-    // RDP-rasterized path over the software colfunc/spanfunc fill. The world
-    // pass is built up stage by stage; in this stage the view is still 100%
-    // software-rendered into the CI8 buffer, so the visible result is identical
-    // regardless of the flag.
+    // RDP-rasterized path over the software colfunc/spanfunc fill.
     //
-    // Erase-to-key is EVENT-DRIVEN (Stage-2 stale-key fix): the seg loop
-    // writes the key index into exactly the routed seg's suppressed column
-    // spans (R_FillColumnKey, r_segs.c), so key pixels can only exist where
-    // an emitted record covers them and the keyed present blit punches them
-    // out. The Stage-1 full-view pre-clear (I_N64KeyClearView) is retired:
-    // it relied on "software covers every view pixel", which vanilla does
-    // not guarantee -- rare per-column coverage gaps kept key pixels OUTSIDE
-    // the keyed box and the present blitted them opaque as the key colour
-    // (the 28-px stale-key sparkle, trace DL_KEYSCAN p=1659). Gap pixels now
-    // keep stale buffer content, byte-identical to the flag-off software
-    // path. The KEY_CLEAR bench phase stays in the enum (reads 0).
+    // Erase-to-key is the BATCHED VIEW CLEAR again (Stage-3 seg_rast
+    // collapse). Stage 2's event-driven per-column erase (R_FillColumnKey at
+    // every suppressed span) was sized for ONE routed seg; with all wall
+    // tiers routed it wrote ~1 uncached byte per wall pixel per frame -- the
+    // same store count as the colfunc it replaced (~3.5-4 ms of the 5.2 ms
+    // flag-ON seg_rast wall). I_N64KeyClearView fills the view window with
+    // the key in 64-bit batches (~6.7k stores) before any drawer runs; CPU
+    // planes/sprites/psprite/HU overwrite their pixels, routed wall spans
+    // stay key for the RDP fill. The Stage-2 sparkle that retired the
+    // original full-view clear (key pixels OUTSIDE the dynamic keyed box
+    // blitted opaque as the key colour, trace DL_KEYSCAN p=1659) is closed
+    // structurally this time: the clear arms a FULL-VIEW keyed box in
+    // I_FinishUpdate, so every view-window key pixel is alpha-compare-
+    // revealed, never opaque-blitted; vanilla coverage gaps reveal
+    // 3-presents-old fb content (the same stale-content artifact class as
+    // vanilla's own unwritten pixels).
+#ifdef N64
+    if (n64_use_rdp_renderer)
+    {
+#ifdef N64_BENCH
+	N64Bench_PhaseBegin(BPH_KEY_CLEAR);
+#endif
+	I_N64KeyClearView();
+#ifdef N64_BENCH
+	N64Bench_PhaseEnd(BPH_KEY_CLEAR);
+#endif
+    }
+#endif
 
     // Clear buffers.
     R_ClearClipSegs ();

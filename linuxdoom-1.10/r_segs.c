@@ -367,6 +367,18 @@ void R_RenderSegLoop (void)
 	    angle = (l_rw_centerangle + xtoviewangle[l_rw_x])>>ANGLETOFINESHIFT;
 	    texturecolumn = l_rw_offset-FixedMul(finetangent[angle],l_rw_distance);
 	    texturecolumn >>= FRACBITS;
+#ifdef N64
+	    // RDP-routed seg: every tier's colfunc is suppressed, so the
+	    // colfunc-only inputs are never read -- skip them, most notably
+	    // the dc_iscale division (~70 VR4300 cycles per column).
+	    // DL_RouteCapture derives the light level from the captured scale
+	    // itself; the masked path (R_RenderMaskedSegRange) computes its own
+	    // iscale/colormap later from maskedtexturecol. The zero-pixel
+	    // colfunc calls a routed mid tier can still make (yl > yh) return
+	    // at their count check before reading any of these.
+	    if (!rdp_route)
+#endif
+	    {
 	    // calculate lighting
 	    index = l_rw_scale>>LIGHTSCALESHIFT;
 
@@ -376,6 +388,7 @@ void R_RenderSegLoop (void)
 	    dc_colormap = l_walllights[index];
 	    dc_x = l_rw_x;
 	    dc_iscale = 0xffffffffu / (unsigned)l_rw_scale;
+	    }
 	}
 
 	// draw the wall tiers
@@ -388,21 +401,16 @@ void R_RenderSegLoop (void)
 #ifdef N64
 	    // RDP-routed mid tier: suppress the CPU pixel write ONLY for columns
 	    // the RDP will actually fill (yl <= yh). Those columns keep the key
-	    // index and the RDP quad shows through; they are exactly the columns
-	    // DL_RouteCapture records and DL_KeyedSpan later keys out, so
-	    // suppressed == recorded == keyed -- no column is left key-index but
-	    // un-keyed (which the present blit would opaque-blit as the key colour).
-	    // Columns with yl > yh fall through to the normal path: l_colfunc draws
-	    // zero pixels there (yl>yh), byte-identical to vanilla, so a
-	    // vertically-clipped part of the routed seg never leaks a stray key
-	    // pixel. KEEP the ceiling/floor clip writes below as the CPU path does.
+	    // index (the batched I_N64KeyClearView wrote it before any drawer
+	    // ran -- Stage-3 replacement for the per-column R_FillColumnKey)
+	    // and the RDP quad shows through via the full-view keyed box.
+	    // Columns with yl > yh fall through to the normal path: l_colfunc
+	    // draws zero pixels there (yl>yh), byte-identical to vanilla. KEEP
+	    // the ceiling/floor clip writes below as the CPU path does.
 	    if (rdp_route && yl <= yh)
 	    {
 		DL_RouteCapture(DL_TIER_MID, l_rw_x, yl, yh, l_rw_scale,
 				texturecolumn, (const void* const*)l_walllights);
-		// Event-driven erase-to-key: write the key index into exactly
-		// this suppressed span (dc_x/dc_yl/dc_yh are already set above).
-		R_FillColumnKey ();
 	    }
 	    else
 #endif
@@ -433,13 +441,14 @@ void R_RenderSegLoop (void)
 #ifdef N64
 		    // RDP-routed top tier (two-sided upper texture). Suppress the
 		    // CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
-		    // mid>=yl), erase to key. KEEP the ceilingclip write below.
+		    // mid>=yl); the span already holds the key from the batched
+		    // view clear (I_N64KeyClearView). KEEP the ceilingclip write
+		    // below.
 		    if (rdp_route)
 		    {
 			DL_RouteCapture(DL_TIER_TOP, l_rw_x, yl, mid, l_rw_scale,
 					texturecolumn,
 					(const void* const*)l_walllights);
-			R_FillColumnKey ();
 		    }
 		    else
 #endif
@@ -482,13 +491,14 @@ void R_RenderSegLoop (void)
 #ifdef N64
 		    // RDP-routed bottom tier (two-sided lower texture). Suppress
 		    // the CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
-		    // mid<=yh), erase to key. KEEP the floorclip write below.
+		    // mid<=yh); the span already holds the key from the batched
+		    // view clear (I_N64KeyClearView). KEEP the floorclip write
+		    // below.
 		    if (rdp_route)
 		    {
 			DL_RouteCapture(DL_TIER_BOT, l_rw_x, mid, yh, l_rw_scale,
 					texturecolumn,
 					(const void* const*)l_walllights);
-			R_FillColumnKey ();
 		    }
 		    else
 #endif

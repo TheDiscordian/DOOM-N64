@@ -1016,11 +1016,12 @@ void I_N64ScanTransparencyKey(void)
     I_Error("I_N64ScanTransparencyKey: no free palette index for transparency key");
 }
 
-// (The Stage-1 full-view key clear, I_N64KeyClearView, is retired: erase-to-
-// key is event-driven at the seg loop's suppressed columns -- R_FillColumnKey,
-// r_segs.c -- so the key index can only exist where an emitted record covers
-// it. See R_RenderPlayerView for the rationale and the stale-key sparkle
-// trace evidence.)
+// (Erase-to-key history: Stage 1 used a full-view pre-clear; Stage 2 retired
+// it for the event-driven per-column R_FillColumnKey because key pixels
+// outside the DYNAMIC keyed box blitted opaque (stale-key sparkle); Stage 3
+// resurrects the batched full-view clear -- I_N64KeyClearView below -- now
+// paired with a FULL-VIEW keyed box so no view-window key pixel is ever
+// opaque-blitted. See R_RenderPlayerView and the clear's comment block.)
 
 // Scrub transparency-key pixels out of a wipe-captured CI8 screen. The wipe
 // captures recycle presented/draw-buffer content that contains the routed
@@ -1059,6 +1060,76 @@ void I_N64WipeScrubKey(byte* scr)
             if (row[x] == key)
                 row[x] = prev[x];
     }
+}
+
+// --- Stage-3 view key-clear + full-view keyed box ---------------------------
+// With ALL wall tiers routed (Stage 3), the per-column event-driven erase
+// (R_FillColumnKey at every suppressed span) wrote ~1 uncached byte per wall
+// pixel per frame -- the same store count as the colfunc it replaced, ~3.5-4 ms
+// of the 5.2 ms flag-ON seg_rast wall. It is replaced by ONE batched 64-bit
+// key-fill of the whole view window at view-render entry (~54 KB / ~6.7k
+// stores, KEY_CLEAR phase): every view pixel starts key, the CPU planes/
+// sprites/psprite/HU overwrite theirs, and the routed wall spans stay key for
+// the RDP fill to show through.
+//
+// The full-view clear's Stage-2 failure mode (the stale-key sparkle: key
+// pixels OUTSIDE the dynamic keyed box blitted OPAQUE as the key colour) is
+// closed STRUCTURALLY by pairing it with a FULL-VIEW keyed box: when the
+// clear armed this frame, the present alpha-compares the ENTIRE view window,
+// so a key pixel is never opaque-blitted -- a vanilla per-column coverage gap
+// reveals the display fb (3-presents-old composite) instead, the same stale-
+// content artifact class as vanilla's own unwritten-pixel behaviour. Opaque
+// world art containing the key index cannot exist INSIDE the view window
+// while the route is on (walls never CPU-draw; the key is reserved out of the
+// colormap-output closure for everything else), so the design rule
+// "alpha-compare never runs over opaque world art" still holds in substance.
+static boolean n64_ci8_view_keyed;       // this draw buffer's view window was
+                                         // key-cleared this frame (arms the
+                                         // present's full-view keyed box)
+
+void I_N64KeyClearView(void)
+{
+    byte*    scr = screens[0];
+    int      x0, y0, w, h, y;
+    byte     key;
+    uint64_t pat;
+
+    if (n64_use_rdp_renderer == 0 || n64_rdp_key_index < 0 || !scr)
+        return;
+    if (!DL_WallRouteOn())
+        return;     // A/B walls-on-CPU: nothing is suppressed, keep CI8 key-free
+
+    x0 = viewwindowx;
+    y0 = viewwindowy;
+    w  = scaledviewwidth;
+    h  = viewheight;
+    if (x0 < 0) { w += x0; x0 = 0; }
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (x0 + w > SCREENWIDTH)  w = SCREENWIDTH - x0;
+    if (y0 + h > SCREENHEIGHT) h = SCREENHEIGHT - y0;
+    if (w <= 0 || h <= 0)
+        return;
+
+    key = (byte)n64_rdp_key_index;
+    pat = (uint64_t)key * 0x0101010101010101ull;
+
+    for (y = y0; y < y0 + h; y++)
+    {
+        byte* row = scr + y * SCREENWIDTH + x0;
+        byte* end = row + w;
+
+        while (((uintptr_t)row & 7) && row < end)
+            *row++ = key;
+        while (row + 8 <= end)
+        {
+            *(uint64_t*)row = pat;
+            row += 8;
+        }
+        while (row < end)
+            *row++ = key;
+    }
+
+    n64_ci8_view_keyed = true;
 }
 
 void I_FinishUpdate(void)
@@ -1201,8 +1272,33 @@ void I_FinishUpdate(void)
     }
 
     {
-    int kx0, ky0, kx1, ky1;
-    boolean keyed = (world_drawn && DL_KeyedSpan(&kx0, &ky0, &kx1, &ky1));
+    int kx0 = 0, ky0 = 0, kx1 = -1, ky1 = -1;
+    boolean keyed = false;
+
+    // FULL-VIEW keyed box (Stage-3): whenever this draw buffer's view window
+    // was key-cleared this frame (I_N64KeyClearView armed it at view-render
+    // entry), the WHOLE view window is alpha-compare keyed -- key pixels can
+    // exist anywhere in it (cleared wall spans, vanilla coverage gaps), and a
+    // key pixel must never be opaque-blitted (that is the stale-key sparkle).
+    // Non-key view pixels (CPU planes/sprites/psprite/HU/menu) blit opaque
+    // through the alpha-compare unchanged. The record-bbox box (DL_KeyedSpan)
+    // is retired from box duty: with all wall tiers routed it under-covers
+    // the key population the full clear creates. world_drawn is NOT the gate
+    // -- a 0-record view frame (all-sky scene) still has a key-cleared window
+    // that must be keyed, not opaque-blitted.
+    if (rdp_on && n64_ci8_view_keyed)
+    {
+        kx0 = viewwindowx;
+        ky0 = viewwindowy;
+        kx1 = viewwindowx + scaledviewwidth - 1;
+        ky1 = viewwindowy + viewheight - 1;
+        if (kx0 < 0) kx0 = 0;
+        if (ky0 < 0) ky0 = 0;
+        if (kx1 > SCREENWIDTH - 1)  kx1 = SCREENWIDTH - 1;
+        if (ky1 > SCREENHEIGHT - 1) ky1 = SCREENHEIGHT - 1;
+        keyed = (kx1 >= kx0 && ky1 >= ky0);
+    }
+    (void)world_drawn;
 
     if (!keyed)
     {
@@ -1305,6 +1401,12 @@ void I_FinishUpdate(void)
     }
     }
     }
+
+    // Disarm the keyed-box flag: it described THIS draw buffer's content and
+    // the present just consumed it. The next view render re-arms it (a paced
+    // menu frame that skipped this present keeps it armed for the present
+    // that eventually runs -- the early-return above sits before this point).
+    n64_ci8_view_keyed = false;
 
     // Detach with a completion callback instead of a global rspq_wait(): the
     // CPU can render the next frame while the RDP reads this buffer. The

@@ -94,6 +94,12 @@ void I_N64MarkPaletteDirty(void);
 // pixels; unscrubbed, melt presents repaint them outside any keyed box and
 // they show as opaque key colour (stale-key sparkle). No-op flag-off.
 void I_N64WipeScrubKey(byte* scr);
+
+// Batched key-fill of the 3D-view window of the CI8 draw buffer (Stage-3
+// seg_rast collapse): called at view-render entry (KEY_CLEAR phase) when the
+// RDP wall route is active, REPLACING the per-column R_FillColumnKey writes.
+// Also arms the present's full-view keyed box. No-op flag-off / route-off.
+void I_N64KeyClearView(void);
 #endif
 
 

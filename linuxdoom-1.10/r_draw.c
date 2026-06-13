@@ -156,49 +156,6 @@ void R_DrawColumn (void)
     }
 }
 
-#ifdef N64
-// RDP renderer (Stage 2): event-driven erase-to-key. Fill the current column
-// span [dc_yl..dc_yh] at dc_x with the transparency-key index -- called by the
-// seg loop for the routed seg's suppressed columns INSTEAD of the colfunc, so
-// the key lands in exactly the pixels the RDP quad covers and the keyed
-// present blit punches out. This replaces the Stage-1 full-view key clear
-// (I_N64KeyClearView): clearing the WHOLE view to key before rendering relied
-// on "software covers every view pixel", which vanilla does not guarantee --
-// rare per-column under-coverage (e.g. a 1-px seg whose plane rows go
-// unmarked) left key pixels OUTSIDE the keyed box, and the present blitted
-// them opaque as the key colour (the 28-px "stale-key sparkle" trace case,
-// DL_KEYSCAN p=1659). With erase-to-key, such gap pixels now keep stale
-// buffer content exactly like the flag-off software path. Same dest walk as
-// R_DrawColumn; key writes are plain bytes (no colormap).
-extern int n64_rdp_key_index;
-
-void R_FillColumnKey (void)
-{
-    int		count;
-    byte*	dest;
-    byte	key;
-
-    count = dc_yh - dc_yl;
-    if (count < 0)
-	return;
-
-#ifdef RANGECHECK
-    if ((unsigned)dc_x >= SCREENWIDTH
-	|| dc_yl < 0
-	|| dc_yh >= SCREENHEIGHT)
-	I_Error ("R_FillColumnKey: %i to %i at %i", dc_yl, dc_yh, dc_x);
-#endif
-
-    dest = ylookup[dc_yl] + columnofs[dc_x];
-    key = (byte)n64_rdp_key_index;
-
-    do
-    {
-	*dest = key;
-	dest += SCREENWIDTH;
-    } while (count--);
-}
-#endif
 
 
 
