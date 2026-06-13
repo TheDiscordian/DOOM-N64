@@ -518,8 +518,11 @@ block *after* `rdpq_detach_cb` returns, while the CPU is already building later 
 `PU_CACHE` block can be evicted and reused inside that window, feeding the RDP DMA garbage. Blocks
 are therefore allocated/pinned `PU_STATIC` while in flight and only demoted to `PU_CACHE` by
 `DL_PresentEnd`, one present later, once the present-seam buffer-flip spin has proven the using
-present's RDP stream fully drained (a 2-deep pending/previous in-flight list; see
-`rdp_view.c:DL_MarkInFlight`). The zone LRU still manages everything not in flight.
+present's RDP stream fully drained (per-slot present-generation stamps, no capacity limit; see
+`rdp_view.c:DL_MarkInFlight`. The original 2x16-entry pending/previous lists overflowed silently
+past 16 distinct textures per present, leaving overflow blocks pinned `PU_STATIC` forever — safe
+but a permanent zone leak once Stage 3 routes arbitrarily many textures, hence the replacement).
+The zone LRU still manages everything not in flight.
 
 **Byte-level validation (Stage-2 closure round) — transpose cache and PRIM levels are EXACT.**
 An in-ROM diagnostic build dumped the actual `dl_rowmajor` cache blocks (full hex + CRC-32 over

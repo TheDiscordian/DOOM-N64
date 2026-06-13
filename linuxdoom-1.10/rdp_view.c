@@ -122,10 +122,17 @@ typedef struct
     byte* block;    // 8-byte-aligned row-major width x height CI8 view into raw
     int   height;   // texture height in texels (rows in the block)
     int   width;    // transpose width = texturewidthmask+1 (pow2 sample period)
+    uint32_t lastuse;   // present generation of the last DL_MarkInFlight
+    uint8_t  pinned;    // currently PU_STATIC for an in-flight window
 } dl_rowmajor_t;
 
 static dl_rowmajor_t* dl_rowmajor;      // [numtextures]
 static int            dl_rowmajor_inited;
+
+// Present generation counter for the in-flight pin/demote schedule (see the
+// in-flight block tracking section below). Declared here because fresh
+// transposes in DL_RowMajorBlock stamp their slot with it.
+static uint32_t       dl_present_gen;
 
 static void DL_InitCaches(void)
 {
@@ -156,8 +163,8 @@ static void DL_InitCaches(void)
 // Allocating PU_STATIC up front also closes a second window: the transpose loop
 // itself calls R_GetColumn -> W_CacheLumpNum (Z_Malloc traffic) and a fresh
 // PU_CACHE block could in principle be purged out from under the loop writing
-// into it. Blocks marked in-flight by DL_Flush are tracked in a 2-deep
-// pending/previous list (see DL_MarkInFlight / DL_PresentEnd).
+// into it. Blocks marked in-flight by DL_Flush carry a per-slot present-
+// generation stamp (see DL_MarkInFlight / DL_PresentEnd).
 static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
 {
     dl_rowmajor_t*  slot;
@@ -221,38 +228,48 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     slot->block = block;
     slot->height = th;
     slot->width = tw;
+    // Fresh blocks are born PU_STATIC: record that as a pin in the current
+    // present generation so DL_PresentEnd's sweep demotes them on the same
+    // schedule as re-pinned blocks (see the in-flight tracking below).
+    slot->pinned = 1;
+    slot->lastuse = dl_present_gen;
     if (out_h) *out_h = th;
     if (out_w) *out_w = tw;
     return block;
 }
 
 // --- in-flight block tracking (PU_CACHE async-read race) -------------------
-// Textures whose blocks were enqueued for RDP reads this present (pending) and
-// last present (prev). DL_PresentEnd -- called AFTER the present's buffer-flip
-// spin, which proves the PREVIOUS present's RDP work fully drained -- demotes
-// last present's blocks back to PU_CACHE unless this present re-used them, then
-// rotates pending->prev. A list overflow simply leaves the block PU_STATIC
-// forever: safe (never dangling), merely un-evictable.
-#define DL_INFLIGHT_MAX 16
-static int dl_if_pend[DL_INFLIGHT_MAX];
-static int dl_if_pend_n;
-static int dl_if_prev[DL_INFLIGHT_MAX];
-static int dl_if_prev_n;
+// Per-slot generation stamps replace the former fixed 2x16-entry pending/
+// previous lists (Stage-3 insurance: the lists overflowed silently past 16
+// distinct textures per present, leaving overflow blocks pinned PU_STATIC
+// FOREVER -- harmless under Stage 2's one-seg routing, a permanent zone leak
+// once Stage 3 routes arbitrarily many textures). dl_present_gen counts
+// presents (declared above the transpose cache, which also stamps it);
+// DL_MarkInFlight stamps the slot with the current generation and pins it;
+// DL_PresentEnd -- called AFTER the present's buffer-flip spin, which proves
+// the PREVIOUS present's RDP work fully drained -- demotes every pinned
+// block whose stamp is older than the present just enqueued (i.e. last used
+// by a present that has provably drained), then advances the generation.
+// Semantics are identical to the old list rotation, with no capacity limit:
+// O(numtextures) == 125 slot reads per present, negligible.
 
 static void DL_MarkInFlight(int texnum)
 {
-    int i;
+    dl_rowmajor_t* slot;
 
-    if (!dl_rowmajor || !dl_rowmajor[texnum].raw)
+    if (!dl_rowmajor)
         return;
-    for (i = 0; i < dl_if_pend_n; i++)
-        if (dl_if_pend[i] == texnum)
-            return;
-    // (Re-)pin: a previously demoted block goes back to PU_STATIC for the
-    // duration of its in-flight window.
-    Z_ChangeTag(dl_rowmajor[texnum].raw, PU_STATIC);
-    if (dl_if_pend_n < DL_INFLIGHT_MAX)
-        dl_if_pend[dl_if_pend_n++] = texnum;
+    slot = &dl_rowmajor[texnum];
+    if (!slot->raw)
+        return;
+    if (!slot->pinned)
+    {
+        // (Re-)pin: a previously demoted block goes back to PU_STATIC for
+        // the duration of its in-flight window.
+        Z_ChangeTag(slot->raw, PU_STATIC);
+        slot->pinned = 1;
+    }
+    slot->lastuse = dl_present_gen;
 }
 
 // --- PRIM light LUT (Q8) ---------------------------------------------------
@@ -931,7 +948,7 @@ void DL_Flush(void)
 // of defect).
 void DL_PresentEnd(void)
 {
-    int i, j;
+    int i;
 
 #if DL_DEBUG_TRACE
     // Presents that ran with NO world records (automap/wipe/menu-paced/no
@@ -985,27 +1002,35 @@ void DL_PresentEnd(void)
     }
 #endif
 
-    for (i = 0; i < dl_if_prev_n; i++)
+    // Demote every pinned block this present did NOT re-use: its last-using
+    // present is at latest the previous one, which the buffer-flip spin has
+    // just proven fully drained. Blocks stamped with the CURRENT generation
+    // were enqueued by the present we just detached -- still potentially in
+    // flight, keep pinned. A slot whose raw was reclaimed (zone NULLed the
+    // back-reference after an earlier demotion) just has its stale pin flag
+    // cleared. No capacity limit: this replaces the former 16-entry lists,
+    // whose silent overflow left blocks PU_STATIC forever.
+    if (dl_rowmajor)
     {
-        int tex = dl_if_prev[i];
-        int live = 0;
-
-        for (j = 0; j < dl_if_pend_n; j++)
+        for (i = 0; i < numtextures; i++)
         {
-            if (dl_if_pend[j] == tex)
+            dl_rowmajor_t* slot = &dl_rowmajor[i];
+
+            if (!slot->pinned)
+                continue;
+            if (!slot->raw)
             {
-                live = 1;
-                break;
+                slot->pinned = 0;
+                continue;
+            }
+            if (slot->lastuse != dl_present_gen)
+            {
+                Z_ChangeTag(slot->raw, PU_CACHE);
+                slot->pinned = 0;
             }
         }
-        if (!live && dl_rowmajor && dl_rowmajor[tex].raw)
-            Z_ChangeTag(dl_rowmajor[tex].raw, PU_CACHE);
     }
-
-    for (i = 0; i < dl_if_pend_n; i++)
-        dl_if_prev[i] = dl_if_pend[i];
-    dl_if_prev_n = dl_if_pend_n;
-    dl_if_pend_n = 0;
+    dl_present_gen++;
 
     dl_wall_count = 0;      // consumed: never re-flush stale records
 }
