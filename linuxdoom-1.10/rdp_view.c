@@ -202,6 +202,12 @@ static int            dl_rowmajor_inited;
 // load by init_offset). 16 RGBA5551 entries = 32 bytes.
 static uint16_t       dl_subpal_up[16] __attribute__((aligned(8)));
 
+// Diagnostic: count LOAD_TILE band loads emitted this present (the headline
+// CI4 lever -- CI8 band-split ran ~150/frame; CI4 should be far fewer). Summed
+// across DL_DrawRecord, read by the bench report, reset each DL_BeginFrame.
+static uint32_t       dl_tile_loads;
+uint32_t DL_TileLoadCount(void) { return dl_tile_loads; }
+
 // Present generation counter for the in-flight pin/demote schedule (see the
 // in-flight block tracking section below). Declared here because fresh
 // transposes in DL_RowMajorBlock stamp their slot with it.
@@ -825,6 +831,9 @@ void DL_BeginFrame(void)
     dl_span_count = 0;
     dl_span_overflow = 0;
     dl_flat_touched_count = 0;
+
+    // Per-frame band-load counter reset (bench diagnostic).
+    dl_tile_loads = 0;
 
     // Per-frame generation bump invalidates every bucket head/tail in O(1):
     // a bucket whose gen stamp != dl_frame_gen is treated as empty, so the
@@ -1759,6 +1768,7 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
         {
             rdpq_load_tile(TILE1, 0, src_lo, blkw / 2, src_lo + rows_up);
             rdpq_set_tile_size(TILE0, 0, src_lo, blkw, src_lo + rows_up);
+            dl_tile_loads++;
             dl_last_up_block = bandsrc;
             dl_last_up_lo    = src_lo;
             dl_last_up_rows  = rows_up;

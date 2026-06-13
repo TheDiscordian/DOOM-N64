@@ -79,6 +79,7 @@ typedef struct
     uint16_t vissprites;
     uint16_t drawsegs;
     uint16_t visplanes;
+    uint16_t tile_loads;    // RDP wall band LOAD_TILEs this frame (CI4 diagnostic)
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -416,6 +417,13 @@ void N64Bench_LoopEnd(void)
         f->vissprites = cur_vissprites;
         f->drawsegs   = cur_drawsegs;
         f->visplanes  = cur_visplanes;
+        {
+            // RDP wall band LOAD_TILE count for this frame's present (CI4 lever
+            // diagnostic). Weakly referenced so non-RDP builds link clean.
+            extern uint32_t DL_TileLoadCount(void) __attribute__((weak));
+            f->tile_loads = DL_TileLoadCount ?
+                            (uint16_t)DL_TileLoadCount() : 0;
+        }
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
     }
@@ -623,6 +631,7 @@ static void N64Bench_ReportPhases(void)
     unsigned long long total_sum = 0;
     unsigned long long leftover_sum = 0;
     unsigned long long vissprite_sum = 0, drawseg_sum = 0, visplane_sum = 0;
+    unsigned long long tileload_sum = 0;
     unsigned long tics_frames = 0;
 
     unsigned long tail_thresh, tail_target, tail_n = 0;
@@ -665,6 +674,7 @@ static void N64Bench_ReportPhases(void)
         vissprite_sum += f->vissprites;
         drawseg_sum   += f->drawsegs;
         visplane_sum  += f->visplanes;
+        tileload_sum  += f->tile_loads;
         if (f->tics_ran) tics_frames++;
 
         // tail accumulation
@@ -718,10 +728,12 @@ static void N64Bench_ReportPhases(void)
         debugf("BENCH_PHASE name=%-8s mean_us=%lu pct=%lu.%lu\n",
                "leftover", mean, pct10 / 10, pct10 % 10);
     }
-    debugf("BENCH_COUNTS mean_vissprites=%lu mean_drawsegs=%lu mean_visplanes=%lu\n",
+    debugf("BENCH_COUNTS mean_vissprites=%lu mean_drawsegs=%lu mean_visplanes=%lu "
+           "mean_tile_loads=%lu\n",
            (unsigned long)(vissprite_sum / bench_frame_count),
            (unsigned long)(drawseg_sum / bench_frame_count),
-           (unsigned long)(visplane_sum / bench_frame_count));
+           (unsigned long)(visplane_sum / bench_frame_count),
+           (unsigned long)(tileload_sum / bench_frame_count));
 
     // --- tail report (worst BENCH_TAIL_PCT%) ------------------------------
     if (tail_n)
