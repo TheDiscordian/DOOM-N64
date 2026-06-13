@@ -1007,6 +1007,15 @@ static int         dl_last_up_c0;      // S window origin of the resident band
 // wrap mask depends on the texture period).
 static int         dl_last_tile_lw;
 static int         dl_last_tile_wrap;
+// PRIM-color dedup. PRIM = the colormap-level brightness (TEX0*PRIM in 1-cycle).
+// Consecutive records in a texture bucket frequently share a light level (the
+// emit splits runs AT light boundaries, so a multi-record run that split for S
+// or deviation reasons keeps one light), so the per-record rdpq_set_prim_color
+// is usually redundant. Cache the last packed PRIM and skip the set when
+// unchanged -- one fewer RDP command + its command-gen per record, sampling-
+// identical. 0 = "no prim set yet this flush" (a real prim is never 0: the LUT
+// entries are colormap brightness and the unlit fallback is 0xFFFFFFFF).
+static uint32_t    dl_last_prim;
 
 static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
 {
@@ -1024,9 +1033,14 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw)
     if (blkw < 1)
         return 0;
 
-    // PRIM = colormap-level brightness (Q8). TEX0*PRIM in 1-cycle.
+    // PRIM = colormap-level brightness (Q8). TEX0*PRIM in 1-cycle. Deduped:
+    // skip the set when this record's light matches the resident PRIM.
     prim = (w->light < NUMCOLORMAPS) ? dl_prim_lut[w->light] : 0xFFFFFFFFu;
-    rdpq_set_prim_color(color_from_packed32(prim));
+    if (prim != dl_last_prim)
+    {
+        rdpq_set_prim_color(color_from_packed32(prim));
+        dl_last_prim = prim;
+    }
 
     xl = (float)w->x1;
     xr = (float)w->x2 + 1.0f;
@@ -1360,6 +1374,7 @@ void DL_Flush(void)
     dl_last_up_c0    = -1;
     dl_last_tile_lw   = -1;
     dl_last_tile_wrap = -1;
+    dl_last_prim      = 0;      // no PRIM resident (caller's setup left it unset)
 
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
