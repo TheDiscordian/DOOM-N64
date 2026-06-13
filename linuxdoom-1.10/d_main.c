@@ -2171,6 +2171,23 @@ void D_DoomMain (void)
 #ifdef BENCH_FORCE_RDP
     n64_use_rdp_renderer = 1;
     debugf("BENCH: BENCH_FORCE_RDP -> n64_use_rdp_renderer=1\n");
+    // Stage-4 sub-path selectors (compile-time, so the A/B runs are byte-
+    // reproducible from committed source -- the same discipline as
+    // BENCH_FORCE_RDP itself). Default (neither defined) is FULL RDP: both
+    // wall and plane A/B toggles keep their startup default of 1.
+    //   BENCH_FORCE_PLANES_ONLY -> SW walls + RDP planes (the ISOLATION A/B).
+    //   BENCH_FORCE_WALLS_ONLY  -> RDP walls + SW planes (the Stage-3 regress-
+    //                              guard config; pixel-matches Stage-3 accept).
+#ifdef BENCH_FORCE_PLANES_ONLY
+    n64_rdp_wall_ab  = 0;
+    n64_rdp_plane_ab = 1;
+    debugf("BENCH: BENCH_FORCE_PLANES_ONLY -> walls CPU, planes RDP\n");
+#endif
+#ifdef BENCH_FORCE_WALLS_ONLY
+    n64_rdp_wall_ab  = 1;
+    n64_rdp_plane_ab = 0;
+    debugf("BENCH: BENCH_FORCE_WALLS_ONLY -> walls RDP, planes CPU\n");
+#endif
 #else
     n64_use_rdp_renderer = 0;
 #endif

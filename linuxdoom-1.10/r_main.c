@@ -43,6 +43,7 @@ static const char rcsid[] = "$Id: r_main.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
 #include "doomstat.h"
 #ifdef N64
 #include "i_video.h"
+#include "rdp_view.h"   // DL_AnyRouteOn (key-clear arming gate)
 #endif
 
 #ifdef N64_BENCH
@@ -1010,7 +1011,12 @@ void R_RenderPlayerView (player_t* player)
     // 3-presents-old fb content (the same stale-content artifact class as
     // vanilla's own unwritten pixels).
 #ifdef N64
-    if (n64_use_rdp_renderer)
+    // Arm the key-clear whenever ANY RDP world pass routes (walls OR planes).
+    // Stage 4: a planes-only config (SW walls + RDP planes, the isolation A/B)
+    // still needs the full-view key-clear so the suppressed plane regions hold
+    // the key for the present's keyed COPY blit -- gating on walls alone would
+    // leave the clear unarmed and the RDP flats covered by stale CI8.
+    if (DL_AnyRouteOn())
     {
 #ifdef N64_BENCH
 	N64Bench_PhaseBegin(BPH_KEY_CLEAR);

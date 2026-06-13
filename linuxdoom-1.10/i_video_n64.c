@@ -1096,8 +1096,9 @@ void I_N64KeyClearView(void)
 
     if (n64_use_rdp_renderer == 0 || n64_rdp_key_index < 0 || !scr)
         return;
-    if (!DL_WallRouteOn())
-        return;     // A/B walls-on-CPU: nothing is suppressed, keep CI8 key-free
+    if (!DL_AnyRouteOn())
+        return;     // neither walls nor planes route: nothing is suppressed,
+                    // keep CI8 key-free (full-software composite path)
 
     x0 = viewwindowx;
     y0 = viewwindowy;

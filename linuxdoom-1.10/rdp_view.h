@@ -140,16 +140,33 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1);
 // Stage 3 routes ALL eligible wall tiers (no per-frame single-seg latch). The
 // seg loop consults DL_WallRouteOn() once per seg to decide whether to route.
 
-// True if the RDP wall path is enabled (flag on + A/B toggle on). The seg loop
-// calls this at the top of each seg to decide whether to capture/route its
+// True if the RDP wall path is enabled (flag on + wall A/B toggle on). The seg
+// loop calls this at the top of each seg to decide whether to capture/route its
 // tiers.
 int DL_WallRouteOn(void);
+
+// True if the RDP plane path is enabled (flag on + plane A/B toggle on). Mirror
+// of DL_WallRouteOn for the Stage-4 floor/ceiling span path; R_MapPlane calls it
+// at its leaf to decide whether to emit a span (RDP) or run spanfunc() (CPU).
+int DL_PlaneRouteOn(void);
+
+// True if ANY RDP world pass is active this frame (walls OR planes). Used at the
+// isolation sites that mean "is the RDP drawing the world": the key-clear arming
+// (r_main.c) and its internal guard (i_video_n64.c), so a planes-only or
+// walls-only config both arm the full-view key-clear + keyed present correctly.
+int DL_AnyRouteOn(void);
 
 // Per-seg A/B debug toggle (graft #4): flip ALL routed walls between the RDP
 // path and the CPU column path for pixel comparison. Runtime so a bench/ares
 // session can be reasoned about; defaults to RDP (1). Set to 0 to keep walls on
 // the CPU (the safe fallback the task allows if walls render wrong).
 extern int n64_rdp_wall_ab;     // 1 = route walls through RDP, 0 = keep on CPU
+
+// Plane A/B toggle (symmetry-completion of n64_rdp_wall_ab). 1 = route floors/
+// ceilings through the RDP span path, 0 = keep them on the CPU spanfunc(). The
+// Stage-4 ISOLATION config is n64_rdp_wall_ab=0 && n64_rdp_plane_ab=1 (SW walls
+// + RDP planes), selected at build time via BENCH_FORCE_PLANES_ONLY.
+extern int n64_rdp_plane_ab;    // 1 = route planes through RDP, 0 = keep on CPU
 
 #endif // N64
 #endif // __RDP_VIEW_H__

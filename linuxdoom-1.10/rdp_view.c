@@ -72,6 +72,12 @@ byte* R_GetColumn(int tex, int col);
 // within the iteration budget.
 int n64_rdp_wall_ab = 1;
 
+// Plane A/B toggle (Stage-4 symmetry-completion of the wall toggle). Defaults to
+// the RDP path so a full RDP build routes both walls AND planes. The ISOLATION
+// experiment (SW walls + RDP planes) is n64_rdp_wall_ab=0 && n64_rdp_plane_ab=1,
+// pinned at build time by BENCH_FORCE_PLANES_ONLY (d_main.c).
+int n64_rdp_plane_ab = 1;
+
 // --- emit arena + per-texture buckets --------------------------------------
 // Stage 3 routes ALL solid wall tiers. Each tier splits into a record per
 // light-level run AND per S-span run (the saturation split in DL_RouteEmit), so
@@ -957,6 +963,20 @@ int DL_WallRouteOn(void)
     if (!n64_rdp_wall_ab)
         return 0;       // A/B toggle: keep walls on the CPU
     return 1;
+}
+
+int DL_PlaneRouteOn(void)
+{
+    if (!n64_use_rdp_renderer)
+        return 0;
+    if (!n64_rdp_plane_ab)
+        return 0;       // A/B toggle: keep planes on the CPU
+    return 1;
+}
+
+int DL_AnyRouteOn(void)
+{
+    return DL_WallRouteOn() || DL_PlaneRouteOn();
 }
 
 // --- per-record draw (the validated Stage-2 band/T/S machinery) -------------

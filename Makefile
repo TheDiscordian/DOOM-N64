@@ -49,6 +49,17 @@ endif
 # instead of a throwaway harness patch. Default (unset) is the flag-OFF run.
 ifeq ($(BENCH_FORCE_RDP),1)
 CFLAGS += -DBENCH_FORCE_RDP=1
+# Stage-4 sub-path selectors (only meaningful with BENCH_FORCE_RDP=1). Pin the
+# wall/plane A/B toggles at startup so the isolation A/B runs are reproducible
+# from committed source.
+#   BENCH_FORCE_PLANES_ONLY=1 -> SW walls + RDP planes (the isolation experiment)
+#   BENCH_FORCE_WALLS_ONLY=1  -> RDP walls + SW planes (Stage-3 regression guard)
+ifeq ($(BENCH_FORCE_PLANES_ONLY),1)
+CFLAGS += -DBENCH_FORCE_PLANES_ONLY=1
+endif
+ifeq ($(BENCH_FORCE_WALLS_ONLY),1)
+CFLAGS += -DBENCH_FORCE_WALLS_ONLY=1
+endif
 endif
 # BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
 # ISViewer every 256 retained frames) for exactly-paired cross-build
