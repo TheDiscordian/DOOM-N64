@@ -99,8 +99,7 @@ static int          dl_arena_overflow;     // 1 if a record was dropped this fra
 // array (cleared lazily via a per-frame generation stamp so BeginFrame stays
 // O(touched), not O(numtextures)).
 static int32_t*     dl_bucket_head;         // [numtextures] first record idx, -1 none
-static int32_t*     dl_bucket_tail;         // [numtextures] last record idx
-static uint32_t*    dl_bucket_gen;          // [numtextures] frame stamp of head/tail
+static uint32_t*    dl_bucket_gen;          // [numtextures] frame stamp of head
 static uint32_t     dl_frame_gen;           // bumped each DL_BeginFrame
 static int          dl_buckets_inited;
 static uint16_t     dl_touched[DL_WALL_ARENA]; // texnums touched this frame (deduped)
@@ -360,8 +359,6 @@ static void DL_InitBuckets(void)
         return;
     dl_bucket_head = (int32_t*)Z_Malloc(numtextures * sizeof(int32_t),
                                         PU_STATIC, 0);
-    dl_bucket_tail = (int32_t*)Z_Malloc(numtextures * sizeof(int32_t),
-                                        PU_STATIC, 0);
     dl_bucket_gen  = (uint32_t*)Z_Malloc(numtextures * sizeof(uint32_t),
                                          PU_STATIC, 0);
     memset(dl_bucket_gen, 0, numtextures * sizeof(uint32_t));
@@ -472,15 +469,24 @@ int DL_EmitWallTier(const rdp_wall_t* w)
             // stamp, so each texnum appears in dl_touched[] at most once).
             dl_bucket_gen[tex]  = dl_frame_gen;
             dl_bucket_head[tex] = idx;
-            dl_bucket_tail[tex] = idx;
             if (dl_touched_count < DL_WALL_ARENA)
                 dl_touched[dl_touched_count++] = (uint16_t)tex;
         }
         else
         {
-            // Chain onto the existing bucket tail.
-            dl_walls[dl_bucket_tail[tex]].bucket_next = idx;
-            dl_bucket_tail[tex] = idx;
+            // HEAD-insert (back-to-front draw order). The BSP walk emits
+            // front-to-back; head insertion makes DL_Flush draw each
+            // texture's records in REVERSE emit order, i.e. farthest first.
+            // Records never overlap on the columns software assigned them,
+            // but a record's quad over-covers its captured spans by a couple
+            // of rows (coverage bias) -- where that over-coverage lands on
+            // ANOTHER tier's key-revealed span, painter order decides which
+            // texels survive. Back-to-front resolves those overlaps to the
+            // NEARER record, matching occlusion (the stairs/pillars
+            // stacked-tier scene is the worst case: far risers stomping near
+            // ones reads as vanished geometry).
+            rec->bucket_next    = dl_bucket_head[tex];
+            dl_bucket_head[tex] = idx;
         }
     }
     return 1;
