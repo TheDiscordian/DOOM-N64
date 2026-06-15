@@ -44,6 +44,48 @@
 
 #include "rdp_view.h"
 
+// --- Integer floor/ceil for the wall emit path (perf-only refactor) --------
+// IFLOOR/ICEIL compute floor()/ceil() of a float with integer/branch arithmetic
+// instead of the libm floorf()/ceilf() calls. Truncation toward zero ((int)x)
+// equals floor for x>=0 and equals ceil for x<=0; the correction term restores
+// the toward-(-/+)inf rounding for the signed fractional case:
+//   IFLOOR(x) = trunc(x) - (trunc(x) > x)   // -1 only when x<0 and fractional
+//   ICEIL(x)  = trunc(x) + (trunc(x) < x)   // +1 only when x>0 and fractional
+// These are PROVABLY identical to floorf/ceilf for every finite x whose true
+// floor/ceil fits in int32. Every operand here is bounded well under 2^20 texels
+// (traced: projective T, period-biased S, and 16.16 spot U/V), so the int cast
+// never overflows -- the replacement is bit-identical to the float result.
+// trunc() is evaluated ONCE (no double-eval of side effects; all call sites pass
+// plain variables/divisions anyway).
+static inline int dl_ifloor(float x) { int t = (int)x; return t - (t > x); }
+static inline int dl_iceil (float x) { int t = (int)x; return t + (t < x); }
+#define IFLOOR(x) dl_ifloor(x)
+#define ICEIL(x)  dl_iceil(x)
+
+// IFLOOR_ASSERT_ENABLE: BENCH-gated equivalence guard. Flip to 1 to compile in a
+// per-site assertion that the integer result MATCHES the original floorf/ceilf
+// on every real frame (any divergence calls I_Error and fail-fasts the bench).
+// MUST be 0 for timing runs and for the committed tree -- the floorf/ceilf
+// shadow calls and the compare defeat the whole point of the refactor.
+#ifndef IFLOOR_ASSERT_ENABLE
+#define IFLOOR_ASSERT_ENABLE 0
+#endif
+#if IFLOOR_ASSERT_ENABLE
+#define IFLOOR_CHK(iv, x) do { \
+    if ((iv) != (int)floorf(x)) \
+        I_Error("IFLOOR ASSERT FAILED: x=%f int=%d floorf=%d\n", \
+                (double)(x), (int)(iv), (int)floorf(x)); \
+} while (0)
+#define ICEIL_CHK(iv, x) do { \
+    if ((iv) != (int)ceilf(x)) \
+        I_Error("ICEIL ASSERT FAILED: x=%f int=%d ceilf=%d\n", \
+                (double)(x), (int)(iv), (int)ceilf(x)); \
+} while (0)
+#else
+#define IFLOOR_CHK(iv, x) ((void)0)
+#define ICEIL_CHK(iv, x)  ((void)0)
+#endif
+
 // Compile-time diagnostic trace (ISViewer debugf) for the flush/emit path.
 // MUST stay 0 in all normal builds -- it adds per-present log traffic that
 // would skew timing runs and spam capture logs. Flip to 1 only for a
@@ -2028,7 +2070,8 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
     // lies in [0, blkw) and the emit-side run split caps |s_r - s_l| at 700, so
     // |S| < blkw + 700 < 1024.
         float smin = (es_l < es_r) ? es_l : es_r;
-        float bias = floorf(smin / (float)blkw) * (float)blkw;
+        float bias = (float)(IFLOOR(smin / (float)blkw) * blkw);
+        IFLOOR_CHK((int)bias / blkw, smin / (float)blkw);
         s_l = es_l - bias;
         s_r = es_r - bias;
     }
@@ -2211,8 +2254,10 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
         byte*   bandsrc;
 
         // Period base via floor division (handles negative T).
-        period_base = (int)floorf(cur / (float)blkh) * blkh;
-        src_lo = (int)floorf(cur) - period_base;
+        period_base = IFLOOR(cur / (float)blkh) * blkh;
+        IFLOOR_CHK(period_base / blkh, cur / (float)blkh);
+        src_lo = IFLOOR(cur) - period_base;
+        IFLOOR_CHK(src_lo + period_base, cur);
         if (src_lo < 0) src_lo = 0;             // float-edge paranoia
         if (src_lo >= blkh) src_lo = blkh - 1;
 
@@ -2224,7 +2269,8 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
         if (band_end > t1)
             band_end = t1;
 
-        src_hi = (int)ceilf(band_end - (float)period_base);
+        src_hi = ICEIL(band_end - (float)period_base);
+        ICEIL_CHK(src_hi, band_end - (float)period_base);
         if (src_hi > src_cap) src_hi = src_cap;
         if (src_hi <= src_lo) src_hi = src_lo + 1;
         rows = src_hi - src_lo;
@@ -2389,15 +2435,18 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     // smaller endpoint lands in [0,64) and the window is [floor(vmin), ceil(vmax)].
     {
         float vmin = (va < vb) ? va : vb;
-        vbias = (int)floorf(vmin / 64.0f) * 64;
+        vbias = IFLOOR(vmin / 64.0f) * 64;
+        IFLOOR_CHK(vbias / 64, vmin / 64.0f);
     }
     va -= (float)vbias;
     vb -= (float)vbias;
     {
         float vmin = (va < vb) ? va : vb;
         float vmax = (va < vb) ? vb : va;
-        vlo = (int)floorf(vmin);
-        vhi = (int)ceilf(vmax);
+        vlo = IFLOOR(vmin);
+        IFLOOR_CHK(vlo, vmin);
+        vhi = ICEIL(vmax);
+        ICEIL_CHK(vhi, vmax);
     }
     if (vlo < 0) vlo = 0;
     // Window must fit the TMEM 32-row cap. A span whose V extent exceeds 32
@@ -2433,8 +2482,10 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
 
     // U period bias (keep S endpoints in a sane fixed-point range; the tile
     // wraps S with mask 6, so a shared period subtraction is sampling-identical).
-    ulo = (int)floorf((ua < ub) ? ua : ub);
-    uhi = (int)ceilf((ua > ub) ? ua : ub);
+    ulo = IFLOOR((ua < ub) ? ua : ub);
+    IFLOOR_CHK(ulo, (ua < ub) ? ua : ub);
+    uhi = ICEIL((ua > ub) ? ua : ub);
+    ICEIL_CHK(uhi, (ua > ub) ? ua : ub);
     ubias = (ulo / 64) * 64;
     if (ulo < 0) ubias = ((ulo - 63) / 64) * 64;    // floor toward -inf
     (void)uhi;
