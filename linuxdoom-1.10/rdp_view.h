@@ -119,6 +119,54 @@ void DL_EmitSpan(int y, int x1, int x2,
 // frame (0 walls, N spans) still enters the flush.
 int DL_SpanCount(void);
 
+// --- Stage-4b plane POLYGON path (trapezoid strips) ------------------------
+// The visplanes-as-RDP-polygons feature (replacing the per-span Stage-4 fill).
+// One rdp_ppoly_t is a single trapezoid RUN over a visplane island: a quad whose
+// left/right edges sit at screen columns x1 and x2+1, each edge spanning its own
+// [ytop..ybot] screen rows. Per-corner U/V are the flat texel coords (R_MapPlane's
+// un-projection evaluated at the corner) and per-edge INV_W ~ (y-centery)/
+// planeheight, so the RDP's perspective divide reproduces software's affine flat
+// map EXACTLY (u*INV_W and v*INV_W are screen-affine for a constant-z plane).
+// Drawn with persp ON (a tall floor poly spans many z-depths -- affine would warp
+// it), one tri-pair per run. Bucketed by flat lump like the spans so each flat
+// uploads once. r_plane.c emits these per trapezoid run (the same island walk the
+// count-only R_CountPlanePolyTris uses, made to emit instead of count).
+typedef struct
+{
+    int16_t  x1, x2;            // screen column span (inclusive); edges at x1, x2+1
+    float    ytop_l, ybot_l;    // left-edge top/bottom screen rows (x1 edge)
+    float    ytop_r, ybot_r;    // right-edge top/bottom screen rows (x2+1 edge)
+    float    u_tl, v_tl;        // texel U/V at the four CORNERS (flat coords, texels)
+    float    u_tr, v_tr;
+    float    u_bl, v_bl;
+    float    u_br, v_br;
+    float    invw_tl, invw_bl;  // per-corner 1/W (left edge top/bottom)
+    float    invw_tr, invw_br;  // per-corner 1/W (right edge top/bottom)
+    int32_t  bucket_next;       // next poly idx in this flat's bucket (-1 end)
+    uint16_t flatlump;          // flat lump number (firstflat+flattranslation)
+    uint8_t  light;             // colormap level 0..NUMCOLORMAPS-1 (PRIM index)
+} rdp_ppoly_t;
+
+// Emit one plane-polygon trapezoid run (Stage-4b). Called from r_plane.c's island
+// walk in place of the per-span path when the polygon plane route is on. Corners
+// carry the flat texel U/V (R_MapPlane un-projection at each corner) and per-corner
+// INV_W. flatlump is the resolved flat lump (firstflat+flattranslation[picnum]);
+// colormap is the run's resolved light table (reduced to a PRIM level here). No-op
+// if the arena is full (the run stays key-index -- a punched hole over stale fb).
+void DL_EmitPlanePoly(const rdp_ppoly_t* p, const void* colormap);
+
+// How many plane polygons are queued this frame (0 if none). ORed into the present
+// world-flush gate alongside DL_Count()/DL_SpanCount() so a poly-planes-only frame
+// still enters DL_Flush.
+int DL_PolyCount(void);
+
+// True if the RDP plane path should emit POLYGONS (trapezoid strips) rather than
+// per-span affine rects. On == plane route on AND the polygon sub-path selected.
+// r_plane.c's R_DrawPlanes consults this to pick the poly emit + suppress the CPU
+// span loop; OFF falls back to the per-span DL_EmitSpan path (Stage-4) or the
+// software spanfunc (flag fully off).
+int DL_PlanePolyOn(void);
+
 // Convert a plane's resolved colormap pointer (ds_colormap) to the colormap
 // level used as the PRIM index, shared with the walls' baked dl_prim_lut. Kept
 // here so the R_MapPlane emit site stays a pure data feed.
@@ -219,6 +267,11 @@ extern int n64_rdp_wall_ab;     // 1 = route walls through RDP, 0 = keep on CPU
 // Stage-4 ISOLATION config is n64_rdp_wall_ab=0 && n64_rdp_plane_ab=1 (SW walls
 // + RDP planes), selected at build time via BENCH_FORCE_PLANES_ONLY.
 extern int n64_rdp_plane_ab;    // 1 = route planes through RDP, 0 = keep on CPU
+
+// Stage-4b sub-path selector. 1 = emit visplanes as RDP POLYGONS (trapezoid
+// strips, perspective-correct -- the low-primitive floor path); 0 = the legacy
+// per-span affine path. Only meaningful when the plane route is on.
+extern int n64_rdp_plane_poly;
 
 #endif // N64
 #endif // __RDP_VIEW_H__

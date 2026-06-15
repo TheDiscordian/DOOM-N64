@@ -462,6 +462,284 @@ R_MakeSpans
 
 
 
+#ifdef N64
+//
+// --- Stage-4b: visplanes as RDP POLYGONS (trapezoid strips) ----------------
+//
+// Replaces DOOM's per-span software fill with RDP trapezoid quads. This is the
+// EMIT half of the count-only R_CountPlanePolyTris probe: the SAME island walk
+// and the SAME DL_SPLIT_DEVY (~1.25-row) run-break predicate, but where the
+// counter returned "1 run" each terminal now computes the run's four corner
+// attributes and emits one quad (2 tris) via DL_EmitPlanePoly.
+//
+// Per-corner U/V are R_MapPlane's un-projection evaluated AT THE CORNER (not per
+// span): for a corner at screen (xc, yc),
+//   distance = planeheight * yslope(yc)         [yslope(yc)=projectiony/|yc-cy+.5|]
+//   length   = distance * distscale[xc]
+//   angle    = (viewangle + xtoviewangle[xc]) >> ANGLETOFINESHIFT
+//   u_texel  = (viewx + cos(angle)*length) / FRACUNIT     (mod 64 in HW)
+//   v_texel  = (-viewy - sin(angle)*length) / FRACUNIT
+// -- the exact float form of R_MapPlane's ds_xfrac/ds_yfrac, in texel units (the
+// flat sampler reads (xfrac>>16)&63 / (yfrac>>16)&63, so >>16 == texels). The
+// columns xtoviewangle/distscale are integer-indexed; the run's end SCREEN edges
+// are at columns xa and xb+1, so the right edge samples column xb's angle/scale
+// extrapolated half a column outward, mirroring the geometry extrapolation.
+//
+// Per-corner INV_W = (yc - centery + 0.5)/planeheight (screen-Y-linear, distance
+// proportional to 1/(yc-centery) via yslope). The absolute scale cancels in the
+// RDP's hyperbolic divide; we keep planeheight in the denominator so the divide
+// reconstructs distance. With INV_W ~ (yc-cy) and u = viewx + cos*dist*distscale
+// (dist ~ 1/(yc-cy)), both u*INV_W and v*INV_W are screen-AFFINE (the (yc-cy)
+// cancels the 1/(yc-cy) in dist, leaving an x-only + y-only sum), so perspective
+// interpolation reproduces the software affine flat map EXACTLY.
+//
+// Light: R_MapPlane picks per-distance light (planezlight[distance>>LIGHTZSHIFT]).
+// A poly spans depths, so the run resolves ONE light at its representative (mid)
+// distance -- the count-only probe's poly granularity; banding is per-run, a
+// close match to software's per-row banding for the shallow floor runs the walk
+// produces, and exact under fixedcolormap (invuln/light-amp).
+
+#include "rdp_view.h"
+#include "tables.h"     // finecosine/finesine, ANGLETOFINESHIFT
+
+// Y-edge run-break threshold (~1.25 rows): the SAME DL_SPLIT_DEVY the wall path
+// and the count-only probe use, duplicated here (r_plane.c stays free of the RDP
+// wall header's heavy deps; asserted to match by a build-time comment in
+// rdp_view.c). A run that interpolates within this of every captured column is
+// one trapezoid; the first column exceeding it splits the run.
+#ifndef PLANETESS_SPLIT_DEVY
+#define PLANETESS_SPLIT_DEVY  1.25f
+#endif
+
+// One corner's screen->texel un-projection + INV_W (float, exact form of
+// R_MapPlane). xc/yc are the corner's screen column/row (fractional). Fills
+// *u/*v (texel coords) and *invw.
+static void
+R_PlaneCornerAttr
+( float		xc,
+  float		yc,
+  float*	u,
+  float*	v,
+  float*	invw )
+{
+    float	dyrows = yc - (float)centery + 0.5f;
+    float	yslope_f;
+    float	distance_f;
+    float	length_f;
+    int		xci;
+    angle_t	ang;
+    float	cosf, sinf;
+
+    if (dyrows < 0.0f) dyrows = -dyrows;
+    if (dyrows < 0.03125f) dyrows = 0.03125f;   // guard the centery singularity
+
+    // yslope(yc) = projectiony/|yc-cy+.5| (the float form of yslope[]'s FixedDiv).
+    yslope_f   = (float)projectiony / dyrows;
+    // distance = FixedMul(planeheight, yslope) = (planeheight*yslope)/FRACUNIT.
+    distance_f = ((float)planeheight * yslope_f) * (1.0f / (float)FRACUNIT);
+
+    // Column-indexed angle/distscale: clamp the screen edge column into range
+    // (the right edge xb+1 can reach viewwidth; sample the last valid column).
+    xci = (int)(xc + 0.5f);
+    if (xci < 0)            xci = 0;
+    if (xci >= viewwidth)   xci = viewwidth - 1;
+
+    // length = FixedMul(distance, distscale[xci]).
+    length_f = distance_f * ((float)distscale[xci] * (1.0f / (float)FRACUNIT));
+
+    ang  = (viewangle + xtoviewangle[xci]) >> ANGLETOFINESHIFT;
+    cosf = (float)finecosine[ang] * (1.0f / (float)FRACUNIT);
+    sinf = (float)finesine[ang]   * (1.0f / (float)FRACUNIT);
+
+    // u/v in TEXELS: (viewx + cos*length)/FRACUNIT, (-viewy - sin*length)/FRACUNIT.
+    *u = ((float)viewx * (1.0f / (float)FRACUNIT)) + cosf * length_f;
+    *v = (-(float)viewy * (1.0f / (float)FRACUNIT)) - sinf * length_f;
+
+    // INV_W = (yc - centery + 0.5)/planeheight (screen-Y-linear). planeheight is
+    // a fixed_t; divide by FRACUNIT so the magnitude is well-scaled (~rows/world).
+    *invw = dyrows / ((float)planeheight * (1.0f / (float)FRACUNIT));
+    if (*invw < 1e-6f) *invw = 1e-6f;
+}
+
+// Emit ONE trapezoid run [xa..xb] of a covered island as a quad. top[]/bottom[]
+// are the visplane's per-column edges; the corner Y geometry uses the EXACT same
+// half-pixel extrapolation R_CountIslandRuns builds (so the emitted quad's screen
+// shape matches what the probe counted). flatlump/cm are the run's flat + light.
+static void
+R_EmitRunPoly
+( const byte*	top,
+  const byte*	bottom,
+  int		xa,
+  int		xb,
+  int		flatlump,
+  const void*	cm )
+{
+    rdp_ppoly_t	p;
+    float	ytl, ytr, ybl, ybr;
+    float	xl = (float)xa;
+    float	xr = (float)xb + 1.0f;      // right SCREEN edge
+
+    // Corner Y edges, extrapolated half a pixel outward (identical construction
+    // to R_CountIslandRuns / DL_EmitRunPiece): the rasterizer's interpolation
+    // then passes through the sampled edge values at the end columns' centers.
+    {
+	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
+	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
+
+	if (xb > xa)
+	{
+	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
+	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
+	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
+	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
+	}
+	ytl = tl0;  ytr = tr0;
+	ybl = bl0;  ybr = br0;
+    }
+    // Keep each edge's screen span strictly positive (degenerate clip steps).
+    if (ybl < ytl + 0.05f) ybl = ytl + 0.05f;
+    if (ybr < ytr + 0.05f) ybr = ytr + 0.05f;
+
+    p.x1 = (int16_t)xa;
+    p.x2 = (int16_t)xb;
+    p.ytop_l = ytl;  p.ybot_l = ybl;
+    p.ytop_r = ytr;  p.ybot_r = ybr;
+
+    // Four corner texel U/V + INV_W (left edge at column xa, right at xb+1).
+    R_PlaneCornerAttr(xl, ytl, &p.u_tl, &p.v_tl, &p.invw_tl);
+    R_PlaneCornerAttr(xr, ytr, &p.u_tr, &p.v_tr, &p.invw_tr);
+    R_PlaneCornerAttr(xl, ybl, &p.u_bl, &p.v_bl, &p.invw_bl);
+    R_PlaneCornerAttr(xr, ybr, &p.u_br, &p.v_br, &p.invw_br);
+
+    p.flatlump = (uint16_t)flatlump;
+    p.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
+
+    DL_EmitPlanePoly(&p, cm);
+}
+
+// Recursive trapezoid-run walk for one covered island [xa..xb] -- the EMIT twin
+// of R_CountIslandRuns. Identical corner extrapolation + identical DL_SPLIT_DEVY
+// deviation predicate + identical split rule; only the terminal differs (emit a
+// quad instead of returning a count). flatlump/cm carry the run's flat + light.
+static void
+R_EmitIslandRuns
+( const byte*	top,
+  const byte*	bottom,
+  int		xa,
+  int		xb,
+  int		depth,
+  int		flatlump,
+  const void*	cm )
+{
+    float	ytl, ytr, ybl, ybr;
+    float	width = (float)(xb + 1 - xa);
+    int		x;
+
+    {
+	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
+	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
+
+	if (xb > xa)
+	{
+	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
+	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
+	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
+	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
+	}
+	ytl = tl0;  ytr = tr0;
+	ybl = bl0;  ybr = br0;
+    }
+
+    if (xb > xa + 1)
+    {
+	for (x = xa; x <= xb; x++)
+	{
+	    float f  = ((float)x + 0.5f - (float)xa) / width;
+	    float lt = ytl + (ytr - ytl) * f;
+	    float lb = ybl + (ybr - ybl) * f;
+	    float dT = lt - (float)top[x];
+	    float dB = ((float)bottom[x] + 1.0f) - lb;
+	    float aT = (dT < 0.0f) ? -dT : dT;
+	    float aB = (dB < 0.0f) ? -dB : dB;
+
+	    if ((aT > PLANETESS_SPLIT_DEVY || aB > PLANETESS_SPLIT_DEVY)
+		&& depth < 10)
+	    {
+		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
+		R_EmitIslandRuns(top, bottom, xa, xm, depth + 1, flatlump, cm);
+		R_EmitIslandRuns(top, bottom, xm + 1, xb, depth + 1, flatlump, cm);
+		return;
+	    }
+	}
+    }
+
+    R_EmitRunPoly(top, bottom, xa, xb, flatlump, cm);
+}
+
+// Resolve the run's light table at its representative (mid) distance -- the same
+// planezlight index R_MapPlane would compute for that depth (or fixedcolormap).
+// Returns the colormap pointer DL_EmitPlanePoly reduces to a PRIM level.
+static const void*
+R_PlaneRunColormap
+( const byte*	top,
+  const byte*	bottom,
+  int		xa,
+  int		xb )
+{
+    int		xm = (xa + xb) >> 1;
+    int		ymid;
+    fixed_t	distance;
+    unsigned	index;
+
+    if (fixedcolormap)
+	return fixedcolormap;
+
+    // Representative row: the vertical mid of the run at its mid column.
+    ymid = ((int)top[xm] + (int)bottom[xm] + 1) >> 1;
+    if (ymid < 0) ymid = 0;
+    if (ymid >= viewheight) ymid = viewheight - 1;
+
+    distance = FixedMul(planeheight, yslope[ymid]);
+    index = distance >> LIGHTZSHIFT;
+    if (index >= MAXLIGHTZ)
+	index = MAXLIGHTZ - 1;
+    return planezlight[index];
+}
+
+// Walk every NON-SKY visplane and emit its covered islands as trapezoid quads.
+// Mirrors R_CountPlanePolyTris's island grouping EXACTLY, but emits. Called from
+// R_DrawPlanes when DL_PlanePolyOn(); the per-visplane planeheight/planezlight/
+// ds_source bookkeeping is set up identically to the software path first.
+static void R_EmitPlanePolys (visplane_t* pl)
+{
+    int		x;
+    int		flatlump = firstflat + flattranslation[pl->picnum];
+
+    x = pl->minx;
+    while (x <= pl->maxx)
+    {
+	int		xa, xb;
+	const void*	cm;
+
+	while (x <= pl->maxx
+	       && (pl->top[x] == 0xff || pl->top[x] > pl->bottom[x]))
+	    x++;
+	if (x > pl->maxx)
+	    break;
+
+	xa = x;
+	while (x <= pl->maxx
+	       && pl->top[x] != 0xff && pl->top[x] <= pl->bottom[x])
+	    x++;
+	xb = x - 1;
+
+	cm = R_PlaneRunColormap(pl->top, pl->bottom, xa, xb);
+	R_EmitIslandRuns(pl->top, pl->bottom, xa, xb, 0, flatlump, cm);
+    }
+}
+#endif // N64
+
+
 //
 // R_DrawPlanes
 // At the end of each frame.
@@ -547,9 +825,24 @@ void R_DrawPlanes (void)
 
 	planezlight = zlight[light];
 
+#ifdef N64
+	// Stage-4b: emit this visplane as RDP trapezoid POLYGONS instead of the
+	// software per-span fill (the count-only probe's EMIT twin). planeheight/
+	// planezlight/ds_flatlump are already set up above exactly as software
+	// needs, so the corner un-projection reads the same camera state. The CPU
+	// span loop is SKIPPED -- the RDP fills these rows, and the keyed present
+	// blit shows the RDP floor through the CI8 overlay (DL_FlushPlanePolys).
+	if (DL_PlanePolyOn())
+	{
+	    R_EmitPlanePolys(pl);
+	    Z_ChangeTag (ds_source, PU_CACHE);
+	    continue;
+	}
+#endif
+
 	pl->top[pl->maxx+1] = 0xff;
 	pl->top[pl->minx-1] = 0xff;
-		
+
 	stop = pl->maxx + 1;
 
 	for (x=pl->minx ; x<= stop ; x++)
@@ -559,7 +852,7 @@ void R_DrawPlanes (void)
 			pl->top[x],
 			pl->bottom[x]);
 	}
-	
+
 	Z_ChangeTag (ds_source, PU_CACHE);
     }
 }
@@ -599,7 +892,10 @@ void R_DrawPlanes (void)
 // DL_SPLIT_DEVY is duplicated here (not #included) to keep r_plane.c free of
 // the RDP wall header's heavy dependencies; it is the same 1.25-row coverage
 // threshold and is asserted to match by a build-time comment in rdp_view.c.
+// (The N64 emit block above may have already defined this same value; guard it.)
+#ifndef PLANETESS_SPLIT_DEVY
 #define PLANETESS_SPLIT_DEVY  1.25f
+#endif
 
 // Recursive trapezoid-run counter for one covered island [xa..xb] of a single
 // visplane, top[]/bottom[] sampled per column. Returns the number of trapezoid

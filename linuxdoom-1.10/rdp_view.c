@@ -132,6 +132,13 @@ int n64_rdp_wall_ab = 1;
 // pinned at build time by BENCH_FORCE_PLANES_ONLY (d_main.c).
 int n64_rdp_plane_ab = 1;
 
+// Stage-4b sub-path selector: 1 = emit visplanes as RDP POLYGONS (trapezoid
+// strips, perspective-correct) -- the new low-primitive floor path; 0 = the
+// legacy per-span affine path (Stage-4 DL_EmitSpan). Only consulted when the
+// plane route is on; OFF (plane route off) is byte-identical software either way.
+// Defaults to the polygon path (the feature this stage adds).
+int n64_rdp_plane_poly = 1;
+
 // --- emit arena + per-texture buckets --------------------------------------
 // Stage 3 routes ALL solid wall tiers. Each tier splits into a record per
 // light-level run AND per S-span run (the saturation split in DL_RouteEmit), so
@@ -188,6 +195,21 @@ static int32_t*     dl_flat_bucket_head;    // [numflats] first span idx, -1 non
 static uint32_t*    dl_flat_bucket_gen;     // [numflats] frame stamp of head
 static uint16_t     dl_flat_touched[DL_SPAN_ARENA]; // flat indices touched (deduped)
 static int          dl_flat_touched_count;
+
+// --- Stage-4b plane POLYGON arena + per-flat buckets -----------------------
+// Visplanes-as-RDP-polygons (the trapezoid-strip path replacing the per-span
+// Stage-4 fill). One rdp_ppoly_t per trapezoid RUN; the count-only probe found
+// mean ~47 / p95 ~150 runs(*2 tris)/frame, well under the wall arena, so a
+// 2048-entry arena is generous (p95 ~75 runs). Overflow drops a run (it stays
+// key-index -- a punched hole over stale fb, the bounded class), same discipline
+// as walls/spans. Buckets reuse the SAME per-flat head/gen arrays + dl_frame_gen
+// stamp the span path uses (a frame runs EITHER the span path OR the poly path,
+// never both -- DL_PlanePolyOn selects), so no extra per-flat allocation.
+#define DL_PPOLY_ARENA   2048
+
+static rdp_ppoly_t  dl_ppolys[DL_PPOLY_ARENA];
+static int          dl_ppoly_count;
+static int          dl_ppoly_overflow;      // 1 if a poly was dropped this frame
 
 // Free-W proportionality constant for this frame (Q1). INV_W = rw_scale * k.
 // The absolute scale cancels in the RDP's hyperbolic divide, so any positive k
@@ -1396,6 +1418,11 @@ void DL_BeginFrame(void)
     dl_span_overflow = 0;
     dl_flat_touched_count = 0;
 
+    // Stage-4b plane polygon arena reset (shares the per-flat buckets +
+    // dl_flat_touched[] with the span path; only one of the two runs per frame).
+    dl_ppoly_count = 0;
+    dl_ppoly_overflow = 0;
+
     // Per-frame band-load counter reset (bench diagnostic).
     dl_tile_loads = 0;
     // Sibling per-present primitive counters reset (same lifecycle).
@@ -1640,6 +1667,62 @@ void DL_EmitSpan(int y, int x1, int x2,
 int DL_SpanCount(void)
 {
     return dl_span_count;
+}
+
+// --- Stage-4b plane polygon emit -------------------------------------------
+// Append ONE trapezoid run (rdp_ppoly_t) to the poly arena and chain it into the
+// flat's bucket (the SAME per-flat bucket arrays the span path uses; a frame runs
+// only one of the two paths). DL_FlushPlanePolys then uploads each flat once and
+// draws all its runs. Caller (r_plane.c's island walk) has filled in geometry +
+// per-corner U/V/INV_W; the colormap is reduced to a PRIM level here so the emit
+// site stays a pure data feed. Overflow drops the run (stays key-index).
+void DL_EmitPlanePoly(const rdp_ppoly_t* p, const void* colormap)
+{
+    int          idx;
+    int          flatidx;
+    rdp_ppoly_t* rec;
+
+    if (!p)
+        return;
+    if (p->x2 < p->x1)
+        return;
+    if (dl_ppoly_count >= DL_PPOLY_ARENA)
+    {
+        dl_ppoly_overflow = 1;
+        return;             // arena full: drop (run stays key-index)
+    }
+
+    idx = dl_ppoly_count++;
+    rec = &dl_ppolys[idx];
+    *rec = *p;
+    rec->light       = DL_PlaneLightLevel(colormap);
+    rec->bucket_next = -1;
+
+    // Chain into the flat's bucket (indexed by flat index = lump-firstflat).
+    // Order within a flat's bucket is irrelevant: a plane's runs tile disjoint
+    // screen regions (each island/run owns its own columns+rows), so they never
+    // overlap -- cheapest head-insert.
+    flatidx = (int)p->flatlump - firstflat;
+    if (dl_flat_bucket_head && flatidx >= 0 && flatidx < numflats)
+    {
+        if (dl_flat_bucket_gen[flatidx] != dl_frame_gen)
+        {
+            dl_flat_bucket_gen[flatidx]  = dl_frame_gen;
+            dl_flat_bucket_head[flatidx] = idx;
+            if (dl_flat_touched_count < DL_SPAN_ARENA)
+                dl_flat_touched[dl_flat_touched_count++] = (uint16_t)flatidx;
+        }
+        else
+        {
+            rec->bucket_next = dl_flat_bucket_head[flatidx];
+            dl_flat_bucket_head[flatidx] = idx;
+        }
+    }
+}
+
+int DL_PolyCount(void)
+{
+    return dl_ppoly_count;
 }
 
 // --- routed per-tier per-column capture ------------------------------------
@@ -2110,6 +2193,11 @@ int DL_PlaneRouteOn(void)
     if (!n64_rdp_plane_ab)
         return 0;       // A/B toggle: keep planes on the CPU
     return 1;
+}
+
+int DL_PlanePolyOn(void)
+{
+    return DL_PlaneRouteOn() && n64_rdp_plane_poly;
 }
 
 int DL_AnyRouteOn(void)
@@ -2672,6 +2760,188 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     }
 }
 
+// --- Stage-4b plane POLYGON draw -------------------------------------------
+// Draw ONE trapezoid run as a single PERSPECTIVE-correct textured tri-pair.
+// Unlike the per-span affine path, a run spans many screen rows and many flat
+// z-depths, so persp is ON (set once by the caller) and each corner carries its
+// own INV_W ~ (y-centery)/planeheight -- the RDP's hyperbolic divide then
+// reconstructs software's affine flat map exactly (u*INV_W and v*INV_W are
+// screen-affine for a constant-z plane, verified in r_plane.c's emit).
+//
+// CI8 64x64 flat, mask-6 S/T HARDWARE wrap (64 period) on BOTH axes. S wraps in
+// hardware so no S window is needed. T (V) is capped by TMEM: a 64-wide CI8 tile
+// fits DL_TMEM_HALF/64 = 32 rows, so we load a 32-row, 16-aligned V window that
+// covers the run's V extent and let the mask-6 T-wrap address within it. A run
+// whose V extent exceeds 32 rows is a very near, steep floor (rare); the window
+// clamps to 32 rows -- the over-extent texels wrap and re-sample within the
+// loaded window, the SAME bounded near-floor minification the span path documents.
+// The tile descriptor (64-wide, mask 6) and resident V window are deduped across
+// a flat's runs (consecutive runs at a similar depth share a window -> skip the
+// LOAD_TILE), the dominant DL_BUILD saving.
+static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
+{
+    uint32_t prim;
+    int   vlo, rows, base, ext;
+    float vmin, vmax;
+    float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
+    int   vbias;
+    float xl, xr;
+
+    // PRIM = colormap-level brightness (Q8), shared LUT with the walls. Deduped.
+    prim = (p->light < NUMCOLORMAPS) ? dl_prim_lut[p->light] : dl_unlit_prim;
+    if (prim != dl_last_prim)
+    {
+        rdpq_set_prim_color(color_from_packed32(prim));
+        dl_last_prim = prim;
+    }
+
+    // Per-corner texel U/V (already in texel units from the emit). The mask-6
+    // S/T wrap makes any whole-64 period subtraction sampling-identical, so bias
+    // BOTH axes of all four corners by ONE shared whole-period offset to land
+    // them in a sane fixed-point range for the triangle setup (the projective
+    // S/W,T/W and 1/W interpolation is unaffected by a per-axis constant shift
+    // since u*INV_W shifts by bias*INV_W which is also screen-affine -> the RDP
+    // reconstructs u-bias, and the mask-6 wrap maps -bias back into [0,64)).
+    u_tl = p->u_tl; v_tl = p->v_tl;
+    u_tr = p->u_tr; v_tr = p->v_tr;
+    u_bl = p->u_bl; v_bl = p->v_bl;
+    u_br = p->u_br; v_br = p->v_br;
+
+    // V (texel-row) extent across the four corners -> the 32-row window to load.
+    vmin = v_tl; vmax = v_tl;
+    if (v_tr < vmin) vmin = v_tr; if (v_tr > vmax) vmax = v_tr;
+    if (v_bl < vmin) vmin = v_bl; if (v_bl > vmax) vmax = v_bl;
+    if (v_br < vmin) vmin = v_br; if (v_br > vmax) vmax = v_br;
+
+    // Period-bias V into [0,64) by a shared whole-64 subtraction (mask-6 T-wrap
+    // makes this sampling-identical) so the window math works in the period.
+    vbias = IFLOOR(vmin / 64.0f) * 64;
+    IFLOOR_CHK(vbias / 64, vmin / 64.0f);
+    v_tl -= (float)vbias; v_tr -= (float)vbias;
+    v_bl -= (float)vbias; v_br -= (float)vbias;
+    vmin -= (float)vbias; vmax -= (float)vbias;
+
+    // 16-aligned 32-row window covering [vmin,vmax] (clamped to the 64 period).
+    {
+        int lo = IFLOOR(vmin);
+        int hi = ICEIL(vmax);
+        IFLOOR_CHK(lo, vmin);
+        ICEIL_CHK(hi, vmax);
+        if (lo < 0) lo = 0;
+        ext = hi - lo + 1;
+        if (ext > 32) ext = 32;     // near-floor clamp (bounded minification)
+        base = (lo / 16) * 16;
+        if (base + 32 < lo + ext)
+            base = ((hi - 31) / 16) * 16;
+        if (base < 0) base = 0;
+        if (base + 32 > 64) base = 64 - 32;
+        if (base < 0) base = 0;
+        vlo  = base;
+        rows = 32;
+        if (vlo + rows > 64) rows = 64 - vlo;
+        if (rows < 1) rows = 1;
+    }
+
+    // Tile descriptor: full 64-period wrap on BOTH S and T (mask 6). Deduped --
+    // every flat poly shares this geometry, so SET_TILE issues once per flush.
+    if (dl_last_tile_lw != 64 || dl_last_tile_wrap != 2)
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;          // 64-texel S period
+        tp.t.mask = 6;          // 64-texel T period
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+        dl_last_tile_lw   = 64;
+        dl_last_tile_wrap = 2;
+        dl_last_up_block  = NULL;
+    }
+
+    // Load the (16-aligned, 32-row) V window across the full 64-texel width.
+    // Period-relative coords; the triangle T (period-relative too, via the bias
+    // above) addresses within [vlo, vlo+rows) and the mask-6 wrap handles the
+    // rest. Dedup against the resident window -> skip the LOAD_TILE + autosync.
+    if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
+    {
+        rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
+        dl_last_up_block = block;
+        dl_last_up_lo    = vlo;
+        dl_last_up_rows  = rows;
+        dl_last_up_c0    = 0;
+        dl_tile_loads++;
+        dl_uploads++;
+    }
+
+    // Trapezoid quad: left edge at column x1, right edge at column x2+1; each
+    // edge spans its own [ytop..ybot] screen rows. Per-corner S/T (texels) +
+    // INV_W (persp ON). Tri-pair (tl,tr,bl),(tr,br,bl).
+    xl = (float)p->x1;
+    xr = (float)p->x2 + 1.0f;
+    {
+        float tl[5] = { xl, p->ytop_l, u_tl, v_tl, p->invw_tl };
+        float tr[5] = { xr, p->ytop_r, u_tr, v_tr, p->invw_tr };
+        float bl[5] = { xl, p->ybot_l, u_bl, v_bl, p->invw_bl };
+        float br[5] = { xr, p->ybot_r, u_br, v_br, p->invw_br };
+        rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
+        rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+    }
+    dl_tris += 2;
+}
+
+// Drain the frame's plane POLYGONS (trapezoid strips) into the attached display
+// fb. Per-FLAT bucket walk mirroring DL_FlushSpans: for each flat used this
+// frame, copy + pin its 64x64 CI8 block ONCE, point the RDP at it, then draw
+// every trapezoid run in that flat's bucket. Persp is ON (a run spans many
+// z-depths); the caller restores its own persp after. Shares the flat bucket
+// arrays + dl_flat_touched[] with the span path -- only one of the two paths
+// queued this frame, so the bucket walk is unambiguous.
+static void DL_FlushPlanePolys(void)
+{
+    int fi;
+
+    if (dl_ppoly_count <= 0)
+        return;
+
+    // Floors span many z-depths -> perspective ON so S/T are perspective-correct
+    // (affine would warp a tall floor poly). The walls left persp ON too.
+    rdpq_mode_persp(true);
+
+    // Reset the dedup caches: the flat tile geometry (64-wide CI8, mask-6 wrap)
+    // differs from the wall tiles the wall flush left resident.
+    dl_last_up_block  = NULL;
+    dl_last_up_lo     = -1;
+    dl_last_up_rows   = -1;
+    dl_last_up_c0     = -1;
+    dl_last_tile_lw   = -1;
+    dl_last_tile_wrap = -1;
+
+    for (fi = 0; fi < dl_flat_touched_count; fi++)
+    {
+        int   flatidx = dl_flat_touched[fi];
+        int   pidx;
+        byte* block;
+
+        block = DL_FlatBlock(flatidx);
+        if (!block)
+            continue;       // no usable flat block: runs stay key
+
+        DL_FlatMarkInFlight(flatidx);
+
+        {
+            surface_t fs = surface_make_linear(block, FMT_CI8, 64, 64);
+            rdpq_set_texture_image(&fs);
+            dl_last_up_block  = NULL;
+            dl_last_tile_lw   = -1;
+            dl_last_tile_wrap = -1;
+        }
+
+        for (pidx = dl_flat_bucket_head[flatidx]; pidx >= 0;
+             pidx = dl_ppolys[pidx].bucket_next)
+        {
+            DL_DrawPlanePoly(&dl_ppolys[pidx], block);
+        }
+    }
+}
+
 // Drain the frame's plane spans into the attached display fb (Stage 4). A
 // per-FLAT bucket walk mirroring the wall flush: for each flat used this frame,
 // copy + pin its row-major block ONCE, point the RDP at it, then draw every
@@ -2934,14 +3204,23 @@ void DL_Flush(void)
     // the arena grown if it ever bites; with DL_WALL_ARENA=512 it should not.
     (void)dl_arena_overflow;
 
-    // Stage-4: drain plane spans (floors/ceilings) after the walls, same rspq
-    // stream, still scissored to the view window. DL_FlushSpans sets persp OFF
-    // (flats are affine) -- the caller's post-flush persp(false) for the blit is
-    // then redundant but harmless. A planes-only frame (0 walls) enters DL_Flush
-    // via the DL_SpanCount() OR in the present gate, runs the empty wall walk
-    // above (dl_touched_count==0), and draws its floors here.
-    DL_FlushSpans();
-    (void)dl_span_overflow;
+    // Stage-4: drain the floors/ceilings after the walls, same rspq stream,
+    // still scissored to the view window. Two mutually-exclusive paths (only one
+    // queued this frame, per DL_PlanePolyOn): the Stage-4b POLYGON path (trapezoid
+    // strips, persp ON) or the legacy per-span path (1px affine rects, persp OFF).
+    // A planes-only frame (0 walls) enters DL_Flush via the DL_SpanCount()/
+    // DL_PolyCount() OR in the present gate, runs the empty wall walk above
+    // (dl_touched_count==0), and draws its floors here.
+    if (dl_ppoly_count > 0)
+    {
+        DL_FlushPlanePolys();
+        (void)dl_ppoly_overflow;
+    }
+    else
+    {
+        DL_FlushSpans();
+        (void)dl_span_overflow;
+    }
 }
 
 // Retire per-present RDP world state. MUST be called at the end of the present
@@ -3066,6 +3345,7 @@ void DL_PresentEnd(void)
     dl_span_count = 0;      // Stage 4: same -- never re-flush stale spans (an
                             // automap/wipe present must not re-draw last world
                             // frame's floors; risk 7 stale-rectangle class)
+    dl_ppoly_count = 0;     // Stage-4b: same for the polygon floor path
 }
 
 #endif // N64

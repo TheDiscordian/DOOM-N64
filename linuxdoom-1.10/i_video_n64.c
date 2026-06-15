@@ -1192,7 +1192,7 @@ void I_FinishUpdate(void)
     // never drains a half-built world list. Stage 2 routes ONE single-sided
     // (midtexture) seg through DL_Flush; everything else is still software-
     // rendered into the CI8 buffer that the present blit reads.
-    if (rdp_on && (DL_Count() + DL_SpanCount()) > 0)
+    if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount()) > 0)
     {
         int vx0 = viewwindowx;
         int vy0 = viewwindowy;
