@@ -43,6 +43,42 @@ rcsid[] = "$Id: r_plane.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
 #include "rdp_view.h"   // Stage-4 RDP plane span emit (DL_PlaneRouteOn/DL_EmitSpan)
 #endif
 
+// ---- PLANE_UV_TRACE: debug-gated floor-poly texel self-trace ----------------
+// Diagnostic ONLY (no rendering change). When -DPLANE_UV_TRACE=1 (Makefile
+// PLANE_UV_TRACE=1; default 0 -> compiled out of normal/timing builds), dump for
+// the first few floor trapezoid polys of an early frame:
+//   * per corner: screen (x,y), the EMITTED (u,v,invw) R_PlaneCornerAttr made,
+//     and the EXPECTED masked texel (s,t) R_MapPlane's per-pixel integer math
+//     yields at that corner's screen pixel;
+//   * at the poly CENTER pixel: the RDP's RECONSTRUCTED texel (bilinear-interp
+//     the corner u*invw,v*invw,invw to centre, then divide) vs R_MapPlane's
+//     EXPECTED (s,t) at that same pixel;
+//   * the frame constants (planeheight, viewx, viewy, projectiony, centery).
+// The orchestrator compares these to localise the garbage-floor bug. Cheap and
+// fully compiled out unless the flag is set. Uses debugf -> ISViewer, so it
+// pulls libdragon in only under the flag.
+#ifndef PLANE_UV_TRACE
+#define PLANE_UV_TRACE 0
+#endif
+#if PLANE_UV_TRACE
+#include <math.h>               // floorf (trace float formatting)
+#include <libdragon.h>          // debugf -> ISViewer (flag-gated only)
+#include "tables.h"             // finecosine/finesine, ANGLETOFINESHIFT
+#ifndef PLANE_UV_TRACE_FRAME
+#define PLANE_UV_TRACE_FRAME 8  // dump on this R_DrawPlanes call (post-warmup)
+#endif
+#ifndef PLANE_UV_TRACE_POLYS
+#define PLANE_UV_TRACE_POLYS 3  // dump at most this many polys that frame
+#endif
+extern int framecount;          // r_main.c per-view frame counter (cross-build)
+static int plane_uv_trace_polys_left = -1;  // armed each matching frame
+// debugf has no float support here, so print floats as int + signed milli-frac.
+// IFLOORF: float -> floor as int (toward -inf, matches texel-cell selection).
+// MILLIFRAC: the |fractional part| in thousandths (0..999) for "%d.%03d".
+#define IFLOORF(f)   ((int)floorf((float)(f)))
+#define MILLIFRAC(f) ((int)(( (float)(f) - floorf((float)(f)) ) * 1000.0f))
+#endif
+
 
 
 planefunction_t		floorfunc;
@@ -589,6 +625,46 @@ R_PlaneCornerAttr
     *invw = dyrows;     // dyrows >= 0.03125 (guarded above) -> 1/INV_W bounded
 }
 
+#if PLANE_UV_TRACE
+// GROUND TRUTH for the self-trace: R_MapPlane's EXACT per-pixel integer math at
+// an ARBITRARY screen pixel (xs,ys). Returns the masked texel (s,t)&63 the
+// software floor would sample there -- the same chain R_MapPlane runs:
+//   distance = FixedMul(planeheight, yslope[ys])
+//   length   = FixedMul(distance, distscale[xs])
+//   ds_xfrac = viewx + FixedMul(finecosine[ang], length)   ; s = (xfrac>>16)&63
+//   ds_yfrac = -viewy - FixedMul(finesine[ang], length)    ; t = (yfrac>>16)&63
+// (ang = (viewangle+xtoviewangle[xs])>>ANGLETOFINESHIFT). Integer-faithful, so
+// it is the literal reference the emitted/reconstructed texels must reproduce.
+// Also returns the raw (unmasked) fixed_t xfrac/yfrac so the trace can show the
+// pre-wrap texel position too.
+static void
+R_PlaneExpectedTexel
+( int       xs,
+  int       ys,
+  int*      s_out,
+  int*      t_out,
+  fixed_t*  xfrac_out,
+  fixed_t*  yfrac_out )
+{
+    angle_t ang;
+    fixed_t distance, length, xfrac, yfrac;
+
+    if (xs < 0) xs = 0; else if (xs >= viewwidth)  xs = viewwidth  - 1;
+    if (ys < 0) ys = 0; else if (ys >= viewheight) ys = viewheight - 1;
+
+    distance = FixedMul(planeheight, yslope[ys]);
+    length   = FixedMul(distance, distscale[xs]);
+    ang      = (viewangle + xtoviewangle[xs]) >> ANGLETOFINESHIFT;
+    xfrac    =  viewx + FixedMul(finecosine[ang], length);
+    yfrac    = -viewy - FixedMul(finesine[ang],   length);
+
+    *xfrac_out = xfrac;
+    *yfrac_out = yfrac;
+    *s_out = (int)((xfrac >> 16) & 63);
+    *t_out = (int)((yfrac >> 16) & 63);
+}
+#endif // PLANE_UV_TRACE
+
 // Emit ONE trapezoid run [xa..xb] of a covered island as a quad. top[]/bottom[]
 // are the visplane's per-column edges; the corner Y geometry uses the EXACT same
 // half-pixel extrapolation R_CountIslandRuns builds (so the emitted quad's screen
@@ -643,6 +719,113 @@ R_EmitRunPoly
     p.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
 
     DL_EmitPlanePoly(&p, cm);
+
+#if PLANE_UV_TRACE
+    // ---- floor-poly texel self-trace (diagnostic, no render effect) ----------
+    // Fires for the first PLANE_UV_TRACE_POLYS polys of frame PLANE_UV_TRACE_FRAME
+    // only. Dumps, per corner: screen(x,y), EMITTED(u,v,invw), and the EXPECTED
+    // masked texel (s,t)&63 R_MapPlane would sample at that corner pixel. Then at
+    // the poly's parametric-center pixel: the RDP-RECONSTRUCTED texel (bilinear
+    // u*invw,v*invw,invw -> divide -> &63) vs R_MapPlane's EXPECTED there. If the
+    // corners already disagree -> the corner-attr derivation is wrong. If corners
+    // agree but the center reconstruction diverges -> the INV_W / screen-affine
+    // assumption is the bug.
+    if (framecount == PLANE_UV_TRACE_FRAME)
+    {
+        if (plane_uv_trace_polys_left < 0)      // first poly seen this frame: arm
+        {
+            plane_uv_trace_polys_left = PLANE_UV_TRACE_POLYS;
+            debugf("PUVT_FRAME frame=%d planeheight=%d viewx=%d viewy=%d "
+                   "projectiony=%d centery=%d viewwidth=%d viewheight=%d\n",
+                   framecount, (int)planeheight, (int)viewx, (int)viewy,
+                   (int)projectiony, (int)centery, viewwidth, viewheight);
+        }
+
+        if (plane_uv_trace_polys_left > 0)
+        {
+            int   i;
+            // Corner screen coords + emitted attrs in a 4-entry array
+            // (order: TL, TR, BL, BR), matching p.* and the xl/xr/yt*/yb* above.
+            float cx[4]   = { xl,        xr,        xl,        xr        };
+            float cy[4]   = { ytl,       ytr,       ybl,       ybr       };
+            float cu[4]   = { p.u_tl,    p.u_tr,    p.u_bl,    p.u_br    };
+            float cv[4]   = { p.v_tl,    p.v_tr,    p.v_bl,    p.v_br    };
+            float ciw[4]  = { p.invw_tl, p.invw_tr, p.invw_bl, p.invw_br };
+            const char* nm[4] = { "TL", "TR", "BL", "BR" };
+
+            debugf("PUVT_POLY n=%d xrun=%d..%d ytl=%d ytr=%d ybl=%d ybr=%d\n",
+                   PLANE_UV_TRACE_POLYS - plane_uv_trace_polys_left,
+                   xa, xb, (int)ytl, (int)ytr, (int)ybl, (int)ybr);
+
+            for (i = 0; i < 4; i++)
+            {
+                int     xs = (int)(cx[i] + 0.5f);
+                int     ys = (int)(cy[i] + 0.5f);
+                int     es, et;
+                fixed_t exf, eyf;
+                // Emitted u,v are raw texels; mask to the 64 period for the
+                // apples-to-apples compare against R_MapPlane's masked s,t.
+                int     emu = ((int)IFLOORF(cu[i])) & 63;
+                int     emv = ((int)IFLOORF(cv[i])) & 63;
+
+                R_PlaneExpectedTexel(xs, ys, &es, &et, &exf, &eyf);
+
+                // Print emitted u,v in milli-texels (x1000) to keep it integer.
+                debugf("PUVT_C %s sx=%d sy=%d emit_u=%d.%03d emit_v=%d.%03d "
+                       "invw=%d.%03d emit_s=%d emit_t=%d exp_s=%d exp_t=%d "
+                       "exp_xfrac=%d exp_yfrac=%d\n",
+                       nm[i], xs, ys,
+                       IFLOORF(cu[i]), MILLIFRAC(cu[i]),
+                       IFLOORF(cv[i]), MILLIFRAC(cv[i]),
+                       IFLOORF(ciw[i]), MILLIFRAC(ciw[i]),
+                       emu, emv, es, et, (int)exf, (int)eyf);
+            }
+
+            // ---- CENTER pixel: RDP reconstruction vs R_MapPlane expected ------
+            // Bilinear-interp the corner (u*invw), (v*invw), invw to the
+            // parametric center (fx=fy=0.5), then divide -> the texel the RDP's
+            // perspective-correct rasterizer reconstructs at the poly's middle.
+            {
+                float uw_tl = cu[0]*ciw[0], uw_tr = cu[1]*ciw[1];
+                float uw_bl = cu[2]*ciw[2], uw_br = cu[3]*ciw[3];
+                float vw_tl = cv[0]*ciw[0], vw_tr = cv[1]*ciw[1];
+                float vw_bl = cv[2]*ciw[2], vw_br = cv[3]*ciw[3];
+
+                // bilinear at fx=fy=0.5 == simple average of the 4 corners.
+                float uw_c = 0.25f*(uw_tl + uw_tr + uw_bl + uw_br);
+                float vw_c = 0.25f*(vw_tl + vw_tr + vw_bl + vw_br);
+                float iw_c = 0.25f*(ciw[0]+ciw[1]+ciw[2]+ciw[3]);
+
+                float s_recon_f = (iw_c != 0.0f) ? (uw_c / iw_c) : 0.0f;
+                float t_recon_f = (iw_c != 0.0f) ? (vw_c / iw_c) : 0.0f;
+                int   s_recon   = ((int)IFLOORF(s_recon_f)) & 63;
+                int   t_recon   = ((int)IFLOORF(t_recon_f)) & 63;
+
+                // Center SCREEN pixel: mid column, mid row at that column.
+                int   xc_s = (int)((xl + xr) * 0.5f);
+                int   yc_s = (int)(((ytl+ytr)*0.5f + (ybl+ybr)*0.5f) * 0.5f);
+                int   es, et;
+                fixed_t exf, eyf;
+
+                R_PlaneExpectedTexel(xc_s, yc_s, &es, &et, &exf, &eyf);
+
+                debugf("PUVT_CTR sx=%d sy=%d recon_s=%d recon_t=%d "
+                       "recon_uf=%d.%03d recon_vf=%d.%03d "
+                       "exp_s=%d exp_t=%d exp_xfrac=%d exp_yfrac=%d\n",
+                       xc_s, yc_s, s_recon, t_recon,
+                       IFLOORF(s_recon_f), MILLIFRAC(s_recon_f),
+                       IFLOORF(t_recon_f), MILLIFRAC(t_recon_f),
+                       es, et, (int)exf, (int)eyf);
+            }
+
+            plane_uv_trace_polys_left--;
+        }
+    }
+    else if (plane_uv_trace_polys_left >= 0)
+    {
+        plane_uv_trace_polys_left = -1;         // re-arm for a future match
+    }
+#endif // PLANE_UV_TRACE
 }
 
 // Recursive trapezoid-run walk for one covered island [xa..xb] -- the EMIT twin

@@ -84,6 +84,15 @@ endif
 ifeq ($(DL_TRACE),1)
 CFLAGS += -DDL_DEBUG_TRACE=1
 endif
+# PLANE_UV_TRACE=1: one-off diagnostic builds only -- floor-poly texel self-trace
+# (PUVT_* lines on the ISViewer log; r_plane.c PLANE_UV_TRACE). Dumps, for the
+# first few floor trapezoid polys of an early frame, the per-corner EMITTED u/v/
+# invw vs R_MapPlane's EXPECTED s/t AND the poly-center RDP-reconstructed texel
+# vs expected, to localise the garbage-floor bug. Never for timing runs (the
+# debugf cost + log traffic skew the numbers); default off (compiled out).
+ifeq ($(PLANE_UV_TRACE),1)
+CFLAGS += -DPLANE_UV_TRACE=1
+endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
 CFLAGS += -I$(CURDIR)/libdragon/include
