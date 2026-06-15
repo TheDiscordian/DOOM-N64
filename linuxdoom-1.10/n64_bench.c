@@ -83,6 +83,12 @@ typedef struct
     uint16_t recs;          // RDP wall records drawn this present (A/B lever)
     uint16_t uploads;       // RDP wall upload calls this present (A/B lever)
     uint16_t tris;          // RDP wall triangles emitted this present (A/B lever)
+#ifdef PLANETESS_COUNT
+    uint16_t plane_polytris; // count-only: tris this frame's visplanes WOULD
+                             // tessellate into as RDP trapezoid strips (go/no-go
+                             // for the "visplanes as RDP polygons" feature; no
+                             // render, no UV -- R_CountPlanePolyTris in r_plane.c)
+#endif
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -124,6 +130,9 @@ static int              cur_tics_ran;
 static uint16_t         cur_vissprites;
 static uint16_t         cur_drawsegs;
 static uint16_t         cur_visplanes;
+#ifdef PLANETESS_COUNT
+static uint16_t         cur_plane_polytris;	// count-only plane-poly tris this frame
+#endif
 
 // Outlier (level-reload) frames: counted separately, kept out of tail stats.
 static unsigned long    outlier_frames;
@@ -181,6 +190,9 @@ void N64Bench_Init(void)
     memset(cur_phase_tk, 0, sizeof(cur_phase_tk));
     cur_tics_ran = 0;
     cur_vissprites = cur_drawsegs = cur_visplanes = 0;
+#ifdef PLANETESS_COUNT
+    cur_plane_polytris = 0;
+#endif
     outlier_frames = 0;
     outlier_max_us = 0;
     bench_virtual_iter = 0;
@@ -282,6 +294,9 @@ void N64Bench_LoopBegin(void)
     memset(cur_phase_tk, 0, sizeof(cur_phase_tk));
     cur_tics_ran = 0;
     cur_vissprites = cur_drawsegs = cur_visplanes = 0;
+#ifdef PLANETESS_COUNT
+    cur_plane_polytris = 0;
+#endif
     loop_start_ticks = get_ticks();
     loop_open = 1;
 }
@@ -346,6 +361,19 @@ void N64Bench_SetCounts(int vissprites, int drawsegs, int visplanes)
     cur_drawsegs   = (uint16_t)drawsegs;
     cur_visplanes  = (uint16_t)visplanes;
 }
+
+#ifdef PLANETESS_COUNT
+// Count-only latch for the "visplanes as RDP polygons" go/no-go measurement:
+// the number of triangles this frame's visplanes WOULD tessellate into as RDP
+// trapezoid strips (R_CountPlanePolyTris in r_plane.c). Separate setter so the
+// SetCounts call site (r_main.c) stays byte-identical when the flag is off.
+void N64Bench_SetPlanePolyTris(int polytris)
+{
+    if (!loop_open)
+        return;
+    cur_plane_polytris = (uint16_t)polytris;
+}
+#endif
 
 void N64Bench_DisplayBegin(void)
 {
@@ -435,6 +463,9 @@ void N64Bench_LoopEnd(void)
             f->uploads = DL_UploadCount ? (uint16_t)DL_UploadCount() : 0;
             f->tris    = DL_TriCount    ? (uint16_t)DL_TriCount()    : 0;
         }
+#ifdef PLANETESS_COUNT
+        f->plane_polytris = cur_plane_polytris;
+#endif
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
     }
@@ -607,6 +638,39 @@ static unsigned long N64Bench_FieldP95(int phase)
     return (unsigned long)BENCH_HIST_OVERFLOW << BENCH_HIST_US_SHIFT;
 }
 
+#ifdef PLANETESS_COUNT
+// p95 of the per-frame plane-poly-tri count (count-only go/no-go measurement).
+// Triangle counts are small integers, so this buckets the value DIRECTLY (one
+// bucket per tri count -- no quantization), giving an EXACT p95 rather than the
+// 64us-bucketed estimate N64Bench_FieldP95 uses for microsecond timings. Counts
+// far beyond BENCH_HIST_BUCKETS (4096) clamp to the overflow bucket, which the
+// E1M1 plane geometry never approaches.
+static unsigned long N64Bench_PlanePolyTrisP95(void)
+{
+    static unsigned long fhist[BENCH_HIST_BUCKETS];
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long b = bench_frames[i].plane_polytris;
+        if (b >= BENCH_HIST_BUCKETS) b = BENCH_HIST_OVERFLOW;
+        fhist[b]++;
+    }
+    target = (bench_frame_count * 95UL + 99) / 100;
+    cum = 0;
+    for (i = 0; i < BENCH_HIST_BUCKETS; i++)
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return i;       // exact tri count at the 95th percentile frame
+    }
+    return BENCH_HIST_OVERFLOW;
+}
+#endif
+
 // us threshold at/above which a frame is in the worst BENCH_TAIL_PCT, found by
 // scanning the frame-total histogram from the top.
 static unsigned long N64Bench_TailThreshold(unsigned long* out_tail_target)
@@ -644,6 +708,9 @@ static void N64Bench_ReportPhases(void)
     unsigned long long vissprite_sum = 0, drawseg_sum = 0, visplane_sum = 0;
     unsigned long long tileload_sum = 0;
     unsigned long long rec_sum = 0, upload_sum = 0, tri_sum = 0;
+#ifdef PLANETESS_COUNT
+    unsigned long long plane_polytris_sum = 0;
+#endif
     unsigned long tics_frames = 0;
 
     unsigned long tail_thresh, tail_target, tail_n = 0;
@@ -690,6 +757,9 @@ static void N64Bench_ReportPhases(void)
         rec_sum       += f->recs;
         upload_sum    += f->uploads;
         tri_sum       += f->tris;
+#ifdef PLANETESS_COUNT
+        plane_polytris_sum += f->plane_polytris;
+#endif
         if (f->tics_ran) tics_frames++;
 
         // tail accumulation
@@ -752,6 +822,16 @@ static void N64Bench_ReportPhases(void)
            (unsigned long)(upload_sum / bench_frame_count),
            (unsigned long)(tri_sum / bench_frame_count),
            (unsigned long)(tileload_sum / bench_frame_count));
+#ifdef PLANETESS_COUNT
+    // DECISIVE go/no-go line for "visplanes as RDP polygons": mean + EXACT p95
+    // of the per-frame triangle count the frame's visplanes WOULD tessellate
+    // into as RDP trapezoid strips (count-only; reuses the wall split predicate
+    // DL_SPLIT_DEVY ~= 1.25 rows). Verdict gate: mean < ~120 and p95 < ~250 = GO;
+    // p95 > ~300 = NO-GO.
+    debugf("BENCH_PLANETESS mean_plane_polytris=%lu p95_plane_polytris=%lu\n",
+           (unsigned long)(plane_polytris_sum / bench_frame_count),
+           N64Bench_PlanePolyTrisP95());
+#endif
 
     // --- tail report (worst BENCH_TAIL_PCT%) ------------------------------
     if (tail_n)

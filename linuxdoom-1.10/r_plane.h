@@ -65,6 +65,13 @@ R_MakeSpans
 
 void R_DrawPlanes (void);
 
+#if defined(N64_BENCH) && defined(PLANETESS_COUNT)
+// Count-only go/no-go for "visplanes as RDP polygons": returns the triangle
+// count this frame's visplanes WOULD tessellate into as RDP trapezoid strips
+// (reuses the wall split predicate DL_SPLIT_DEVY). No render, no UV, no emit.
+int R_CountPlanePolyTris (void);
+#endif
+
 visplane_t*
 R_FindPlane
 ( fixed_t	height,

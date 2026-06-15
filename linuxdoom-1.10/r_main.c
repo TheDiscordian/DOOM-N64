@@ -1082,6 +1082,13 @@ void R_RenderPlayerView (player_t* player)
     N64Bench_SetCounts((int)(vissprite_p - vissprites),
 		       (int)(ds_p - drawsegs),
 		       (int)(lastvisplane - visplanes));
+#ifdef PLANETESS_COUNT
+    // Count-only go/no-go for "visplanes as RDP polygons": the visplane pool is
+    // still full here (R_DrawPlanes does not clear it; next frame's R_ClearPlanes
+    // does), so tessellate-count it now. Pure measurement -- reads top[]/bottom[],
+    // emits nothing, does not perturb the geometry fingerprint.
+    N64Bench_SetPlanePolyTris(R_CountPlanePolyTris());
+#endif
 #else
     R_DrawMasked ();
 #endif

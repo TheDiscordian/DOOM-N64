@@ -563,3 +563,154 @@ void R_DrawPlanes (void)
 	Z_ChangeTag (ds_source, PU_CACHE);
     }
 }
+
+
+#if defined(N64_BENCH) && defined(PLANETESS_COUNT)
+//
+// R_CountPlanePolyTris  --  DECISIVE go/no-go measurement for the future
+// "visplanes as RDP polygons" feature. COUNT ONLY: no rendering, no UV, no RDP
+// emit. It answers one question -- if each frame's visplanes were tessellated
+// into TRAPEZOID STRIPS (one quad = 2 triangles per straight run, the run
+// breaking wherever the top or bottom edge deviates from a straight
+// interpolation by more than the split threshold), how many triangles per
+// frame would that be? Mean + p95 over the bench decide viability before any
+// real rebuild.
+//
+// The split predicate is REUSED from the wall path's DL_EmitRunPiece
+// (rdp_view.c): the same Y-edge deviation logic and the SAME threshold
+// DL_SPLIT_DEVY (~1.25 rows). The S (texture-column) split lives only in the
+// textured wall path -- there is no UV here (count-only, pre-feature), so this
+// pass applies exactly the geometric Y-edge half of that predicate:
+//   * corners extrapolated half a pixel outward (the rasterizer's interpolation
+//     then passes through the sampled edge values at the end columns' centers),
+//   * top edge = top[x], bottom edge = bottom[x]+1 (mirrors the wall code's
+//     t_yh[x]+1.0f -- bottom is the row PAST the last covered row),
+//   * a run that interpolates within DL_SPLIT_DEVY of every captured column is
+//     ONE trapezoid (2 tris); the first column exceeding it splits the run, and
+//     each sub-piece re-verifies itself (recursion's fixed point at width<=2).
+//
+// Non-convex / disconnected planes: a visplane's top[]/bottom[] carry the 0xff
+// sentinel in columns the plane does not cover (R_FindPlane memsets top to
+// 0xff; a column is covered iff top[x] != 0xff && top[x] <= bottom[x]). The
+// pass walks [minx..maxx] and tessellates each contiguous covered ISLAND
+// independently, so a plane split by an occluder counts as the separate
+// trapezoid strips it would really decompose into.
+//
+// DL_SPLIT_DEVY is duplicated here (not #included) to keep r_plane.c free of
+// the RDP wall header's heavy dependencies; it is the same 1.25-row coverage
+// threshold and is asserted to match by a build-time comment in rdp_view.c.
+#define PLANETESS_SPLIT_DEVY  1.25f
+
+// Recursive trapezoid-run counter for one covered island [xa..xb] of a single
+// visplane, top[]/bottom[] sampled per column. Returns the number of trapezoid
+// runs (each = 2 triangles) the island decomposes into. Direct adaptation of
+// DL_EmitRunPiece's Y-deviation scan (rdp_view.c ~:1840), stripped to the
+// geometric edges (no S/scale/T -- there is no texture in count-only mode).
+static int
+R_CountIslandRuns
+( const byte*	top,
+  const byte*	bottom,
+  int		xa,
+  int		xb,
+  int		depth )
+{
+    float	ytl, ytr, ybl, ybr;	// corner Y edges (ybot is bottom+1)
+    float	width = (float)(xb + 1 - xa);
+    int		x;
+
+    // Corner attributes, extrapolated half a pixel outward along each end
+    // column's local per-column step -- identical construction to
+    // DL_EmitRunPiece. A width-1 island gets the column's own constant edges.
+    {
+	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
+	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
+
+	if (xb > xa)
+	{
+	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
+	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
+	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
+	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
+	}
+	ytl = tl0;  ytr = tr0;
+	ybl = bl0;  ybr = br0;
+    }
+
+    // Deviation scan: linear-interp each edge across the run and compare to the
+    // captured per-column values; split at the FIRST column whose top or bottom
+    // edge deviates beyond PLANETESS_SPLIT_DEVY. Width-1/2 islands are exact by
+    // construction (the lerp through two extrapolated corners passes through
+    // both column samples), so they skip the scan and terminate the recursion.
+    if (xb > xa + 1)
+    {
+	for (x = xa; x <= xb; x++)
+	{
+	    float f  = ((float)x + 0.5f - (float)xa) / width;
+	    float lt = ytl + (ytr - ytl) * f;
+	    float lb = ybl + (ybr - ybl) * f;
+	    float dT = lt - (float)top[x];
+	    float dB = ((float)bottom[x] + 1.0f) - lb;
+	    float aT = (dT < 0.0f) ? -dT : dT;
+	    float aB = (dB < 0.0f) ? -dB : dB;
+
+	    if ((aT > PLANETESS_SPLIT_DEVY || aB > PLANETESS_SPLIT_DEVY)
+		&& depth < 10)
+	    {
+		// Split at the first deviating column; keep both halves
+		// non-empty so the recursion always shrinks (exactly the
+		// midpoint rule DL_EmitRunPiece uses).
+		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
+		return R_CountIslandRuns(top, bottom, xa, xm, depth + 1)
+		     + R_CountIslandRuns(top, bottom, xm + 1, xb, depth + 1);
+	    }
+	}
+    }
+
+    // One trapezoid run covers this island span.
+    return 1;
+}
+
+// Walk every visplane in the frame, split each into covered islands over
+// [minx..maxx], count trapezoid runs per island, and return total TRIANGLES
+// (runs * 2). Pure measurement -- does not touch the renderer, the visplane
+// pool, or any latched count, so the geometry fingerprint is unperturbed.
+int R_CountPlanePolyTris (void)
+{
+    visplane_t*	pl;
+    int		total_runs = 0;
+
+    for (pl = visplanes ; pl < lastvisplane ; pl++)
+    {
+	int x;
+
+	if (pl->minx > pl->maxx)
+	    continue;
+
+	// Walk [minx..maxx], grouping contiguous covered columns into islands.
+	// A column is covered iff its top sentinel is clear AND top <= bottom
+	// (an empty/degenerate column reads top == 0xff from the R_FindPlane
+	// memset, or a crossed pair from clip interplay -- either way no span).
+	x = pl->minx;
+	while (x <= pl->maxx)
+	{
+	    int xa, xb;
+
+	    while (x <= pl->maxx
+		   && (pl->top[x] == 0xff || pl->top[x] > pl->bottom[x]))
+		x++;
+	    if (x > pl->maxx)
+		break;
+
+	    xa = x;
+	    while (x <= pl->maxx
+		   && pl->top[x] != 0xff && pl->top[x] <= pl->bottom[x])
+		x++;
+	    xb = x - 1;
+
+	    total_runs += R_CountIslandRuns(pl->top, pl->bottom, xa, xb, 0);
+	}
+    }
+
+    return total_runs * 2;	// 2 triangles per trapezoid run
+}
+#endif	// N64_BENCH && PLANETESS_COUNT

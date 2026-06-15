@@ -40,6 +40,14 @@ CFLAGS += -IDOOM_N64_Port_Example/src
 CFLAGS += -DDEBUG=$(DEBUG)
 ifeq ($(BENCH),1)
 CFLAGS += -DN64_BENCH=1
+# PLANETESS_COUNT=1: count-only go/no-go instrumentation for the future
+# "visplanes as RDP polygons" feature. Every bench frame, R_CountPlanePolyTris
+# (r_plane.c) tessellates the live visplanes into trapezoid strips using the
+# wall split predicate (DL_SPLIT_DEVY) and reports the triangle count -- mean +
+# p95 on the BENCH_PLANETESS line. NO render / NO UV / NO RDP emit, so the
+# geometry fingerprint is unperturbed. Always on for bench builds (the visplanes
+# exist regardless of which wall/plane renderer is selected).
+CFLAGS += -DPLANETESS_COUNT=1
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

@@ -95,6 +95,13 @@ void N64Bench_SetTicsRan(int tics);
 // Called from R_RenderPlayerView after R_DrawMasked, when the pools are full.
 void N64Bench_SetCounts(int vissprites, int drawsegs, int visplanes);
 
+#ifdef PLANETESS_COUNT
+// Latch the count-only go/no-go measurement for "visplanes as RDP polygons":
+// the triangle count this frame's visplanes WOULD tessellate into as RDP
+// trapezoid strips (R_CountPlanePolyTris). Same call site as SetCounts.
+void N64Bench_SetPlanePolyTris(int polytris);
+#endif
+
 // Called once per gametic from G_Ticker to advance scenario timing/phases.
 void N64Bench_TicHook(void);
 
