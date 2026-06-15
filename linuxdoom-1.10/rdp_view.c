@@ -218,6 +218,13 @@ typedef struct
     uint8_t  subpal_r[16];  // gamma RGB of each sub-palette entry (downsample snap)
     uint8_t  subpal_g[16];
     uint8_t  subpal_b[16];
+    uint8_t  subpal_idx[16];// PLAYPAL index each sub-palette entry resolved to.
+                            // The slot SELECTION is fixed (built once from base
+                            // PLAYPAL); on a palette flash the colours are re-
+                            // derived from the CURRENT master TLUT at THESE indices
+                            // so walls tint with the world (DL_RetintSubPalettes).
+    uint32_t subpal_gen;    // palette generation the subpal[] COLOURS track (0 ==
+                            // base PLAYPAL, as built). Re-tint when != current gen.
     uint8_t  remap[256];    // PLAYPAL index -> sub-palette slot (0..subpal_n-1)
 } dl_rowmajor_t;
 
@@ -305,6 +312,8 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
     dl_mc_box_t boxes[16];
     int   nboxes;
     uint8_t  pal_r[16], pal_g[16], pal_b[16];   // final sub-palette RGB (gamma)
+    uint8_t  pal_idx[16];                       // PLAYPAL index of each entry
+                                                // (for per-flash re-tint)
 
     if (slot->subpal_inited)
         return;
@@ -324,6 +333,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
         slot->subpal[0] = 1;        // black, opaque
         slot->subpal_n  = 1;
         memset(slot->remap, 0, sizeof(slot->remap));
+        memset(slot->subpal_idx, 0, sizeof(slot->subpal_idx)); // PLAYPAL idx 0
         slot->subpal_inited = 1;
         return;
     }
@@ -353,6 +363,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
         slot->subpal[0] = 1;
         slot->subpal_n  = 1;
         memset(slot->remap, 0, sizeof(slot->remap));
+        memset(slot->subpal_idx, 0, sizeof(slot->subpal_idx)); // PLAYPAL idx 0
         slot->subpal_inited = 1;
         return;
     }
@@ -363,6 +374,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
         for (i = 0; i < nuniq; i++)
         {
             pal_r[i] = wr[i]; pal_g[i] = wg[i]; pal_b[i] = wb[i];
+            pal_idx[i] = wpix[i];       // PLAYPAL index of this entry (re-tint)
         }
         slot->subpal_n = (uint8_t)nuniq;
     }
@@ -481,6 +493,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
             pal_r[k]=gammatable[usegamma][playpal[bestidx*3+0]];
             pal_g[k]=gammatable[usegamma][playpal[bestidx*3+1]];
             pal_b[k]=gammatable[usegamma][playpal[bestidx*3+2]];
+            pal_idx[k]=(uint8_t)bestidx;    // PLAYPAL index of this entry (re-tint)
         }
         slot->subpal_n = (uint8_t)nboxes;
     }
@@ -497,6 +510,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
         slot->subpal_r[k] = pal_r[k];
         slot->subpal_g[k] = pal_g[k];
         slot->subpal_b[k] = pal_b[k];
+        slot->subpal_idx[k] = pal_idx[k];   // PLAYPAL index for per-flash re-tint
     }
     for (; k < 16; k++)
     {
@@ -504,6 +518,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
         slot->subpal_r[k] = slot->subpal_r[0];
         slot->subpal_g[k] = slot->subpal_g[0];
         slot->subpal_b[k] = slot->subpal_b[0];
+        slot->subpal_idx[k] = slot->subpal_idx[0];
     }
 
     // remap[]: every PLAYPAL index -> nearest sub-palette slot (squared RGB on
@@ -524,6 +539,55 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
     }
 
     slot->subpal_inited = 1;
+}
+
+// --- CI4 damage-flash re-tint (palette-flash correctness) -------------------
+// Palette flashes (damage red / pickup gold / radsuit green / invuln) work by
+// tinting the master 256-TLUT via I_SetPalette; CI8 sprites/planes/HUD sample
+// the master so they flash. CI4 walls sample their OWN 16-entry sub-palettes,
+// built ONCE from the BASE PLAYPAL and never re-tinted -> walls stayed un-flashed
+// (Ryan: "the red that washes over everything doesn't hit the walls anymore").
+//
+// FIX: when the palette generation changes (a real flash, not the wall pass's own
+// forced re-upload), re-derive each initialized sub-palette's 16 RGBA5551 entries
+// from the CURRENT master TLUT at the entry's FIXED PLAYPAL index (subpal_idx[k]).
+// The index SELECTION stays fixed (so the texture's quantization is unchanged);
+// only the COLOURS track the flash, exactly like the CI8 world. Per-flash re-pack
+// (~16 small palettes x <=16 entries), not per-frame -- gated on the generation.
+// Alpha is forced opaque (walls are never the transparency key).
+extern uint32_t I_N64PaletteGen(void);
+extern const uint16_t* I_N64MasterTLUT(void);
+
+// Re-derive ONE slot's 16 sub-palette entries from the current master TLUT at the
+// entry's fixed PLAYPAL index (alpha forced opaque -- walls are never the key),
+// and stamp the slot with the generation its colours now track. No-op if already
+// current. The master is fetched once as a pointer and indexed directly (no
+// per-entry cross-TU call). Used by the lazy per-texture upload path.
+static void DL_RetintSlot(dl_rowmajor_t* slot, uint32_t gen)
+{
+    const uint16_t* master;
+    int k;
+    if (!slot->subpal_inited || slot->subpal_gen == gen)
+        return;
+    master = I_N64MasterTLUT();
+    for (k = 0; k < 16; k++)
+        slot->subpal[k] = (uint16_t)((master[slot->subpal_idx[k]]
+                                      & ~(uint16_t)1) | 1);
+    slot->subpal_gen = gen;
+}
+
+// Latch the current palette generation for this flush. The per-slot retint is
+// LAZY: every texture that draws this frame passes the upload site, where
+// DL_RetintSlot(slot, dl_retint_gen) re-derives its colours if they don't track
+// the current flash. So the flush only needs to record the generation here --
+// textures NOT drawn this frame are not visible and don't need retinting (they
+// re-tint lazily whenever they next draw). Cost is O(touched) on a flash frame,
+// not O(numtextures), and zero on un-flashed frames (DL_RetintSlot's gen check).
+static uint32_t dl_retint_gen = 0xFFFFFFFFu;    // palette gen this flush tracks
+
+static void DL_RetintSubPalettes(void)
+{
+    dl_retint_gen = I_N64PaletteGen();
 }
 
 // --- per-texture downsample-error metric (selective S-downsample gate) -------
@@ -2539,6 +2603,13 @@ void DL_Flush(void)
     dl_last_tile_wrap = -1;
     dl_last_prim      = 0;      // no PRIM resident (caller's setup left it unset)
 
+    // CI4 DAMAGE-FLASH CORRECTNESS. Latch the current palette generation; each
+    // texture's sub-palette is then re-tinted LAZILY at its upload site below
+    // (DL_RetintSlot) if its colours don't track the current flash. So walls tint
+    // with the world on damage/pickup/radsuit flashes, at O(touched) cost on a
+    // flash frame and zero on un-flashed frames.
+    DL_RetintSubPalettes();
+
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
     // every record chained in that texture's bucket. All of a texture's uploads
@@ -2587,6 +2658,11 @@ void DL_Flush(void)
             surface_t texsurf;
 
             slot->pal_slot = (uint8_t)pal_slot;
+            // First-touch-during-flash: DL_RowMajorBlock just built this slot from
+            // base PLAYPAL (the flush-top sweep ran before it existed), so re-tint
+            // it from the current master before its sub-palette is uploaded. No-op
+            // (gen match) for slots the sweep already handled.
+            DL_RetintSlot(slot, dl_retint_gen);
             // Copy this texture's sub-palette into ITS slot's persistent scratch
             // (the LOAD_TLUT reads it asynchronously; per-slot buffers keep each
             // alive through the frame's async window). Tail frames with >16

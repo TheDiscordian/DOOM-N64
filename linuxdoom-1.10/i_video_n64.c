@@ -57,6 +57,23 @@ static boolean n64_aux_screen_owned[3];
 // the buffer is free for CPU reuse its slot is free to rewrite -- a queued
 // LOAD_TLUT can never see a rewrite, however fast the palette churns.
 static uint16_t doom_tlut_master[256];
+
+// Palette GENERATION: bumped ONLY when I_SetPalette actually rewrites the master
+// (a real palette/flash change -- damage red, pickup, radsuit green, invuln). The
+// CI4 wall pass reads this to re-tint its sub-palettes when the flash changes, so
+// walls track the world flash (they sample their own 16-entry sub-palettes built
+// from the BASE palette, not the master, so without this they would stay un-
+// flashed). NOT bumped by I_N64ForceTLUTReupload / I_N64MarkPaletteDirty (those
+// only re-arm the existing master's upload, no colour change), so the wall re-tint
+// fires once per flash, not every frame.
+static uint32_t doom_palette_gen;
+uint32_t I_N64PaletteGen(void) { return doom_palette_gen; }
+
+// The live (flashed) master TLUT (RGBA5551, 256 entries). The CI4 wall pass
+// re-derives each sub-palette entry's colour from the master at its fixed PLAYPAL
+// index so wall colours track palette flashes. Returned as a pointer so the wall
+// re-tint indexes it directly (no per-entry cross-TU call on flash frames).
+const uint16_t* I_N64MasterTLUT(void) { return doom_tlut_master; }
 static uint16_t doom_tlut_up[2][256] __attribute__((aligned(16)));
 static uint64_t last_menu_present_ms;
 static boolean n64_split_active;
@@ -1496,6 +1513,7 @@ void I_SetPalette(byte* palette)
     }
 
     n64_palette_dirty = true;
+    doom_palette_gen++;     // real colour change: the CI4 wall re-tint tracks this
 }
 
 // The renderer toggle changes the key index's TLUT alpha bit (see I_SetPalette),
