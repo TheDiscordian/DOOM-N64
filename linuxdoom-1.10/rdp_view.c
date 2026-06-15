@@ -1505,13 +1505,26 @@ void DL_RouteCapture(int tier, int x, int yl, int yh, fixed_t scale,
 // overflow class the old fixed-point corner math inherited from vanilla.
 
 // Split thresholds. Y: deviation beyond ~a row means the lerped edge cannot
-// represent the truncated/clipped span shape -- split. S: the floor admits
-// the sub-texel residue of projective math; the 0.51*step term admits the
-// irreducible half-column anchor uncertainty at glancing minification (an S
-// error under half the local per-column S step shifts sampling by less than
-// software's own column quantization).
+// represent the truncated/clipped span shape -- split. This is COVERAGE
+// (correctness: an undercovered row stays key-index = a junction gap), so it
+// stays TIGHT at ~1 row -- NOT a perf lever.
+//
+// S: the floor admits the sub-texel residue of projective math; the adaptive
+// term (DL_SPLIT_SCOEF * local per-column S step) admits the half-column anchor
+// uncertainty at glancing minification. Ryan ACCEPTED the CI4 glancing look, so
+// the floor is RAISED 1.5 -> 2.0 texels: a glancing wall whose projective S
+// already tracks software within ~2 texels no longer shatters into extra
+// sub-pieces (each split is +1 record = +2 triangles + dlbuild). The look comes
+// from S compression itself, not the split count, so it is unchanged (glancing
+// A/B confirms). MEASURED: net-neutral on avg in the bench scenario (few glancing
+// segs there) with a small p95 improvement -- it is a tail/glancing-frame lever,
+// not a hot-path one; pushing the floor/coefficient harder (2.75/1.0) measured a
+// slight avg REGRESSION (larger runs -> wider T-span -> more band work), so 2.0
+// is the net-neutral-or-better setting. Y coverage (DL_SPLIT_DEVY) stays TIGHT
+// at ~1 row -- correctness (an undercovered row is a junction gap), not a lever.
 #define DL_SPLIT_DEVY   1.25f
-#define DL_SPLIT_DEVS   1.5f
+#define DL_SPLIT_DEVS   2.0f
+#define DL_SPLIT_SCOEF  0.51f
 
 static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
                             int cy, float k, int depth)
@@ -1596,7 +1609,7 @@ static void DL_EmitRunPiece(int tier, int xa, int xb, fixed_t mid, int texnum,
                 if (st < 0) st = -st;
                 if (st > maxstep) maxstep = st;
             }
-            sthresh = 0.51f * (float)maxstep;
+            sthresh = DL_SPLIT_SCOEF * (float)maxstep;
             if (sthresh < DL_SPLIT_DEVS)
                 sthresh = DL_SPLIT_DEVS;
         }
