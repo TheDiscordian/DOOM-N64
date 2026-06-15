@@ -376,35 +376,11 @@ static inline int DL_RGBdist2(int r0,int g0,int b0,int r1,int g1,int b1)
     return dr*dr + dg*dg + db*db;
 }
 
-// The CI4 sub-palette output a quantize fills: the 16 RGBA5551 TLUT entries, the
-// gamma RGB + PLAYPAL index of each entry (downsample snap / per-flash re-tint),
-// the entry count, and the 256-entry PLAYPAL-index -> slot remap. The wall slot
-// (dl_rowmajor_t) and the flat slot (dl_flat_ci4_t) both embed these fields at
-// the same names, so the quantizer writes via explicit pointers and BOTH paths
-// share the identical median-cut + snap (no second copy of the algorithm).
-typedef struct
-{
-    uint16_t* subpal;       // [16] RGBA5551 TLUT
-    uint8_t*  subpal_r;     // [16] gamma R
-    uint8_t*  subpal_g;     // [16] gamma G
-    uint8_t*  subpal_b;     // [16] gamma B
-    uint8_t*  subpal_idx;   // [16] PLAYPAL index of each entry
-    uint8_t*  remap;        // [256] PLAYPAL index -> slot
-    uint8_t*  subpal_n;     // out: entry count (1..16)
-} dl_subpal_out_t;
-
-// Quantize a 256-bin PLAYPAL-index frequency histogram into a <=16-colour CI4
-// sub-palette (the Stage-3 wall algorithm, factored so flats reuse it verbatim):
-//   1. <=16 distinct indices -> take them verbatim (lossless);
-//   2. else frequency-weighted median-cut in gamma-RGB to 16 representatives,
-//      each snapped to its nearest PLAYPAL entry (squared-RGB distance);
-//   3. fill remap[] (every PLAYPAL index -> nearest of the <=16, squared-RGB).
-// All-zero histogram -> a single black entry. The caller has already stamped the
-// destination as un-inited; this writes the colours/idx/remap/count only.
-static void DL_QuantizeHistogram(const int freq[256], const dl_subpal_out_t* o)
+static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
 {
     const byte* playpal;
-    int   i, k;
+    int   th, tw, col, row, i, k;
+    int   freq[256];
     int   nuniq = 0;
     // working arrays for median-cut (parallel, reordered together)
     uint8_t  wpix[256];     // PLAYPAL index of distinct colour
@@ -416,16 +392,37 @@ static void DL_QuantizeHistogram(const int freq[256], const dl_subpal_out_t* o)
     uint8_t  pal_idx[16];                       // PLAYPAL index of each entry
                                                 // (for per-flash re-tint)
 
+    if (slot->subpal_inited)
+        return;
+
+    // Histogram the FULL-resolution texture (its complete colour set), NOT the
+    // stored downsampled dims: slot->width/height may be the post-downsample 64x64
+    // block, but the sub-palette must represent every colour the texture contains
+    // so the box-filter averages snap to in-gamut entries. Use the original
+    // sampling period / texture height directly.
     playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
-    if (!playpal)
+    tw = texturewidthmask[texnum] + 1;
+    th = textureheight[texnum] >> FRACBITS;
+    if (!playpal || th < 1 || tw < 1)
     {
-        o->subpal[0] = 1;       // black, opaque
-        *o->subpal_n = 1;
-        memset(o->remap, 0, 256);
-        memset(o->subpal_idx, 0, 16);
+        // Degenerate: a single black entry, everything maps to it. Marks the
+        // slot inited so we never retry a broken texture every frame.
+        slot->subpal[0] = 1;        // black, opaque
+        slot->subpal_n  = 1;
+        memset(slot->remap, 0, sizeof(slot->remap));
+        memset(slot->subpal_idx, 0, sizeof(slot->subpal_idx)); // PLAYPAL idx 0
+        slot->subpal_inited = 1;
         return;
     }
 
+    // Frequency histogram over exactly the texels the wall can sample.
+    memset(freq, 0, sizeof(freq));
+    for (col = 0; col < tw; col++)
+    {
+        const byte* src = R_GetColumn(texnum, col);
+        for (row = 0; row < th; row++)
+            freq[src[row]]++;
+    }
     for (i = 0; i < 256; i++)
     {
         if (freq[i] > 0)
@@ -440,10 +437,11 @@ static void DL_QuantizeHistogram(const int freq[256], const dl_subpal_out_t* o)
     }
     if (nuniq == 0)
     {
-        o->subpal[0] = 1;
-        *o->subpal_n = 1;
-        memset(o->remap, 0, 256);
-        memset(o->subpal_idx, 0, 16);
+        slot->subpal[0] = 1;
+        slot->subpal_n  = 1;
+        memset(slot->remap, 0, sizeof(slot->remap));
+        memset(slot->subpal_idx, 0, sizeof(slot->subpal_idx)); // PLAYPAL idx 0
+        slot->subpal_inited = 1;
         return;
     }
 
@@ -455,7 +453,7 @@ static void DL_QuantizeHistogram(const int freq[256], const dl_subpal_out_t* o)
             pal_r[i] = wr[i]; pal_g[i] = wg[i]; pal_b[i] = wb[i];
             pal_idx[i] = wpix[i];       // PLAYPAL index of this entry (re-tint)
         }
-        *o->subpal_n = (uint8_t)nuniq;
+        slot->subpal_n = (uint8_t)nuniq;
     }
     else
     {
@@ -574,96 +572,49 @@ static void DL_QuantizeHistogram(const int freq[256], const dl_subpal_out_t* o)
             pal_b[k]=gammatable[usegamma][playpal[bestidx*3+2]];
             pal_idx[k]=(uint8_t)bestidx;    // PLAYPAL index of this entry (re-tint)
         }
-        *o->subpal_n = (uint8_t)nboxes;
+        slot->subpal_n = (uint8_t)nboxes;
     }
 
-    // Pack the final sub-palette as RGBA5551 (alpha=1, opaque). Also keep each
-    // entry's gamma RGB (the downsample snap reads it) + its PLAYPAL index.
-    for (k = 0; k < *o->subpal_n; k++)
+    // Pack the final sub-palette as RGBA5551 (alpha=1, opaque -- walls are
+    // never the transparency key; the key only matters for the CI8 overlay).
+    // Also keep each entry's gamma RGB: the downsample transpose averages a
+    // source column-group's gamma RGB per row and snaps to the nearest of these.
+    for (k = 0; k < slot->subpal_n; k++)
     {
-        o->subpal[k] = (uint16_t)(((pal_r[k] >> 3) << 11) |
-                                  ((pal_g[k] >> 3) << 6)  |
-                                  ((pal_b[k] >> 3) << 1)  | 1);
-        o->subpal_r[k] = pal_r[k];
-        o->subpal_g[k] = pal_g[k];
-        o->subpal_b[k] = pal_b[k];
-        o->subpal_idx[k] = pal_idx[k];
+        slot->subpal[k] = (uint16_t)(((pal_r[k] >> 3) << 11) |
+                                     ((pal_g[k] >> 3) << 6)  |
+                                     ((pal_b[k] >> 3) << 1)  | 1);
+        slot->subpal_r[k] = pal_r[k];
+        slot->subpal_g[k] = pal_g[k];
+        slot->subpal_b[k] = pal_b[k];
+        slot->subpal_idx[k] = pal_idx[k];   // PLAYPAL index for per-flash re-tint
     }
     for (; k < 16; k++)
     {
-        o->subpal[k]   = o->subpal[0];
-        o->subpal_r[k] = o->subpal_r[0];
-        o->subpal_g[k] = o->subpal_g[0];
-        o->subpal_b[k] = o->subpal_b[0];
-        o->subpal_idx[k] = o->subpal_idx[0];
+        slot->subpal[k]   = slot->subpal[0];
+        slot->subpal_r[k] = slot->subpal_r[0];
+        slot->subpal_g[k] = slot->subpal_g[0];
+        slot->subpal_b[k] = slot->subpal_b[0];
+        slot->subpal_idx[k] = slot->subpal_idx[0];
     }
 
     // remap[]: every PLAYPAL index -> nearest sub-palette slot (squared RGB on
-    // gamma-applied colours).
+    // gamma-applied colours). Unused indices still get a valid slot (harmless;
+    // they are never sampled). Used indices snap to the closest of the <=16.
     for (i = 0; i < 256; i++)
     {
         int pr=gammatable[usegamma][playpal[i*3+0]];
         int pg=gammatable[usegamma][playpal[i*3+1]];
         int pb=gammatable[usegamma][playpal[i*3+2]];
         int bestslot=0, bestd=0x7fffffff;
-        for (k = 0; k < *o->subpal_n; k++)
+        for (k = 0; k < slot->subpal_n; k++)
         {
             int d=DL_RGBdist2(pr,pg,pb, pal_r[k],pal_g[k],pal_b[k]);
             if (d<bestd) { bestd=d; bestslot=k; }
         }
-        o->remap[i] = (uint8_t)bestslot;
-    }
-}
-
-static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
-{
-    const byte* playpal;
-    int   th, tw, col, row;
-    int   freq[256];
-
-    if (slot->subpal_inited)
-        return;
-
-    // Histogram the FULL-resolution texture (its complete colour set), NOT the
-    // stored downsampled dims: slot->width/height may be the post-downsample 64x64
-    // block, but the sub-palette must represent every colour the texture contains
-    // so the box-filter averages snap to in-gamut entries. Use the original
-    // sampling period / texture height directly.
-    playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
-    tw = texturewidthmask[texnum] + 1;
-    th = textureheight[texnum] >> FRACBITS;
-    if (!playpal || th < 1 || tw < 1)
-    {
-        // Degenerate: a single black entry, everything maps to it. Marks the
-        // slot inited so we never retry a broken texture every frame.
-        slot->subpal[0] = 1;        // black, opaque
-        slot->subpal_n  = 1;
-        memset(slot->remap, 0, sizeof(slot->remap));
-        memset(slot->subpal_idx, 0, sizeof(slot->subpal_idx)); // PLAYPAL idx 0
-        slot->subpal_inited = 1;
-        return;
+        slot->remap[i] = (uint8_t)bestslot;
     }
 
-    // Frequency histogram over exactly the texels the wall can sample, then
-    // quantize through the shared CI4 helper (same algorithm flats reuse).
-    {
-        dl_subpal_out_t o;
-        memset(freq, 0, sizeof(freq));
-        for (col = 0; col < tw; col++)
-        {
-            const byte* src = R_GetColumn(texnum, col);
-            for (row = 0; row < th; row++)
-                freq[src[row]]++;
-        }
-        o.subpal     = slot->subpal;
-        o.subpal_r   = slot->subpal_r;
-        o.subpal_g   = slot->subpal_g;
-        o.subpal_b   = slot->subpal_b;
-        o.subpal_idx = slot->subpal_idx;
-        o.remap      = slot->remap;
-        o.subpal_n   = &slot->subpal_n;
-        DL_QuantizeHistogram(freq, &o);
-    }
     slot->subpal_inited = 1;
 }
 
@@ -1287,35 +1238,14 @@ static void DL_MarkInFlight(int texnum)
 // reload-survival lesson (DEFECTS.md Stage-3) applies: a slot whose raw the zone
 // reclaimed (NULLs the back-reference) re-copies on next touch, and DL_BeginFrame
 // resets the generation stamps so nothing crosses a P_SetupLevel wrongly.
-#define DL_FLAT_CI8_BYTES   4096    // 64x64 CI8 source lump (one byte/texel)
-#define DL_FLAT_CI4_BYTES   2048    // 64x64 CI4 stored block (two texels/byte)
+#define DL_FLAT_BYTES   4096    // 64x64 CI8
 
-// FLAT CI4 STORE (the floor-noise fix). The 64x64 CI8 flat is 4 KB and does NOT
-// fit the 2 KB lower TMEM half (the master/sub-palette TLUT owns the upper half),
-// so the old plane path loaded only a 32-row V-window and relied on the mask-6 T
-// wrap -- any floor poly whose texture-V spanned >32 of the 64 rows addressed the
-// half of TMEM that was never loaded -> white noise. Stored as CI4 the WHOLE flat
-// is exactly 2 KB: it loads in ONE rdpq_load_tile (full 64x64, full 64-period S/T
-// wrap, no 32-row window). The flat is quantized to a 16-entry sub-palette by the
-// SAME median-cut the walls use (DL_QuantizeHistogram); flats with >16 colours
-// (8 of E1M1's 21, worst FLOOR5_1 at 34) median-cut down -- the colour-quant look
-// Ryan already accepted for walls, not a resolution loss (full 64x64 retained).
 typedef struct
 {
     void*    raw;       // Z_Malloc'd allocation (back-referenced by zone)
-    byte*    block;     // 8-byte-aligned 64x64 row-major CI4 view into raw (2 KB)
+    byte*    block;     // 8-byte-aligned 64x64 row-major CI8 view into raw
     uint32_t lastuse;   // present generation of the last DL_FlatMarkInFlight
     uint8_t  pinned;    // currently PU_STATIC for an in-flight window
-    uint8_t  pal_slot;  // CI4 palette slot assigned for the CURRENT frame (0..15)
-    uint8_t  subpal_n;  // count of valid sub-palette entries (1..16)
-    uint8_t  subpal_inited; // 1 once the CI4 block + sub-palette + remap are built
-    uint16_t subpal[16];    // <=16 RGBA5551 TLUT entries (quantized flat colours)
-    uint8_t  subpal_r[16];  // gamma RGB of each entry (for per-flash re-tint snap)
-    uint8_t  subpal_g[16];
-    uint8_t  subpal_b[16];
-    uint8_t  subpal_idx[16];// PLAYPAL index each entry resolved to (per-flash re-tint)
-    uint32_t subpal_gen;    // palette generation the subpal[] COLOURS track
-    uint8_t  pack_remap[256];// PLAYPAL index -> sub-palette slot (CI4 pack on reload)
 } dl_flat_t;
 
 static dl_flat_t*   dl_flat;            // [numflats]
@@ -1332,48 +1262,14 @@ static void DL_InitFlatCache(void)
     dl_flat_inited = 1;
 }
 
-// Build a flat's <=16-colour CI4 sub-palette ONCE, from its CI8 lump bytes, via
-// the SHARED median-cut quantizer (DL_QuantizeHistogram). Histograms the 4096
-// raw PLAYPAL indices, fills subpal[]/subpal_idx[]/remap[]/subpal_n. Mirrors the
-// wall DL_BuildSubPalette, only the histogram source differs (a flat is a flat
-// 64x64 lump, not column-organized texture posts).
-static void DL_BuildFlatSubPalette(dl_flat_t* slot, const byte* lump)
-{
-    int freq[256];
-    int i;
-    dl_subpal_out_t o;
-
-    if (slot->subpal_inited)
-        return;
-
-    memset(freq, 0, sizeof(freq));
-    for (i = 0; i < DL_FLAT_CI8_BYTES; i++)
-        freq[lump[i]]++;
-
-    o.subpal     = slot->subpal;
-    o.subpal_r   = slot->subpal_r;
-    o.subpal_g   = slot->subpal_g;
-    o.subpal_b   = slot->subpal_b;
-    o.subpal_idx = slot->subpal_idx;
-    o.remap      = slot->pack_remap;     // PLAYPAL idx -> slot, used by the CI4 pack
-    o.subpal_n   = &slot->subpal_n;
-    DL_QuantizeHistogram(freq, &o);
-    slot->subpal_inited = 1;
-}
-
-// Produce (or fetch) the row-major CI4 block for a flat index (lump-firstflat).
-// FIRST TOUCH: copy the CI8 lump, build the <=16-colour sub-palette + remap, pack
-// the 4096 CI8 texels into a 2 KB CI4 block (2 texels/byte, even col -> high
-// nibble, odd col -> low nibble; RDP CI4 byte order, matching the wall pack).
-// Caches PU_STATIC, returns the 8-byte-aligned 2 KB block. NULL on bad index /
-// alloc failure. The whole 64x64 CI4 block (2 KB) loads in ONE rdpq_load_tile --
-// it fits the lower TMEM half, so the plane path needs no 32-row V window.
+// Produce (or fetch) the row-major CI8 block for a flat index (lump-firstflat).
+// Copies the flat lump bytes once, caches PU_STATIC, returns the 8-byte-aligned
+// block (always 64x64). NULL on a bad index or alloc failure.
 static byte* DL_FlatBlock(int flatidx)
 {
     dl_flat_t*  slot;
     byte*       block;
     const byte* src;
-    int         row, col;
 
     if (flatidx < 0 || flatidx >= numflats)
         return NULL;
@@ -1385,45 +1281,31 @@ static byte* DL_FlatBlock(int flatidx)
     slot = &dl_flat[flatidx];
     // A demoted (PU_CACHE) block may be reclaimed by the zone LRU; it NULLs
     // slot->raw (the back-referenced user ptr) when it does, so re-derive
-    // slot->block from raw each touch and re-pack if raw is gone. The sub-palette
-    // (subpal_inited) persists across a reclaim -- only the CI4 block is rebuilt.
+    // slot->block from raw each touch and re-copy if raw is gone.
     if (slot->raw && slot->block)
         return slot->block;
     slot->block = NULL;
 
-    // Cache the CI8 lump (PU_CACHE): both the sub-palette histogram and the CI4
-    // pack read it; it can be released after.
-    src = (const byte*)W_CacheLumpNum(firstflat + flatidx, PU_CACHE);
-    if (!src)
-        return NULL;
-
-    // Build the sub-palette + 256->slot remap once (lossless if <=16 colours,
-    // median-cut otherwise -- the shared wall quantizer).
-    DL_BuildFlatSubPalette(slot, src);
-
-    // Over-allocate by 7 bytes so the CI4 view is 8-byte aligned (the RDP DMA into
-    // TMEM requires an 8-byte-aligned source; Z_Malloc only guarantees 4). User
-    // ptr back-references the slot so a zone reclaim NULLs slot->raw.
-    slot->raw = Z_Malloc(DL_FLAT_CI4_BYTES + 7, PU_STATIC, (void**)&slot->raw);
+    // Over-allocate by 7 bytes so the row-major view is 8-byte aligned (the RDP
+    // DMA into TMEM requires an 8-byte-aligned source; Z_Malloc only guarantees
+    // 4). User ptr back-references the slot so a zone reclaim NULLs slot->raw.
+    slot->raw = Z_Malloc(DL_FLAT_BYTES + 7, PU_STATIC, (void**)&slot->raw);
     if (!slot->raw)
         return NULL;
     block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
 
-    // Pack 64x64 CI8 -> 64x64 CI4 (32-byte row pitch). remap[] turns each PLAYPAL
-    // index into its 0..15 sub-palette slot; even column -> high nibble, odd
-    // column -> low nibble (RDP CI4 byte order; matches DL_RowMajorBlock).
-    for (row = 0; row < 64; row++)
+    // Copy the flat lump bytes (already row-major CI8). Cache PU_CACHE during
+    // the copy then writeback; the block stays PU_STATIC (slot->raw) so the
+    // copy source can be released immediately.
+    src = (const byte*)W_CacheLumpNum(firstflat + flatidx, PU_CACHE);
+    if (!src)
     {
-        const byte* srow = src + row * 64;
-        byte*       drow = block + row * 32;     // 32 bytes/row (2 texels/byte)
-        for (col = 0; col < 64; col += 2)
-        {
-            byte hi = slot->pack_remap[srow[col]]     & 0x0F;
-            byte lo = slot->pack_remap[srow[col + 1]] & 0x0F;
-            drow[col >> 1] = (byte)((hi << 4) | lo);
-        }
+        Z_Free(slot->raw);
+        slot->raw = NULL;
+        return NULL;
     }
-    data_cache_hit_writeback(block, DL_FLAT_CI4_BYTES);
+    memcpy(block, src, DL_FLAT_BYTES);
+    data_cache_hit_writeback(block, DL_FLAT_BYTES);
 
     slot->block  = block;
     slot->pinned = 1;       // born PU_STATIC; demoted on the wall schedule
@@ -2886,22 +2768,24 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
 // reconstructs software's affine flat map exactly (u*INV_W and v*INV_W are
 // screen-affine for a constant-z plane, verified in r_plane.c's emit).
 //
-// CI4 64x64 flat (2 KB), mask-6 S/T HARDWARE wrap (64 period) on BOTH axes. THE
-// WHOLE FLAT IS RESIDENT: at 2 KB it fits the lower TMEM half, so DL_FlushPlanePolys
-// loads all 64x64 texels ONCE per flat (one rdpq_load_tile) and configures the CI4
-// draw tile (with the flat's sub-palette) up front. This poly therefore does NO
-// tile setup and NO V-window load -- the old 32-row CI8 window (which addressed
-// the unloaded TMEM half when a run's V spanned >32 rows -> the floor white noise)
-// is GONE: every texel of a full-depth run now addresses correctly. The poly only
-// sets PRIM (deduped) + the whole-64 period bias on the four corners + draws.
+// CI8 64x64 flat, mask-6 S/T HARDWARE wrap (64 period) on BOTH axes. S wraps in
+// hardware so no S window is needed. T (V) is capped by TMEM: a 64-wide CI8 tile
+// fits DL_TMEM_HALF/64 = 32 rows, so we load a 32-row, 16-aligned V window that
+// covers the run's V extent and let the mask-6 T-wrap address within it. A run
+// whose V extent exceeds 32 rows is a very near, steep floor (rare); the window
+// clamps to 32 rows -- the over-extent texels wrap and re-sample within the
+// loaded window, the SAME bounded near-floor minification the span path documents.
+// The tile descriptor (64-wide, mask 6) and resident V window are deduped across
+// a flat's runs (consecutive runs at a similar depth share a window -> skip the
+// LOAD_TILE), the dominant DL_BUILD saving.
 static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 {
     uint32_t prim;
+    int   vlo, rows, base, ext;
     float vmin, vmax, umin;
     float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
     int   vbias, ubias;
     float xl, xr;
-    (void)block;        // the flat block is resident (loaded once by the flush)
 
     // PRIM = colormap-level brightness (Q8), shared LUT with the walls. Deduped.
     prim = (p->light < NUMCOLORMAPS) ? dl_prim_lut[p->light] : dl_unlit_prim;
@@ -2922,7 +2806,7 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     // period so all four corners land near [0,64+spread). (The remaining within-
     // run spread is bounded by the Y-deviation run split; an extreme steep near-
     // floor whose spread still exceeds the s10.5 range is the documented bounded
-    // near-floor artifact.)
+    // near-floor artifact, the same class the span path's V clamp accepts.)
     u_tl = p->u_tl; v_tl = p->v_tl;
     u_tr = p->u_tr; v_tr = p->v_tr;
     u_bl = p->u_bl; v_bl = p->v_bl;
@@ -2947,7 +2831,6 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     if (umin >  1.0e8f) umin =  1.0e8f; else if (umin < -1.0e8f) umin = -1.0e8f;
     if (vmin >  1.0e8f) vmin =  1.0e8f; else if (vmin < -1.0e8f) vmin = -1.0e8f;
     if (vmax >  1.0e8f) vmax =  1.0e8f; else if (vmax < -1.0e8f) vmax = -1.0e8f;
-    (void)vmax;
 
     // Whole-64 period bias on BOTH axes (mask-6 wrap -> sampling-identical).
     ubias = IFLOOR(umin / 64.0f) * 64;
@@ -2959,6 +2842,57 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     IFLOOR_CHK(vbias / 64, vmin / 64.0f);
     v_tl -= (float)vbias; v_tr -= (float)vbias;
     v_bl -= (float)vbias; v_br -= (float)vbias;
+    vmin -= (float)vbias; vmax -= (float)vbias;
+
+    // 16-aligned 32-row window covering [vmin,vmax] (clamped to the 64 period).
+    {
+        int lo = IFLOOR(vmin);
+        int hi = ICEIL(vmax);
+        IFLOOR_CHK(lo, vmin);
+        ICEIL_CHK(hi, vmax);
+        if (lo < 0) lo = 0;
+        ext = hi - lo + 1;
+        if (ext > 32) ext = 32;     // near-floor clamp (bounded minification)
+        base = (lo / 16) * 16;
+        if (base + 32 < lo + ext)
+            base = ((hi - 31) / 16) * 16;
+        if (base < 0) base = 0;
+        if (base + 32 > 64) base = 64 - 32;
+        if (base < 0) base = 0;
+        vlo  = base;
+        rows = 32;
+        if (vlo + rows > 64) rows = 64 - vlo;
+        if (rows < 1) rows = 1;
+    }
+
+    // Tile descriptor: full 64-period wrap on BOTH S and T (mask 6). Deduped --
+    // every flat poly shares this geometry, so SET_TILE issues once per flush.
+    if (dl_last_tile_lw != 64 || dl_last_tile_wrap != 2)
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;          // 64-texel S period
+        tp.t.mask = 6;          // 64-texel T period
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+        dl_last_tile_lw   = 64;
+        dl_last_tile_wrap = 2;
+        dl_last_up_block  = NULL;
+    }
+
+    // Load the (16-aligned, 32-row) V window across the full 64-texel width.
+    // Period-relative coords; the triangle T (period-relative too, via the bias
+    // above) addresses within [vlo, vlo+rows) and the mask-6 wrap handles the
+    // rest. Dedup against the resident window -> skip the LOAD_TILE + autosync.
+    if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
+    {
+        rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
+        dl_last_up_block = block;
+        dl_last_up_lo    = vlo;
+        dl_last_up_rows  = rows;
+        dl_last_up_c0    = 0;
+        dl_tile_loads++;
+        dl_uploads++;
+    }
 
     // NO per-vertex S/T clamp. The four corner texels are NOT independent: under
     // perspective the RDP reconstructs S_px = interp(S*INV_W)/interp(INV_W), which
@@ -2994,20 +2928,15 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 }
 
 // Drain the frame's plane POLYGONS (trapezoid strips) into the attached display
-// fb. Per-FLAT bucket walk mirroring the wall flush: for each flat used this
-// frame, fetch + pin its 64x64 CI4 block ONCE, upload its 16-entry sub-palette
-// to a CI4 TLUT slot, load the WHOLE 2 KB flat in ONE rdpq_load_tile (full 64x64,
-// mask-6 S/T hardware wrap -- the whole flat is resident, no 32-row V window),
-// then draw every trapezoid run in that flat's bucket. Persp is ON (a run spans
-// many z-depths). CI4 is loaded through an I8 view (TILE1, half the S width) then
-// drawn through the CI4 tile (TILE0 + palette) -- libdragon's texload_tile_4bpp
-// pattern, identical to the wall path. After the pass the master 256-TLUT is
-// re-asserted (the flat sub-palettes overwrote the TLUT region) so CI8
-// sprites/HUD/overlay sample the right colours.
+// fb. Per-FLAT bucket walk mirroring DL_FlushSpans: for each flat used this
+// frame, copy + pin its 64x64 CI8 block ONCE, point the RDP at it, then draw
+// every trapezoid run in that flat's bucket. Persp is ON (a run spans many
+// z-depths); the caller restores its own persp after. Shares the flat bucket
+// arrays + dl_flat_touched[] with the span path -- only one of the two paths
+// queued this frame, so the bucket walk is unambiguous.
 static void DL_FlushPlanePolys(void)
 {
     int fi;
-    int slots_used = 0;     // # distinct flats given a TLUT slot (re-assert gate)
 
     if (dl_ppoly_count <= 0)
         return;
@@ -3016,11 +2945,8 @@ static void DL_FlushPlanePolys(void)
     // (affine would warp a tall floor poly). The walls left persp ON too.
     rdpq_mode_persp(true);
 
-    // Latch the current palette generation for the per-flat damage-flash re-tint.
-    DL_RetintSubPalettes();
-
-    // Reset the dedup caches: the flat tile geometry (CI4, mask-6 wrap, per-flat
-    // palette slot) differs from the wall tiles the wall flush left resident.
+    // Reset the dedup caches: the flat tile geometry (64-wide CI8, mask-6 wrap)
+    // differs from the wall tiles the wall flush left resident.
     dl_last_up_block  = NULL;
     dl_last_up_lo     = -1;
     dl_last_up_rows   = -1;
@@ -3033,73 +2959,19 @@ static void DL_FlushPlanePolys(void)
         int   flatidx = dl_flat_touched[fi];
         int   pidx;
         byte* block;
-        dl_flat_t* slot;
-        int   pal_slot;
 
         block = DL_FlatBlock(flatidx);
         if (!block)
             continue;       // no usable flat block: runs stay key
 
         DL_FlatMarkInFlight(flatidx);
-        slot     = &dl_flat[flatidx];
-        pal_slot = slots_used & 15;     // touch-order slot, like the wall path
-        slot->pal_slot = (uint8_t)pal_slot;
 
-        // Damage-flash re-tint: re-derive this flat's 16 sub-palette colours from
-        // the current master TLUT at their fixed PLAYPAL indices when a flash
-        // changed the palette generation (no-op on un-flashed frames). So floors
-        // tint with the world exactly like the walls + CI8 spans did.
-        if (slot->subpal_gen != dl_retint_gen)
         {
-            const uint16_t* master = I_N64MasterTLUT();
-            int k;
-            for (k = 0; k < 16; k++)
-                slot->subpal[k] = (uint16_t)((master[slot->subpal_idx[k]]
-                                              & ~(uint16_t)1) | 1);
-            slot->subpal_gen = dl_retint_gen;
-        }
-
-        // Upload this flat's sub-palette to its CI4 TLUT slot (slot*16). Per-slot
-        // persistent scratch (the LOAD_TLUT reads it asynchronously). >16 distinct
-        // flats reuse a slot -> sync so the prior owner's tris drained first.
-        if (slots_used >= 16)
-        {
-            rdpq_sync_tile();
-            rdpq_sync_load();
-        }
-        memcpy(dl_subpal_up[pal_slot], slot->subpal, sizeof(slot->subpal));
-        data_cache_hit_writeback(dl_subpal_up[pal_slot], sizeof(slot->subpal));
-        rdpq_tex_upload_tlut(dl_subpal_up[pal_slot], pal_slot * 16, 16);
-        slots_used++;
-
-        // Point the RDP at the CI4 block as an I8 byte image (the CI4 LOAD goes
-        // through the I8 view at half the S width: 64 CI4 texels = 32 bytes/row).
-        {
-            surface_t fs = surface_make_linear(block, FMT_I8, 32, 64);
+            surface_t fs = surface_make_linear(block, FMT_CI8, 64, 64);
             rdpq_set_texture_image(&fs);
             dl_last_up_block  = NULL;
             dl_last_tile_lw   = -1;
             dl_last_tile_wrap = -1;
-        }
-
-        // Configure TILE1 (I8 load tile, 32-byte pitch) + TILE0 (CI4 draw tile,
-        // mask-6 S AND T hardware wrap, this flat's palette slot). Then load the
-        // WHOLE 64x64 flat ONCE through TILE1 (blkw/2 = 32 texels wide in the I8
-        // view, 64 rows) and set the CI4 draw extents to the full 64x64. 2 KB ->
-        // fits the lower TMEM half -> the whole flat is resident; the mask-6 S/T
-        // wrap addresses any texel of any run, no window.
-        {
-            rdpq_tileparms_t tp;
-            memset(&tp, 0, sizeof(tp));
-            tp.s.mask   = 6;            // 64-texel S period (hardware wrap)
-            tp.t.mask   = 6;            // 64-texel T period (hardware wrap)
-            tp.palette  = pal_slot;
-            rdpq_set_tile(TILE1, FMT_I8,  0, 32, NULL);     // internal load tile
-            rdpq_set_tile(TILE0, FMT_CI4, 0, 32, &tp);      // draw tile
-            rdpq_load_tile(TILE1, 0, 0, 32, 64);            // whole 2 KB flat
-            rdpq_set_tile_size(TILE0, 0, 0, 64, 64);        // full CI4 extents
-            dl_tile_loads++;
-            dl_uploads++;
         }
 
         for (pidx = dl_flat_bucket_head[flatidx]; pidx >= 0;
@@ -3108,12 +2980,6 @@ static void DL_FlushPlanePolys(void)
             DL_DrawPlanePoly(&dl_ppolys[pidx], block);
         }
     }
-
-    // The flat sub-palettes overwrote the 256-entry TLUT region; re-assert the
-    // master 256-TLUT so CI8 sprites/HUD/overlay (drawn after the floors, same
-    // rspq stream) sample the right colours. Only when a flat actually drew.
-    if (slots_used > 0)
-        I_N64ForceTLUTReupload();
 }
 
 // Drain the frame's plane spans into the attached display fb (Stage 4). A
