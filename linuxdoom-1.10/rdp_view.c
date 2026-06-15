@@ -3123,15 +3123,6 @@ static void DL_FlushPlanePolys(void)
 // TLUT; this function sets persp OFF (flats are affine) for its draws. The
 // upload/tile/PRIM dedup statics are shared with the wall path; reset them here
 // because the flat tile geometry (64-wide, mask-6 wrap) differs from wall tiles.
-//
-// NOTE: this LEGACY per-span path is CI8-only (it reads DL_FlatBlock as a 64x64
-// CI8 surface + samples the master TLUT). DL_FlatBlock now returns a 2 KB CI4
-// block (the floor-noise fix), so this path is INCOMPATIBLE with the current
-// flat store. It is unreachable in normal operation -- n64_rdp_plane_poly=1 by
-// default routes floors through DL_EmitPlanePoly (dl_span_count stays 0, the
-// early return below fires) and DL_Flush only calls DL_FlushSpans when
-// dl_ppoly_count==0. Kept as documented dead code; if the span path is ever
-// revived it must adopt the CI4 two-tile load (see DL_FlushPlanePolys).
 static void DL_FlushSpans(void)
 {
     int fi;
