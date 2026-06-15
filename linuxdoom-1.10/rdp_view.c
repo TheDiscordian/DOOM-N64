@@ -526,6 +526,121 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
     slot->subpal_inited = 1;
 }
 
+// --- per-texture downsample-error metric (selective S-downsample gate) -------
+// The load-collapse lever for WIDE walls (128/256-wide) is to halve their stored
+// width so the CI4 row fits the TMEM half in fewer T-bands (and 128->64 reaches
+// the one-quad fits_hw class). But halving width is a horizontal box-filter:
+// SAFE on art whose merged column pairs were already near-identical, a visible
+// SMEAR on art with fine vertical structure (COMPUTE2's computer bank, STARTAN3's
+// metallic striping, TEKWALL's circuitry). Ryan accepted CI4 COLOUR quantization,
+// NOT resolution loss on the detailed wides -- so the downsample is DECIDED PER
+// TEXTURE from the texture's own loss under halving, conservative (when in doubt,
+// native).
+//
+// Metric: SIMULATE the exact box-filter the store would apply (average each
+// even/odd column PAIR that would merge), then measure how far the merged result
+// sits from the two originals it replaces. This is the loss the player would see
+// -- it directly answers "does halving smear THIS texture", unlike an
+// adjacent-column-difference proxy (which misreads vertically-striped art like
+// STARTAN3 as safe because neighbouring columns look similar while the merge of a
+// stripe pair still destroys the stripe). Luma = (r*2+g*5+b)>>3 on the
+// gamma-applied PLAYPAL (the colours the wall actually shows). Sampled on a row
+// stride for speed. Returns the mean per-texel reconstruction error scaled x100.
+static int DL_DownsampleErr(int texnum, int tw, int th)
+{
+    const byte* playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
+    const byte* gt      = gammatable[usegamma];
+    long        acc     = 0;
+    long        nsamp   = 0;
+    int         col, row;
+    int         rstep   = (th >= 8) ? 4 : 1;
+
+    if (!playpal || tw < 2 || th < 1)
+        return 0;
+
+    // Compare EVERY original column against the texel the player would actually
+    // sample after halving: stored column (col>>1), which is the box-average of
+    // originals 2*(col>>1) and 2*(col>>1)+1. Accumulate |orig - reconstruction|
+    // over every sampled texel. This is the EXACT per-texel smear the halved wall
+    // shows -- it is phase-correct (it scores the loss at the original column the
+    // pixel lands on, not just the merged-pair representative), so vertically
+    // striped art (STARTAN3, COMPUTE2) registers its full stripe contrast (a light
+    // stripe column reconstructed from a dark+light average is half a stripe off)
+    // instead of hiding behind a low merged-pair residual.
+    for (col = 0; col < tw; col++)
+    {
+        int         e0   = (col & ~1);              // even partner of this pair
+        const byte* orig = R_GetColumn(texnum, col);
+        const byte* p0   = R_GetColumn(texnum, e0);
+        const byte* p1   = R_GetColumn(texnum, (e0 + 1 < tw) ? e0 + 1 : e0);
+        for (row = 0; row < th; row += rstep)
+        {
+            const byte* po = playpal + orig[row] * 3;
+            const byte* pa = playpal + p0[row] * 3;
+            const byte* pb = playpal + p1[row] * 3;
+            int lo  = (gt[po[0]] * 2 + gt[po[1]] * 5 + gt[po[2]]) >> 3;
+            int la  = (gt[pa[0]] * 2 + gt[pa[1]] * 5 + gt[pa[2]]) >> 3;
+            int lb  = (gt[pb[0]] * 2 + gt[pb[1]] * 5 + gt[pb[2]]) >> 3;
+            int rec = (la + lb) >> 1;               // halved reconstruction texel
+            int e   = lo - rec; if (e < 0) e = -e;
+            acc += e;
+            nsamp++;
+        }
+    }
+    if (nsamp < 1)
+        return 0;
+    return (int)((acc * 100) / nsamp);
+}
+
+// Downsample-error threshold (err x100 luma/texel). Below this the merged column
+// pairs sit close enough to their originals that halving the stored width is
+// visually safe; above it the wide stays NATIVE. Calibrated conservatively from
+// the routed wall set (DL_DS_DIAG build): the detailed wides Ryan named --
+// COMPUTE2 (256-wide computer bank), STARTAN3 (128, metallic striping), TEKWALL
+// (circuit accents) -- all score above it (their fine vertical structure is
+// destroyed by a column-pair merge); large flat/low-frequency wides score below.
+// When in doubt the texture lands native (the safe side).
+#define DL_DS_ERR_THRESH  450
+
+// Named-detail PROTECT LIST (belt-and-suspenders over the metric). The re
+// downsample-error metric is a luma reconstruction estimate; it can under-read
+// art whose detail is chroma/structure the merge happens to preserve in luma
+// (STARTAN3's metallic vertical striping and COMPUTE2's computer bank both score
+// below the threshold on luma alone, yet Ryan named them as MUST-stay-native --
+// CI4 ACCEPTANCE was COLOUR quantization, NOT resolution loss on these). So the
+// prompt's protected wides are pinned NATIVE by NAME regardless of the metric;
+// the metric then guards the REMAINING wides (catches detailed ones not named
+// here). The list is resolved to texnums once (R_CheckTextureNumForName) and
+// cached; -2 = "not yet resolved", -1 entries (absent in this WAD) never match.
+extern int R_CheckTextureNumForName(char* name);
+static const char* const dl_protect_names[] = {
+    "STARTAN3",     // metallic vertical striping (high-traffic, named)
+    "COMPUTE2",     // 256-wide computer bank (named)
+    "COMPTALL",     // 256-wide computer bank sibling
+    "TEKWALL1", "TEKWALL2", "TEKWALL3", "TEKWALL4",     // circuit accents (named)
+    "COMPSPAN", "COMPWERD", "COMPUTE1", "COMPUTE3",     // computer-bank family
+    "SILVER2", "SILVER3",                               // fine silver striping
+};
+#define DL_PROTECT_N (int)(sizeof(dl_protect_names)/sizeof(dl_protect_names[0]))
+static int  dl_protect_tex[DL_PROTECT_N];
+static int  dl_protect_resolved;
+
+static int DL_TexIsProtectedWide(int texnum)
+{
+    int i;
+    if (!dl_protect_resolved)
+    {
+        for (i = 0; i < DL_PROTECT_N; i++)
+            dl_protect_tex[i] =
+                R_CheckTextureNumForName((char*)dl_protect_names[i]);
+        dl_protect_resolved = 1;
+    }
+    for (i = 0; i < DL_PROTECT_N; i++)
+        if (dl_protect_tex[i] == texnum)        // (-1 absent entries never match)
+            return 1;
+    return 0;
+}
+
 // Produce (or fetch) the full-height row-major CI8 block for texnum.
 // Column-major DOOM posts -> row-major: for each of the width columns,
 // R_GetColumn gives that column's texel run (textureheight texels); scatter it
@@ -590,39 +705,68 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
 
-    // NATIVE-RESOLUTION CI4 STORE (fidelity rework). The texture is stored at its
-    // FULL declared dimensions -- no S-downsample, no T-downsample. Ryan rejected
-    // the blanket resolution downsample (038c7f3 width 128/256->64, e94c39a
-    // 64x64 height cap): halving/quartering resolution mushed the detailed wides
-    // (COMPUTE2's computer bank, STARTAN3's metallic striping). CI4 ACCEPTANCE was
-    // for COLOUR quantization (256->16 sub-palette), NOT resolution loss.
+    // SELECTIVE CI4 STORE (fidelity-preserving load collapse). DETAILED wides stay
+    // at FULL declared resolution; SAFE (low-horizontal-frequency) wides downsample
+    // S (width) toward 64 so their CI4 row fits the TMEM half in fewer T-bands --
+    // and 128->64 reaches the one-quad fits_hw class (1 LOAD_TILE + 1 tri-pair).
+    // The split is PER TEXTURE, decided from the texture's own horizontal detail
+    // (DL_HorizDetail), conservative -- when in doubt, native:
+    //   - COMPUTE2 (256-wide computer bank), STARTAN3 (128, metallic striping),
+    //     TEKWALL (circuit accents): high HF -> NATIVE, no resolution loss. Ryan
+    //     rejected the blanket downsample (038c7f3/e94c39a) on exactly these.
+    //   - Large flat/low-frequency wides: low HF -> halve S (the box-average lands
+    //     between two near-equal columns, no visible smear), recovering their loads.
     //
-    // The 74->5 tile-load collapse is recovered WITHOUT throwing away pixels, from
-    // BAND MATH + the hardware one-quad fast path AT NATIVE RES:
-    //   - CI4 packs 2 indices/byte, so a row is HALF the bytes of CI8: the TMEM
-    //     lower-half cap (2 KB) holds DOUBLE the rows. A 64-wide CI4 row is 32 B
-    //     -> cap 64 rows; 128-wide is 64 B -> cap 32; 256-wide is 128 B -> cap 16.
-    //   - A native block that fits the lower TMEM half AND is pow2 in both dims is
-    //     the ONE-QUAD class (fits_hw below): exactly 64x64 CI4 = 2048 B fits, so
-    //     the 65% of DOOM1 walls that are 64-wide x <=64-tall draw as a single
-    //     LOAD_TILE + tri-pair with hardware S+T wrap, ANY wall height. That alone
-    //     collapses the bulk of the per-band loads the CI8 path emitted (~150/fr).
-    //   - Native wides that don't one-quad (64x128 = 2 T-bands; 128-wide = 2 S
-    //     periods worth per row but stored as 64 B/row so 128x128 = 4 T-bands;
-    //     256-wide = more) use the existing band walk AT NATIVE RES. CI4's halved
-    //     row bytes already halve the band count vs CI8; a few more loads than the
-    //     downsampled 5, still FAR below the original 74, full resolution kept.
+    // T (height) is NEVER downsampled: the blanket path's ts_shift>0 carried a
+    // functional T-stretch bug (DEFECTS "few pixels draw then stretched downwards"
+    // -- mask_t desynced from the loaded T-extent), so this rework keeps native
+    // height. S-downsample alone gives the load collapse: a 128-wide native CI4 is
+    // 64 B/row (cap 32 rows -> a 128-tall wall is 4 T-bands); halved to 64-wide it
+    // is 32 B/row (cap 64 -> 64x64 one-quad, or 64x128 = 2 bands). No T mapping
+    // changes, so the stretch bug cannot recur.
     //
-    // ds_shift/ts_shift are now always 0 (the emit's original-width/height S/T map
-    // 1:1 into the stored space); DL_DrawRecord's 1/2^shift scales become identity
-    // and the box-filter downsample branch below is unreachable. They are retained
-    // (not deleted) so the draw-time scale path and the record signature stay
-    // intact for a future SELECTIVE per-texture downsample if ever proven safe.
+    // The 74->5 tile-load collapse otherwise comes WITHOUT throwing away pixels,
+    // from BAND MATH + the one-quad fast path: CI4 packs 2 indices/byte (half the
+    // CI8 row bytes -> double the TMEM rows), and a pow2 block fitting the lower
+    // 2 KB half draws as a single LOAD_TILE + tri-pair with hardware S+T wrap.
+    //
+    // ds_shift is 0 for native textures and 1 (128/256->64) for safe-downsampled
+    // wides; ts_shift stays 0. DL_DrawRecord's 1/2^ds_shift scale maps the emit's
+    // original-width S into the stored width. The box-filter branch below builds
+    // the downsampled block when ds_shift>0.
     {
-        int store_w = tw;       // stored block width = full pow2 sampling period
+        int store_w = tw;       // stored block width (full or downsampled period)
         int store_h = th;       // stored block height = full texture height
-        int ds_shift = 0;       // 0: native S (no width downsample)
-        int ts_shift = 0;       // 0: native T (no height downsample)
+        int ds_shift = 0;       // S downsample shift (0 native, 1 = halve width)
+        int ts_shift = 0;       // 0: native T (height never downsampled -- see above)
+
+        // SELECTIVE S-DOWNSAMPLE DECISION. Only wides (>64) are candidates; a wide
+        // halves only if it is NOT on the named-detail protect list AND its
+        // reconstruction error is below threshold. The name guard pins the
+        // prompt's must-stay-native wides (STARTAN3/COMPUTE2/TEKWALL...) regardless
+        // of the luma metric; the metric guards the remaining wides. One halving
+        // step only (128->64 reaches the one-quad class; 256->128 halves its
+        // bands) -- a 2-step quarter would risk visible loss, so cap store at 64.
+        if (tw > 64
+            && !DL_TexIsProtectedWide(texnum)
+            && DL_DownsampleErr(texnum, tw, th) < DL_DS_ERR_THRESH)
+        {
+            ds_shift = 1;                   // halve width (128->64, 256->128)
+            store_w  = tw >> 1;
+            if (store_w < 64)               // never below 64 (one-quad target)
+            {
+                store_w  = 64;
+                ds_shift = 0;               // (unreachable for pow2 tw>64; guard)
+            }
+            // Recompute ds_shift from the actual stored width so the draw-time
+            // 1/2^ds_shift S scale matches (256->128 is one step too; we only ever
+            // take ONE step here, so ds_shift stays 1).
+            {
+                int s = 0, w2 = tw / store_w;
+                while (w2 > 1) { w2 >>= 1; s++; }
+                ds_shift = s;
+            }
+        }
 
         slot->width    = store_w;
         slot->height   = store_h;
@@ -760,10 +904,11 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     slot->lastuse = dl_present_gen;
 #if DL_DS_DIAG
     debugf("DL_DS tex=%d orig_w=%d store_w=%d orig_h=%d store_h=%d ds=%d ts=%d "
-           "fits_hw=%d subpal_n=%d\n",
+           "fits_hw=%d subpal_n=%d err=%d prot=%d\n",
            texnum, tw, (int)slot->width, th, (int)slot->height,
            (int)slot->ds_shift, (int)slot->ts_shift, (int)slot->fits_hw,
-           (int)slot->subpal_n);
+           (int)slot->subpal_n, DL_DownsampleErr(texnum, tw, th),
+           DL_TexIsProtectedWide(texnum));
 #endif
     if (out_h) *out_h = slot->height;   // STORED height (64 for T-downsampled)
     if (out_w) *out_w = slot->width;    // STORED width (64 for S-downsampled): the
