@@ -721,41 +721,57 @@ static int DL_DownsampleErr(int texnum, int tw, int th)
 // When in doubt the texture lands native (the safe side).
 #define DL_DS_ERR_THRESH  450
 
-// Named-detail PROTECT LIST (belt-and-suspenders over the metric). The re
-// downsample-error metric is a luma reconstruction estimate; it can under-read
-// art whose detail is chroma/structure the merge happens to preserve in luma
-// (STARTAN3's metallic vertical striping and COMPUTE2's computer bank both score
-// below the threshold on luma alone, yet Ryan named them as MUST-stay-native --
-// CI4 ACCEPTANCE was COLOUR quantization, NOT resolution loss on these). So the
-// prompt's protected wides are pinned NATIVE by NAME regardless of the metric;
-// the metric then guards the REMAINING wides (catches detailed ones not named
-// here). The list is resolved to texnums once (R_CheckTextureNumForName) and
-// cached; -2 = "not yet resolved", -1 entries (absent in this WAD) never match.
+// =====================================================================
+//  COLLAPSE/PROTECT BOUNDARY (the one knob that sets which wides downsample)
+// =====================================================================
+// The boundary is a single WIDTH threshold: a wall texture stays NATIVE iff its
+// sampling period is >= DL_PROTECT_MIN_W. Everything narrower (the 128-wide
+// tiling walls -- STARTAN3, TEKWALL1, COMPTILE, BROWN1, STARG3, ...) COLLAPSES
+// to the one-quad 64x64 CI4 class (S 128->64 AND T 128->64); everything >= the
+// threshold (COMPUTE2 256x56 and any other >=256-wide) stays at full resolution.
+//
+//  *** To re-tune the boundary, change THIS ONE LINE. ***
+//  Raise to 512 to also collapse the 256-wides; the value is the smallest width
+//  that is KEPT NATIVE. 256 protects COMPUTE2's 256-px computer-readout detail
+//  (a 4x horizontal squish destroys it, and as a one-off non-tiling texture
+//  hardware S-wrap can't recover the loads) while collapsing the 128 tiling set.
+#define DL_PROTECT_MIN_W  256
+
+// Per-texture NAME OVERRIDE list (fine-grained, on TOP of the width boundary).
+// Use this to flip an INDIVIDUAL texture's verdict without moving the global
+// boundary: list a name here to pin it NATIVE even though it is below the width
+// threshold (e.g. a 128-wide whose detail the preview flags). EMPTY by default --
+// the prompt's split is captured entirely by DL_PROTECT_MIN_W, so no 128-wide is
+// named-protected (STARTAN3/TEKWALL1 are now COLLAPSE targets, deliberately). Add
+// a name as a one-line edit to protect it; the list resolves to texnums once
+// (R_CheckTextureNumForName) and is cached. -1 entries (absent in WAD) never hit.
 extern int R_CheckTextureNumForName(char* name);
 static const char* const dl_protect_names[] = {
-    "STARTAN3",     // metallic vertical striping (high-traffic, named)
-    "COMPUTE2",     // 256-wide computer bank (named)
-    "COMPTALL",     // 256-wide computer bank sibling
-    "TEKWALL1", "TEKWALL2", "TEKWALL3", "TEKWALL4",     // circuit accents (named)
-    "COMPSPAN", "COMPWERD", "COMPUTE1", "COMPUTE3",     // computer-bank family
-    "SILVER2", "SILVER3",                               // fine silver striping
+    // (empty) -- e.g. add "STARTAN3", here to keep that one 128-wide native.
+    0,  // sentinel so the array is never zero-length (ISO C); skipped at resolve.
 };
 #define DL_PROTECT_N (int)(sizeof(dl_protect_names)/sizeof(dl_protect_names[0]))
 static int  dl_protect_tex[DL_PROTECT_N];
 static int  dl_protect_resolved;
 
-static int DL_TexIsProtectedWide(int texnum)
+// A wide is PROTECTED (stays native) if it meets the width boundary OR is named
+// in the override list above. tw is the texture's sampling period (store-width
+// candidate); pass texturewidthmask+1 at the call site.
+static int DL_TexIsProtectedWide(int texnum, int tw)
 {
     int i;
+    if (tw >= DL_PROTECT_MIN_W)             // global width boundary (the knob)
+        return 1;
     if (!dl_protect_resolved)
     {
         for (i = 0; i < DL_PROTECT_N; i++)
-            dl_protect_tex[i] =
-                R_CheckTextureNumForName((char*)dl_protect_names[i]);
+            dl_protect_tex[i] = dl_protect_names[i]
+                ? R_CheckTextureNumForName((char*)dl_protect_names[i])
+                : -1;                       // sentinel slot -> never matches
         dl_protect_resolved = 1;
     }
     for (i = 0; i < DL_PROTECT_N; i++)
-        if (dl_protect_tex[i] == texnum)        // (-1 absent entries never match)
+        if (dl_protect_tex[i] == texnum)    // (-1 absent/sentinel never match)
             return 1;
     return 0;
 }
@@ -859,31 +875,50 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
         int ds_shift = 0;       // S downsample shift (0 native, 1 = halve width)
         int ts_shift = 0;       // 0: native T (height never downsampled -- see above)
 
-        // SELECTIVE S-DOWNSAMPLE DECISION. Only wides (>64) are candidates; a wide
-        // halves only if it is NOT on the named-detail protect list AND its
-        // reconstruction error is below threshold. The name guard pins the
-        // prompt's must-stay-native wides (STARTAN3/COMPUTE2/TEKWALL...) regardless
-        // of the luma metric; the metric guards the remaining wides. One halving
-        // step only (128->64 reaches the one-quad class; 256->128 halves its
-        // bands) -- a 2-step quarter would risk visible loss, so cap store at 64.
-        if (tw > 64
-            && !DL_TexIsProtectedWide(texnum)
-            && DL_DownsampleErr(texnum, tw, th) < DL_DS_ERR_THRESH)
+        // SELECTIVE S+T DOWNSAMPLE DECISION (the collapse-to-one-quad lever).
+        // A wide texture COLLAPSES only if it is NOT protected (below the width
+        // boundary DL_PROTECT_MIN_W and not name-pinned) AND its box-filter
+        // reconstruction error is below threshold. The width boundary pins the
+        // must-stay-native wides (COMPUTE2 and any >=256-wide) regardless of the
+        // luma metric; the metric guards the remaining (collapsing) wides. When a
+        // wide collapses we take BOTH axes down toward 64 in ONE halving step each:
+        //   - S 128->64 (or 256->128, capped at 64): halve the stored width so the
+        //     CI4 row fits the TMEM half (the load-band lever).
+        //   - T 128->64: halve the stored HEIGHT too, but ONLY for a pow2 height
+        //     > 64. A 128x128 wall then stores 64x64 CI4 = 2 KB -> fits_hw -> the
+        //     ONE-QUAD hardware S+T wrap path (1 LOAD_TILE + 1 tri-pair). Non-pow2
+        //     or <=64-tall heights keep native T (the band walk handles them) so
+        //     the hardware T-mask = log2(store_h) stays exact -- this is the
+        //     consistency the prior blanket T-path also held; what got that path
+        //     reverted was halving DETAILED wides indiscriminately, which the
+        //     protect boundary + error gate now prevent.
+        // store_h tracks the T downsample so blkh / T-mask / load-extent / T-scale
+        // all reference the SAME (downsampled) height downstream -- no desync.
+        int is_collapsing =
+            (tw > 64
+             && !DL_TexIsProtectedWide(texnum, tw)
+             && DL_DownsampleErr(texnum, tw, th) < DL_DS_ERR_THRESH);
+        if (is_collapsing)
         {
-            ds_shift = 1;                   // halve width (128->64, 256->128)
+            // --- S axis: halve width toward 64 (one step; cap at 64) ----------
             store_w  = tw >> 1;
             if (store_w < 64)               // never below 64 (one-quad target)
-            {
                 store_w  = 64;
-                ds_shift = 0;               // (unreachable for pow2 tw>64; guard)
-            }
-            // Recompute ds_shift from the actual stored width so the draw-time
-            // 1/2^ds_shift S scale matches (256->128 is one step too; we only ever
-            // take ONE step here, so ds_shift stays 1).
             {
                 int s = 0, w2 = tw / store_w;
                 while (w2 > 1) { w2 >>= 1; s++; }
-                ds_shift = s;
+                ds_shift = s;               // 1 for 128->64 (and 256->128)
+            }
+
+            // --- T axis: halve height 128->64 for pow2-tall wides only --------
+            // Gate on a power-of-two height > 64 so the hardware T-mask
+            // (log2(store_h)) wraps the downsampled block exactly; the common
+            // wall height is 128 -> store_h 64. Heights <=64 (already one-quad-
+            // tall) or non-pow2 (56/72/...) keep ts_shift 0 and stay native T.
+            if (th > 64 && (th & (th - 1)) == 0)
+            {
+                store_h  = th >> 1;         // 128 -> 64 (one step)
+                ts_shift = 1;
             }
         }
 
@@ -1027,7 +1062,7 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
            texnum, tw, (int)slot->width, th, (int)slot->height,
            (int)slot->ds_shift, (int)slot->ts_shift, (int)slot->fits_hw,
            (int)slot->subpal_n, DL_DownsampleErr(texnum, tw, th),
-           DL_TexIsProtectedWide(texnum));
+           DL_TexIsProtectedWide(texnum, tw));
 #endif
     if (out_h) *out_h = slot->height;   // STORED height (64 for T-downsampled)
     if (out_w) *out_w = slot->width;    // STORED width (64 for S-downsampled): the
