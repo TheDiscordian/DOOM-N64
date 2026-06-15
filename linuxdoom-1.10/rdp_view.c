@@ -2782,9 +2782,9 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 {
     uint32_t prim;
     int   vlo, rows, base, ext;
-    float vmin, vmax;
+    float vmin, vmax, umin;
     float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
-    int   vbias;
+    int   vbias, ubias;
     float xl, xr;
 
     // PRIM = colormap-level brightness (Q8), shared LUT with the walls. Deduped.
@@ -2795,26 +2795,49 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
         dl_last_prim = prim;
     }
 
-    // Per-corner texel U/V (already in texel units from the emit). The mask-6
-    // S/T wrap makes any whole-64 period subtraction sampling-identical, so bias
-    // BOTH axes of all four corners by ONE shared whole-period offset to land
-    // them in a sane fixed-point range for the triangle setup (the projective
-    // S/W,T/W and 1/W interpolation is unaffected by a per-axis constant shift
-    // since u*INV_W shifts by bias*INV_W which is also screen-affine -> the RDP
-    // reconstructs u-bias, and the mask-6 wrap maps -bias back into [0,64)).
+    // Per-corner texel U/V (texel units from the emit). PERSPECTIVE-SAFE PERIOD
+    // BIAS: the raw flat texel coords can be huge (a far/steep run's u,v run to
+    // thousands of texels), which overflows rdpq_triangle's s10.5 S/T cast. The
+    // mask-6 S/T wrap (64 period) makes subtracting a WHOLE-64 multiple from a
+    // texel coord sampling-identical, and under perspective a per-vertex constant
+    // bias B shifts the reconstructed per-pixel S uniformly (RDP computes
+    // S_px = interp(S*INV_W)/interp(INV_W) = S - B for S' = S-B), so a whole-64 B
+    // wraps back to the same texel. Bias EACH axis by its min-corner whole-64
+    // period so all four corners land near [0,64+spread). (The remaining within-
+    // run spread is bounded by the Y-deviation run split; an extreme steep near-
+    // floor whose spread still exceeds the s10.5 range is the documented bounded
+    // near-floor artifact, the same class the span path's V clamp accepts.)
     u_tl = p->u_tl; v_tl = p->v_tl;
     u_tr = p->u_tr; v_tr = p->v_tr;
     u_bl = p->u_bl; v_bl = p->v_bl;
     u_br = p->u_br; v_br = p->v_br;
 
-    // V (texel-row) extent across the four corners -> the 32-row window to load.
+    // U/V extents across the four corners.
+    umin = u_tl;
+    if (u_tr < umin) umin = u_tr;
+    if (u_bl < umin) umin = u_bl;
+    if (u_br < umin) umin = u_br;
     vmin = v_tl; vmax = v_tl;
     if (v_tr < vmin) vmin = v_tr; if (v_tr > vmax) vmax = v_tr;
     if (v_bl < vmin) vmin = v_bl; if (v_bl > vmax) vmax = v_bl;
     if (v_br < vmin) vmin = v_br; if (v_br > vmax) vmax = v_br;
 
-    // Period-bias V into [0,64) by a shared whole-64 subtraction (mask-6 T-wrap
-    // makes this sampling-identical) so the window math works in the period.
+    // IFLOOR/int-cast SAFETY: the extents feed dl_ifloor((extent)/64), whose
+    // (int) cast traps if |extent/64| >= 2^31. The corner horizon guard
+    // (r_plane.c, dyrows>=1) already bounds these well under that, but clamp the
+    // extents defensively to a generous +-1e8 texels so a degenerate camera frame
+    // can never trap the floor's IFLOOR (the period bias below + HW mask-6 wrap
+    // make the exact extent value irrelevant past whole-64 multiples anyway).
+    if (umin >  1.0e8f) umin =  1.0e8f; else if (umin < -1.0e8f) umin = -1.0e8f;
+    if (vmin >  1.0e8f) vmin =  1.0e8f; else if (vmin < -1.0e8f) vmin = -1.0e8f;
+    if (vmax >  1.0e8f) vmax =  1.0e8f; else if (vmax < -1.0e8f) vmax = -1.0e8f;
+
+    // Whole-64 period bias on BOTH axes (mask-6 wrap -> sampling-identical).
+    ubias = IFLOOR(umin / 64.0f) * 64;
+    IFLOOR_CHK(ubias / 64, umin / 64.0f);
+    u_tl -= (float)ubias; u_tr -= (float)ubias;
+    u_bl -= (float)ubias; u_br -= (float)ubias;
+
     vbias = IFLOOR(vmin / 64.0f) * 64;
     IFLOOR_CHK(vbias / 64, vmin / 64.0f);
     v_tl -= (float)vbias; v_tr -= (float)vbias;
@@ -2870,6 +2893,24 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
         dl_tile_loads++;
         dl_uploads++;
     }
+
+    // s10.5 CAST GUARD. rdpq_triangle casts each vertex texel to s10.5 (S*32,
+    // range |S| < 1024). After the per-axis whole-64 bias the min corner sits in
+    // [0,64); the remaining spread is bounded by the Y-deviation run split for
+    // typical floors, but a pathological steep near-floor run could still exceed
+    // 1024 texels of spread. Clamp each vertex into +-960 (< 1024) so the cast
+    // never traps -- a bounded near-floor minification on those rare runs (the
+    // documented overflow class), never a crash. Whole texels preserved for the
+    // common case (no clamp hit). HW mask-6 wrap folds the survivors into [0,64).
+    #define DL_PP_SCLAMP 960.0f
+    if (u_tl >  DL_PP_SCLAMP) u_tl =  DL_PP_SCLAMP; else if (u_tl < -DL_PP_SCLAMP) u_tl = -DL_PP_SCLAMP;
+    if (u_tr >  DL_PP_SCLAMP) u_tr =  DL_PP_SCLAMP; else if (u_tr < -DL_PP_SCLAMP) u_tr = -DL_PP_SCLAMP;
+    if (u_bl >  DL_PP_SCLAMP) u_bl =  DL_PP_SCLAMP; else if (u_bl < -DL_PP_SCLAMP) u_bl = -DL_PP_SCLAMP;
+    if (u_br >  DL_PP_SCLAMP) u_br =  DL_PP_SCLAMP; else if (u_br < -DL_PP_SCLAMP) u_br = -DL_PP_SCLAMP;
+    if (v_tl >  DL_PP_SCLAMP) v_tl =  DL_PP_SCLAMP; else if (v_tl < -DL_PP_SCLAMP) v_tl = -DL_PP_SCLAMP;
+    if (v_tr >  DL_PP_SCLAMP) v_tr =  DL_PP_SCLAMP; else if (v_tr < -DL_PP_SCLAMP) v_tr = -DL_PP_SCLAMP;
+    if (v_bl >  DL_PP_SCLAMP) v_bl =  DL_PP_SCLAMP; else if (v_bl < -DL_PP_SCLAMP) v_bl = -DL_PP_SCLAMP;
+    if (v_br >  DL_PP_SCLAMP) v_br =  DL_PP_SCLAMP; else if (v_br < -DL_PP_SCLAMP) v_br = -DL_PP_SCLAMP;
 
     // Trapezoid quad: left edge at column x1, right edge at column x2+1; each
     // edge spans its own [ytop..ybot] screen rows. Per-corner S/T (texels) +

@@ -531,7 +531,13 @@ R_PlaneCornerAttr
     float	cosf, sinf;
 
     if (dyrows < 0.0f) dyrows = -dyrows;
-    if (dyrows < 0.03125f) dyrows = 0.03125f;   // guard the centery singularity
+    // Horizon guard. A corner closer than ~1 row to centery would yield a
+    // near-infinite distance (yslope -> inf); software never maps a floor row
+    // that close to the horizon (its visplanes are bounded away from it), so the
+    // only way a corner reaches it is the half-pixel run-end extrapolation. Clamp
+    // dyrows to >= 1 row: the distance stays finite + sane, and the downstream
+    // texel coords + IFLOOR/s10.5 casts can never overflow (which trapped before).
+    if (dyrows < 1.0f) dyrows = 1.0f;
 
     // yslope(yc) = projectiony/|yc-cy+.5| (the float form of yslope[]'s FixedDiv).
     yslope_f   = (float)projectiony / dyrows;
@@ -555,10 +561,16 @@ R_PlaneCornerAttr
     *u = ((float)viewx * (1.0f / (float)FRACUNIT)) + cosf * length_f;
     *v = (-(float)viewy * (1.0f / (float)FRACUNIT)) - sinf * length_f;
 
-    // INV_W = (yc - centery + 0.5)/planeheight (screen-Y-linear). planeheight is
-    // a fixed_t; divide by FRACUNIT so the magnitude is well-scaled (~rows/world).
-    *invw = dyrows / ((float)planeheight * (1.0f / (float)FRACUNIT));
-    if (*invw < 1e-6f) *invw = 1e-6f;
+    // INV_W = (yc - centery + 0.5) -- screen-Y-linear, the ROW offset itself.
+    // distance ~ planeheight/dyrows (yslope), so 1/W ~ dyrows up to a constant;
+    // the ABSOLUTE scale of INV_W cancels in the RDP's texture divide (u =
+    // (u*INV_W)/INV_W), and planeheight cancels independently because the texel
+    // coords already carry the full distance (length ~ planeheight/dyrows, so
+    // u*INV_W is x-only + y-only -- screen-affine -- for ANY INV_W scale). Using
+    // bare dyrows keeps 1/INV_W = 1/dyrows in [~1/168, ~32], well inside
+    // rdpq_triangle's s16.16 W = 1/INV_W cast (the planeheight-scaled form
+    // overflowed it on deep floors near the horizon: 1/INV_W = planeheight/dyrows).
+    *invw = dyrows;     // dyrows >= 0.03125 (guarded above) -> 1/INV_W bounded
 }
 
 // Emit ONE trapezoid run [xa..xb] of a covered island as a quad. top[]/bottom[]
