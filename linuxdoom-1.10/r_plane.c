@@ -547,9 +547,21 @@ R_MakeSpans
 #define PLANETESS_SPLIT_DEVY  1.25f
 #endif
 
-// One corner's screen->texel un-projection + INV_W (float, exact form of
-// R_MapPlane). xc/yc are the corner's screen column/row (fractional). Fills
-// *u/*v (texel coords) and *invw.
+// One corner's screen->texel un-projection + INV_W. xc/yc are the corner's
+// screen column/row (fractional). Fills *u/*v (texel coords) and *invw.
+//
+// The texel un-projection runs R_MapPlane's EXACT integer FixedMul chain (the
+// same one R_PlaneExpectedTexel mirrors), then expresses the final fixed
+// xfrac/yfrac in TEXELS as float (xfrac/65536, yfrac/65536). The earlier float
+// port carried yslope/distance/length as 16.16-FIXED magnitudes but only shed
+// ONE FRACUNIT on the way to *u/*v, leaving the length term un-divided: it
+// emitted u,v of ~+-700,000 texels (a whole uncancelled <<16) where R_MapPlane's
+// true texel is ~700-1200. Running the integer chain and dividing the final
+// fixed xfrac/yfrac by FRACUNIT removes that ambiguity by construction -- the
+// emitted texel is then identical (modulo the masking the trace applies) to the
+// software floor's ds_xfrac>>16 / ds_yfrac>>16 at that corner pixel. Full
+// precision, UN-masked: the perspective interp and the whole-64 period bias
+// downstream need the continuous texel, so we do NOT &63 here.
 static void
 R_PlaneCornerAttr
 ( float		xc,
@@ -559,12 +571,9 @@ R_PlaneCornerAttr
   float*	invw )
 {
     float	dyrows = yc - (float)centery + 0.5f;
-    float	yslope_f;
-    float	distance_f;
-    float	length_f;
-    int		xci;
+    int		xci, yci;
     angle_t	ang;
-    float	cosf, sinf;
+    fixed_t	distance, length, xfrac, yfrac;
 
     if (dyrows < 0.0f) dyrows = -dyrows;
     // Horizon guard. A corner closer than ~1 row to centery would yield a
@@ -575,43 +584,38 @@ R_PlaneCornerAttr
     // texel coords + IFLOOR/s10.5 casts can never overflow (which trapped before).
     if (dyrows < 1.0f) dyrows = 1.0f;
 
-    // yslope(yc) = projectiony/|yc-cy+.5| (the float form of yslope[]'s FixedDiv).
-    yslope_f   = (float)projectiony / dyrows;
-    // distance = FixedMul(planeheight, yslope) = (planeheight*yslope)/FRACUNIT.
-    distance_f = ((float)planeheight * yslope_f) * (1.0f / (float)FRACUNIT);
-
-    // Column-indexed angle/distscale: clamp the screen edge column into range
-    // (the right edge xb+1 can reach viewwidth; sample the last valid column).
+    // Row-indexed yslope and column-indexed distscale/xtoviewangle, the exact
+    // integer tables R_MapPlane samples. yci is the corner row offset from
+    // centery (yslope[] is symmetric about centery: yslope[y] depends only on
+    // |y-centery+.5|). Clamp both screen indices into range -- the right edge
+    // xb+1 can reach viewwidth and the half-pixel extrapolation can push a corner
+    // a row past the visplane; sample the last valid column/row (matches
+    // R_PlaneExpectedTexel's clamps).
     xci = (int)(xc + 0.5f);
     if (xci < 0)            xci = 0;
     if (xci >= viewwidth)   xci = viewwidth - 1;
 
-    // length = FixedMul(distance, distscale[xci]).
-    length_f = distance_f * ((float)distscale[xci] * (1.0f / (float)FRACUNIT));
+    yci = (int)((float)centery + dyrows - 0.5f + 0.5f);   // round(centery+dyrows)
+    if (yci < 0)            yci = 0;
+    if (yci >= viewheight)  yci = viewheight - 1;
 
-    // World-distance bound. A real DOOM map fits within +-32768 world units, so
-    // any interior floor pixel has length well under ~5e4; software's R_MapPlane
-    // never maps farther because its visplanes are bounded away from the horizon.
-    // The ONLY corner that reaches a pathological length is the half-pixel run-end
-    // extrapolation at dyrows~=1 (just past the horizon, OUTSIDE the covered span)
-    // and/or a screen-edge column whose distscale blows up -- it produced u,v of
-    // ~9e7 texels, whose raw S=u*32 (~3e9) overflows rdpq_triangle_rsp's float->
-    // int16 S cast (rdpq_tri.c:521, trunc.w.s NOTIMPL trap). Clamp length to a
-    // generous 1e6 (>20x the map diagonal): every real sampled pixel is far below
-    // it, so its u,v / u*INV_W / INV_W keep their exact planar values (the RDP's
-    // perspective divide stays exact); only the sub-pixel extrapolated edge corner
-    // is bounded -- the documented near-horizon artifact, never a crash and never
-    // the interior distortion the old per-vertex +-960 S/T clamp caused.
-    if (length_f >  1.0e6f) length_f =  1.0e6f;
-    else if (length_f < -1.0e6f) length_f = -1.0e6f;
+    // R_MapPlane's exact integer chain (== R_PlaneExpectedTexel):
+    //   distance = FixedMul(planeheight, yslope[y])
+    //   length   = FixedMul(distance, distscale[x])
+    //   xfrac    =  viewx + FixedMul(finecosine[ang], length)
+    //   yfrac    = -viewy - FixedMul(finesine[ang],   length)
+    distance = FixedMul(planeheight, yslope[yci]);
+    length   = FixedMul(distance, distscale[xci]);
+    ang      = (viewangle + xtoviewangle[xci]) >> ANGLETOFINESHIFT;
+    xfrac    =  viewx + FixedMul(finecosine[ang], length);
+    yfrac    = -viewy - FixedMul(finesine[ang],   length);
 
-    ang  = (viewangle + xtoviewangle[xci]) >> ANGLETOFINESHIFT;
-    cosf = (float)finecosine[ang] * (1.0f / (float)FRACUNIT);
-    sinf = (float)finesine[ang]   * (1.0f / (float)FRACUNIT);
-
-    // u/v in TEXELS: (viewx + cos*length)/FRACUNIT, (-viewy - sin*length)/FRACUNIT.
-    *u = ((float)viewx * (1.0f / (float)FRACUNIT)) + cosf * length_f;
-    *v = (-(float)viewy * (1.0f / (float)FRACUNIT)) - sinf * length_f;
+    // u/v in TEXELS = the fixed xfrac/yfrac >> 16, full precision (not masked):
+    // xfrac/65536, yfrac/65536 -- exactly R_MapPlane's ds_xfrac/ds_yfrac in texel
+    // units. FRACUNIT == 65536; the fixed magnitude carries the whole <<16, so
+    // the single /FRACUNIT here lands on the true texel position.
+    *u = (float)xfrac * (1.0f / (float)FRACUNIT);
+    *v = (float)yfrac * (1.0f / (float)FRACUNIT);
 
     // INV_W = (yc - centery + 0.5) -- screen-Y-linear, the ROW offset itself.
     // distance ~ planeheight/dyrows (yslope), so 1/W ~ dyrows up to a constant;
