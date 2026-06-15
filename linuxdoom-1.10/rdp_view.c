@@ -590,72 +590,39 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
 
-    // HEADLINE T-BAND COLLAPSE (DO #1): downsample 128/256-wide textures to a
-    // 64-wide CI4 block at first touch. A 64-wide CI4 row is 32 bytes; the lower
-    // 2 KB TMEM half then caps at 64 rows (vs 32 for 128-wide @ 64 B/row, 16 for
-    // 256-wide @ 128 B/row). So a 128-tall wall on a 64- or 128-tall texture goes
-    // from 2-4 T-bands to ONE band (one LOAD_TILE, one tri-pair) and wraps in
-    // hardware S+T -- exactly the one-quad-per-wall lever the CI4 design promised
-    // but the prior round under-delivered (128/256-wide kept band-splitting -> 74
-    // loads/frame). Ryan ACCEPTED the CI4 fidelity, so 64-wide downsample is on
-    // the table; DOOM1 has 36 x 128-wide + 8 x 256-wide that stop band-splitting.
+    // NATIVE-RESOLUTION CI4 STORE (fidelity rework). The texture is stored at its
+    // FULL declared dimensions -- no S-downsample, no T-downsample. Ryan rejected
+    // the blanket resolution downsample (038c7f3 width 128/256->64, e94c39a
+    // 64x64 height cap): halving/quartering resolution mushed the detailed wides
+    // (COMPUTE2's computer bank, STARTAN3's metallic striping). CI4 ACCEPTANCE was
+    // for COLOUR quantization (256->16 sub-palette), NOT resolution loss.
     //
-    // ds_shift maps the emit's ORIGINAL-width S into the stored 64-wide space (a
-    // right-shift applied in DL_DrawRecord). The stored width (slot->width) is 64
-    // so the S-mask/pitch/cap all follow it; the sub-palette is built from the
-    // FULL-res columns (the colour set is a superset of any averaged colour, so
-    // the snap target is correct) and the downsample averages source column-pairs
-    // (128) / quads (256) in gamma RGB, snapping each averaged texel to the
-    // nearest sub-palette slot.
+    // The 74->5 tile-load collapse is recovered WITHOUT throwing away pixels, from
+    // BAND MATH + the hardware one-quad fast path AT NATIVE RES:
+    //   - CI4 packs 2 indices/byte, so a row is HALF the bytes of CI8: the TMEM
+    //     lower-half cap (2 KB) holds DOUBLE the rows. A 64-wide CI4 row is 32 B
+    //     -> cap 64 rows; 128-wide is 64 B -> cap 32; 256-wide is 128 B -> cap 16.
+    //   - A native block that fits the lower TMEM half AND is pow2 in both dims is
+    //     the ONE-QUAD class (fits_hw below): exactly 64x64 CI4 = 2048 B fits, so
+    //     the 65% of DOOM1 walls that are 64-wide x <=64-tall draw as a single
+    //     LOAD_TILE + tri-pair with hardware S+T wrap, ANY wall height. That alone
+    //     collapses the bulk of the per-band loads the CI8 path emitted (~150/fr).
+    //   - Native wides that don't one-quad (64x128 = 2 T-bands; 128-wide = 2 S
+    //     periods worth per row but stored as 64 B/row so 128x128 = 4 T-bands;
+    //     256-wide = more) use the existing band walk AT NATIVE RES. CI4's halved
+    //     row bytes already halve the band count vs CI8; a few more loads than the
+    //     downsampled 5, still FAR below the original 74, full resolution kept.
+    //
+    // ds_shift/ts_shift are now always 0 (the emit's original-width/height S/T map
+    // 1:1 into the stored space); DL_DrawRecord's 1/2^shift scales become identity
+    // and the box-filter downsample branch below is unreachable. They are retained
+    // (not deleted) so the draw-time scale path and the record signature stay
+    // intact for a future SELECTIVE per-texture downsample if ever proven safe.
     {
-        int store_w;            // stored block width (period after S downsample)
-        int store_h;            // stored block height (rows after T downsample)
-        int ds_shift = 0;       // log2(tw / store_w)
-        int ts_shift = 0;       // log2(th / store_h)
-
-        // S downsample: cap the stored period at 64 (128->64, 256->64).
-        if (tw > 64)
-        {
-            store_w  = 64;
-            while ((store_w << ds_shift) < tw)
-                ds_shift++;     // 128 -> 1, 256 -> 2
-        }
-        else
-        {
-            store_w = tw;
-        }
-
-        // T downsample (DO #3 enabler): cap the stored height at 64 ONLY when (a)
-        // the texture is taller than 64 AND (b) its height is a power of two (so
-        // hardware T-mask wraps cleanly) AND (c) halving it makes the whole block
-        // fit the lower 2 KB TMEM half. A 64x64 CI4 block is exactly 2 KB and a
-        // fitting pow2 block is then drawn as ONE QUAD with hardware S+T wrap (no
-        // band walk) regardless of wall height -- the residual-load lever after
-        // the width collapse (most DOOM1 walls are 64-wide x 128-tall = 4 KB,
-        // 2 T-bands; 64x64 = 1 load). Non-pow2-tall textures (72/56/24) keep
-        // their full height and the band walk (correct mod-blkh wrap); they are a
-        // minority and already <= 2 bands.
-        {
-            int is_pow2_h = (th & (th - 1)) == 0;
-            if (th > 64 && is_pow2_h)
-            {
-                int pad0  = (store_w < 16) ? 16 : store_w;
-                int pitch0 = pad0 / 2;
-                // halve height until it fits 2 KB (128->64 is one step for the
-                // 64-wide bulk; narrower textures already fit and skip this).
-                store_h = th;
-                while (store_h > 64 || pitch0 * store_h > DL_TMEM_HALF)
-                {
-                    if ((store_h & 1) != 0) break;  // can't halve further cleanly
-                    store_h >>= 1;
-                    ts_shift++;
-                }
-            }
-            else
-            {
-                store_h = th;
-            }
-        }
+        int store_w = tw;       // stored block width = full pow2 sampling period
+        int store_h = th;       // stored block height = full texture height
+        int ds_shift = 0;       // 0: native S (no width downsample)
+        int ts_shift = 0;       // 0: native T (no height downsample)
 
         slot->width    = store_w;
         slot->height   = store_h;
@@ -1804,12 +1771,11 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
     xl = (float)w->x1;
     xr = (float)w->x2 + 1.0f;
 
-    // DOWNSAMPLE S SCALE (DO #1): the emit captured S in ORIGINAL-width texture
-    // columns; the stored block is downsampled to blkw (64) by ds_shift, so an
-    // original column c maps to stored column c >> ds_shift. Scale both endpoints
-    // by 1/2^ds_shift BEFORE the period bias/mask (which operate in the stored
-    // 64-wide space). The emit's run-break cap of 700 original columns becomes
-    // <= 350 stored, well inside the |S| < 1024 saturation guard.
+    // S SCALE: ds_shift is 0 at native resolution (no width downsample), so this
+    // is an identity scale -- the emit's original-width S maps 1:1 into the stored
+    // blkw-wide space. The 1/2^ds_shift form is retained so a future SELECTIVE
+    // per-texture downsample (ds_shift>0) would still map original column c to
+    // stored column c >> ds_shift before the period bias/mask.
     {
         float sscale = 1.0f / (float)(1 << ds_shift);
         float es_l = w->s_l * sscale;
@@ -1880,11 +1846,12 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
     // per edge, so adjacent slices share their boundary chord exactly (no gap,
     // no overlap) and the union tiles the full rect.
     //
-    // DOWNSAMPLE T SCALE: the emit captured T in ORIGINAL-height texel rows; the
-    // stored block is blkh = (orig_h >> ts_shift) tall, so scale every T endpoint
-    // by 1/2^ts_shift into the stored row space. The vertical wrap period is then
-    // blkh (the stored height), which both paths honour (fast path via hardware
-    // T-mask = log2(blkh); band walk via mod-blkh period split).
+    // T SCALE: ts_shift is 0 at native resolution (no height downsample), so this
+    // is an identity scale -- the emit's original-height T maps 1:1 into the
+    // stored blkh rows. blkh is the full texture height, the vertical wrap period
+    // both paths honour (fast path via hardware T-mask = log2(blkh); band walk via
+    // mod-blkh period split). The 1/2^ts_shift form is retained for a future
+    // SELECTIVE per-texture downsample only.
     {
         float tscale = 1.0f / (float)(1 << ts_shift);
         tl0 = w->t_top_l * tscale;
