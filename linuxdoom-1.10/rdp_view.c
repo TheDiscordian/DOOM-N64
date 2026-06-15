@@ -160,14 +160,19 @@ static float        dl_invw_k = 1.0f;
 // textures are 64-wide" is FALSE: 44 of DOOM1's 125 TEXTURE1 entries are wider
 // (36 x 128-wide, 8 x 256-wide). A fixed 64-wide transpose sampled `col mod 64`
 // where software samples `col mod width` -- wrong columns across half of every
-// wide wall. The transpose width is texturewidthmask[texnum]+1: the EXACT
+// wide wall. The transpose period is texturewidthmask[texnum]+1: the EXACT
 // power-of-two period R_GetColumn samples with (`col &= texturewidthmask`,
 // r_data.c:390), so non-power-of-two declared widths (e.g. the one 24-wide
-// texture, effective period 16) match the software sampler bit-for-bit.
+// texture, effective period 16) match the software sampler bit-for-bit. The
+// STORED block width can be narrower than that period: 128/256-wide textures are
+// downsampled to a 64-wide CI4 block (DL_RowMajorBlock ds_shift; DO #1), and the
+// emit's original-width S is right-shifted into the 64-wide space at draw time.
 //
-// TMEM tile sizing is per-width: a CI8 tile must fit the lower 2 KB TMEM half
-// (the TLUT owns the upper half), so DL_Flush uploads the block in bands of at
-// most DL_TMEM_HALF/width rows (64-wide: 32 rows; 128-wide: 16; 256-wide: 8).
+// TMEM tile sizing is per-STORED-width: a CI4 tile must fit the lower 2 KB TMEM
+// half (the TLUT owns the upper half), so the band walk caps at
+// DL_TMEM_HALF/(store_w/2) rows. With downsample every routed texture stores at
+// <= 64-wide (32 B/row), so the cap is 64 rows -- a <=64-tall texture is ONE
+// band (one LOAD_TILE, one tri-pair) regardless of its original 128/256 width.
 #define DL_TMEM_HALF    2048
 // Widths below 8 would break the 8-byte DMA/TMEM-line alignment of per-band
 // row offsets; no stock DOOM texture is that narrow -- refuse to route them.
@@ -184,13 +189,23 @@ typedef struct
     void* raw;      // the actual Z_Malloc'd allocation (back-referenced by zone)
     byte* block;    // 8-byte-aligned row-major width x height CI4 view into raw
     int   height;   // texture height in texels (rows in the block)
-    int   width;    // transpose width = texturewidthmask+1 (pow2 sample period)
+    int   width;    // STORED block width (texels/row in block): the sampling
+                    // period after downsample -- 64 for downsampled 128/256-wide,
+                    // else texturewidthmask+1. The S-mask/pitch follow this.
+    uint8_t  ds_shift;  // downsample shift: S right-shift mapping the emit's
+                        // original-width S into the stored 64-wide space (0 for
+                        // <=64-wide, 1 for 128->64, 2 for 256->64). The HEADLINE
+                        // T-band collapse: a 64-wide CI4 row halves/quarters the
+                        // pitch so the TMEM cap rises 32/16 -> 64 rows.
     uint32_t lastuse;   // present generation of the last DL_MarkInFlight
     uint8_t  pinned;    // currently PU_STATIC for an in-flight window
     uint8_t  subpal_n;  // count of valid sub-palette entries (1..16)
     uint8_t  subpal_inited; // 1 once the sub-palette + remap are built
     uint8_t  pal_slot;  // CI4 palette slot assigned for the CURRENT frame (0..15)
     uint16_t subpal[16];    // <=16 RGBA5551 TLUT entries (the quantized colours)
+    uint8_t  subpal_r[16];  // gamma RGB of each sub-palette entry (downsample snap)
+    uint8_t  subpal_g[16];
+    uint8_t  subpal_b[16];
     uint8_t  remap[256];    // PLAYPAL index -> sub-palette slot (0..subpal_n-1)
 } dl_rowmajor_t;
 
@@ -455,14 +470,24 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
 
     // Pack the final sub-palette as RGBA5551 (alpha=1, opaque -- walls are
     // never the transparency key; the key only matters for the CI8 overlay).
+    // Also keep each entry's gamma RGB: the downsample transpose averages a
+    // source column-group's gamma RGB per row and snaps to the nearest of these.
     for (k = 0; k < slot->subpal_n; k++)
     {
         slot->subpal[k] = (uint16_t)(((pal_r[k] >> 3) << 11) |
                                      ((pal_g[k] >> 3) << 6)  |
                                      ((pal_b[k] >> 3) << 1)  | 1);
+        slot->subpal_r[k] = pal_r[k];
+        slot->subpal_g[k] = pal_g[k];
+        slot->subpal_b[k] = pal_b[k];
     }
     for (; k < 16; k++)
-        slot->subpal[k] = slot->subpal[0];
+    {
+        slot->subpal[k]   = slot->subpal[0];
+        slot->subpal_r[k] = slot->subpal_r[0];
+        slot->subpal_g[k] = slot->subpal_g[0];
+        slot->subpal_b[k] = slot->subpal_b[0];
+    }
 
     // remap[]: every PLAYPAL index -> nearest sub-palette slot (squared RGB on
     // gamma-applied colours). Unused indices still get a valid slot (harmless;
@@ -539,38 +564,72 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     if (th > 1023)
         return NULL;
 
-    // The transpose width is the texture's power-of-two sampling period
-    // (R_GetColumn masks with texturewidthmask), NOT a fixed 64: see BUG-D note
-    // above. Wider periods than 512 can't be addressed by LOAD_TILE (S
-    // coordinate caps at 1024) and tile at <= 4 TMEM rows anyway; narrower
-    // than 8 break band alignment -- both refuse to route (CPU keeps the seg).
+    // The texture's power-of-two sampling period (R_GetColumn masks with
+    // texturewidthmask), NOT a fixed 64: see BUG-D note above. Wider periods than
+    // 512 can't be addressed by LOAD_TILE (S coordinate caps at 1024) and tile at
+    // <= 4 TMEM rows anyway; narrower than 8 break band alignment -- both refuse
+    // to route (CPU keeps the seg).
     tw = texturewidthmask[texnum] + 1;
     if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
-    slot->width = tw;
 
-    // CI4 row pitch is tw/2 bytes (2 indices/byte), and the RDP requires every
-    // tile pitch be a multiple of 8 bytes. tw is a power of two (texturewidthmask
-    // = pow2-1), so tw/2 is a multiple of 8 for tw >= 16; only tw==8 (4 bytes)
-    // is short. PAD the stored row to a 16-texel period (8 bytes) for tw==8 --
-    // the extra 8 texels are never sampled because the hardware S-wrap mask is
-    // log2(tw) (the REAL period), which folds every S into [0,tw). pad_w is the
-    // stored period (texels/row); the row pitch is pad_w/2 bytes.
+    // HEADLINE T-BAND COLLAPSE (DO #1): downsample 128/256-wide textures to a
+    // 64-wide CI4 block at first touch. A 64-wide CI4 row is 32 bytes; the lower
+    // 2 KB TMEM half then caps at 64 rows (vs 32 for 128-wide @ 64 B/row, 16 for
+    // 256-wide @ 128 B/row). So a 128-tall wall on a 64- or 128-tall texture goes
+    // from 2-4 T-bands to ONE band (one LOAD_TILE, one tri-pair) and wraps in
+    // hardware S+T -- exactly the one-quad-per-wall lever the CI4 design promised
+    // but the prior round under-delivered (128/256-wide kept band-splitting -> 74
+    // loads/frame). Ryan ACCEPTED the CI4 fidelity, so 64-wide downsample is on
+    // the table; DOOM1 has 36 x 128-wide + 8 x 256-wide that stop band-splitting.
+    //
+    // ds_shift maps the emit's ORIGINAL-width S into the stored 64-wide space (a
+    // right-shift applied in DL_DrawRecord). The stored width (slot->width) is 64
+    // so the S-mask/pitch/cap all follow it; the sub-palette is built from the
+    // FULL-res columns (the colour set is a superset of any averaged colour, so
+    // the snap target is correct) and the downsample averages source column-pairs
+    // (128) / quads (256) in gamma RGB, snapping each averaged texel to the
+    // nearest sub-palette slot.
     {
-        int pad_w = (tw < 16) ? 16 : tw;
+        int store_w;            // stored block width (period after downsample)
+        int ds_shift = 0;       // log2(tw / store_w)
+
+        if (tw > 64)
+        {
+            store_w  = 64;
+            while ((store_w << ds_shift) < tw)
+                ds_shift++;     // 128 -> 1, 256 -> 2
+        }
+        else
+        {
+            store_w = tw;
+        }
+        slot->width    = store_w;
+        slot->ds_shift = (uint8_t)ds_shift;
+
+    // CI4 row pitch is store_w/2 bytes (2 indices/byte), and the RDP requires
+    // every tile pitch be a multiple of 8 bytes. store_w is a power of two, so
+    // store_w/2 is a multiple of 8 for store_w >= 16; only store_w==8 (4 bytes)
+    // is short. PAD the stored row to a 16-texel period (8 bytes) for store_w==8
+    // -- the extra 8 texels are never sampled because the hardware S-wrap mask is
+    // log2(store_w) (the REAL period), which folds every S into [0,store_w).
+    // pad_w is the stored period (texels/row); the row pitch is pad_w/2 bytes.
+    {
+        int pad_w = (store_w < 16) ? 16 : store_w;
         int pitch = pad_w / 2;          // bytes/row (multiple of 8)
 
         // Build this texture's <=16-colour CI4 sub-palette + 256->slot remap
         // ONCE, at first touch (lossless if it already has <=16 distinct
-        // colours). Needs slot->width/height set.
+        // colours). Needs slot->width(=store_w)/height set; the sub-palette is
+        // built over the FULL-res columns (DL_BuildSubPalette re-reads tw via
+        // texturewidthmask), so downsample averaging snaps to the same palette.
         slot->height = th;
         DL_BuildSubPalette(texnum, slot);
 
         // PU_STATIC until DL_PresentEnd demotes it (lifetime note above); user
         // ptr back-references the slot so a zone reclaim NULLs slot->raw and the
-        // next touch re-transposes. The CI4 block is pitch*th bytes (HALF of the
-        // CI8 block at pad_w==tw -- the headline TMEM/band win). Over-allocate by
-        // 7 so the view is 8-byte aligned (the RDP DMA into TMEM needs an
+        // next touch re-transposes. The CI4 block is pitch*th bytes. Over-allocate
+        // by 7 so the view is 8-byte aligned (the RDP DMA into TMEM needs an
         // 8-byte-aligned source; Z_Malloc guarantees only 4).
         {
             int ci4_bytes = pitch * th;
@@ -580,25 +639,84 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
             block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
             memset(block, 0, ci4_bytes);    // pad texels = slot 0 (never sampled)
 
-            // Transpose column-major posts -> row-major AND pack to CI4 nibbles.
-            // Even column -> high nibble, odd column -> low nibble (RDP CI4 byte
-            // order; matches mksprite's (ix0<<4)|ix1). remap[] turns each PLAYPAL
-            // index into its 0..15 sub-palette slot.
-            for (col = 0; col < tw; col++)
+            if (ds_shift == 0)
             {
-                const byte* src = R_GetColumn(texnum, col);
-                byte*       dstcol = block + (col >> 1);
-                int         shift  = (col & 1) ? 0 : 4;
-                for (row = 0; row < th; row++)
+                // No downsample: transpose column-major posts -> row-major AND
+                // pack to CI4 nibbles. Even column -> high nibble, odd column ->
+                // low nibble (RDP CI4 byte order; matches mksprite's
+                // (ix0<<4)|ix1). remap[] turns each PLAYPAL index into its 0..15
+                // sub-palette slot.
+                for (col = 0; col < tw; col++)
                 {
-                    byte nib = slot->remap[src[row]] & 0x0F;
-                    byte* d  = dstcol + row * pitch;
-                    if (shift) *d = (byte)((*d & 0x0F) | (nib << 4));
-                    else       *d = (byte)((*d & 0xF0) | nib);
+                    const byte* src = R_GetColumn(texnum, col);
+                    byte*       dstcol = block + (col >> 1);
+                    int         shift  = (col & 1) ? 0 : 4;
+                    for (row = 0; row < th; row++)
+                    {
+                        byte nib = slot->remap[src[row]] & 0x0F;
+                        byte* d  = dstcol + row * pitch;
+                        if (shift) *d = (byte)((*d & 0x0F) | (nib << 4));
+                        else       *d = (byte)((*d & 0xF0) | nib);
+                    }
+                }
+            }
+            else
+            {
+                // Downsample tw -> 64: each output column averages a group of
+                // (1<<ds_shift) source columns in gamma RGB per row, then snaps
+                // the averaged texel to the nearest sub-palette slot. Averaging
+                // gamma RGB (not palette indices, which is meaningless) is the
+                // principled paletted box-filter; snapping among the sub-palette's
+                // <=16 entries keeps the result inside the texture's own colours.
+                const byte* playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
+                const int   group   = 1 << ds_shift;
+                const byte* gt      = gammatable[usegamma];
+                const byte* srccols[4];     // group <= 4 (256 -> 64)
+                int         g;
+
+                for (col = 0; col < store_w; col++)
+                {
+                    byte* dstcol = block + (col >> 1);
+                    int   shift  = (col & 1) ? 0 : 4;
+                    int   c0     = col << ds_shift;
+
+                    for (g = 0; g < group; g++)
+                        srccols[g] = R_GetColumn(texnum, c0 + g);
+
+                    for (row = 0; row < th; row++)
+                    {
+                        int sr = 0, sg = 0, sb = 0;
+                        int bestslot = 0, bestd = 0x7fffffff;
+                        byte* d;
+                        byte  nib;
+
+                        for (g = 0; g < group; g++)
+                        {
+                            const byte* p = playpal + srccols[g][row] * 3;
+                            sr += gt[p[0]];
+                            sg += gt[p[1]];
+                            sb += gt[p[2]];
+                        }
+                        sr >>= ds_shift; sg >>= ds_shift; sb >>= ds_shift;
+
+                        for (g = 0; g < slot->subpal_n; g++)
+                        {
+                            int dd = DL_RGBdist2(sr, sg, sb,
+                                                 slot->subpal_r[g],
+                                                 slot->subpal_g[g],
+                                                 slot->subpal_b[g]);
+                            if (dd < bestd) { bestd = dd; bestslot = g; }
+                        }
+                        nib = (byte)(bestslot & 0x0F);
+                        d   = dstcol + row * pitch;
+                        if (shift) *d = (byte)((*d & 0x0F) | (nib << 4));
+                        else       *d = (byte)((*d & 0xF0) | nib);
+                    }
                 }
             }
             data_cache_hit_writeback(block, ci4_bytes);
         }
+    }
     }
     slot->block = block;
     // Fresh blocks are born PU_STATIC: record that as a pin in the current
@@ -1583,7 +1701,7 @@ static int         dl_last_tile_wrap;
 static uint32_t    dl_last_prim;
 
 static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
-                         int pal_slot)
+                         int pal_slot, int ds_shift)
 {
     int     cap;            // max CI4 tile rows fitting the lower TMEM half
     int     pad_w;          // stored CI4 period (texels/row; >=16 for pitch)
@@ -1610,6 +1728,17 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
     xl = (float)w->x1;
     xr = (float)w->x2 + 1.0f;
 
+    // DOWNSAMPLE S SCALE (DO #1): the emit captured S in ORIGINAL-width texture
+    // columns; the stored block is downsampled to blkw (64) by ds_shift, so an
+    // original column c maps to stored column c >> ds_shift. Scale both endpoints
+    // by 1/2^ds_shift BEFORE the period bias/mask (which operate in the stored
+    // 64-wide space). The emit's run-break cap of 700 original columns becomes
+    // <= 350 stored, well inside the |S| < 1024 saturation guard.
+    {
+        float sscale = 1.0f / (float)(1 << ds_shift);
+        float es_l = w->s_l * sscale;
+        float es_r = w->s_r * sscale;
+
     // S bias reduction (BUG D, saturation guard): texturecolumn is unbounded
     // (rw_offset + tangent term), but rdpq_triangle's attribute fixed point
     // saturates at |S| >= 1024 texels, smearing the texture. The tile wraps S
@@ -1617,11 +1746,10 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
     // both endpoints is sampling-identical; after the bias the smaller endpoint
     // lies in [0, blkw) and the emit-side run split caps |s_r - s_l| at 700, so
     // |S| < blkw + 700 < 1024.
-    {
-        float smin = (w->s_l < w->s_r) ? w->s_l : w->s_r;
+        float smin = (es_l < es_r) ? es_l : es_r;
         float bias = floorf(smin / (float)blkw) * (float)blkw;
-        s_l = w->s_l - bias;
-        s_r = w->s_r - bias;
+        s_l = es_l - bias;
+        s_r = es_r - bias;
     }
 
     // CI4 HARDWARE S-WRAP (the headline one-quad-per-wall lever). The whole
@@ -2227,7 +2355,7 @@ void DL_Flush(void)
                        (int)w->t_top_r, (int)w->t_bot_r,
                        (int)w->s_l, (int)w->s_r, (int)w->light);
 #endif
-                DL_DrawRecord(w, block, blkh, blkw, pal_slot);
+                DL_DrawRecord(w, block, blkh, blkw, pal_slot, slot->ds_shift);
             }
         }
     }
