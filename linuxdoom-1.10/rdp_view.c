@@ -776,6 +776,80 @@ static int DL_TexIsProtectedWide(int texnum, int tw)
     return 0;
 }
 
+// =====================================================================
+//  2x DOWNSAMPLE TIER (named >=256-wides: halve BOTH axes once, band-split)
+// =====================================================================
+// A THIRD per-texture verdict, between NATIVE (protected) and ONE-QUAD collapse.
+// The width boundary (DL_PROTECT_MIN_W) keeps every >=256-wide NATIVE; this list
+// carves a named subset back OUT of native into a 2x downsample: ds_shift=1 AND
+// ts_shift=1 (halve width 256->128 AND halve a pow2 height 128->64 in ONE step
+// each). A 128x64 CI4 tile is (128/2)*64 = 4096 B > DL_TMEM_HALF (2048), so it
+// does NOT reach the one-quad fits_hw budget -- it BAND-SPLITS normally (2 S-bands
+// of 64x64). So this tier still cuts the >=256-wide's upload/triangle volume (the
+// RSP-command lever) WITHOUT the 4x horizontal squish a full collapse to 64 would
+// inflict on these large-period faces.
+//
+//  *** This is the tunable boundary: ONE LINE PER TEXTURE. ***
+// Listed >=256-wides downsample 2x; any >=256-wide NOT listed stays NATIVE. SKY1
+// is deliberately ABSENT (it rides the sky special path, never route here). Drop
+// a name to pull it back to native, add a name to 2x-downsample it; resolves to
+// texnums once (R_CheckTextureNumForName), cached, -1 (absent in WAD) never hits.
+static const char* const dl_downsample2x_names[] = {
+    "PLANET1",
+    "COMPUTE2",
+    "COMPTALL",
+    "GRAY7",
+    "STONE",
+    "PIPE2",
+    0,  // sentinel so the array is never zero-length (ISO C); skipped at resolve.
+};
+#define DL_DS2X_N (int)(sizeof(dl_downsample2x_names)/sizeof(dl_downsample2x_names[0]))
+static int  dl_ds2x_tex[DL_DS2X_N];
+static int  dl_ds2x_resolved;
+
+// Is this texture in the 2x-downsample set above? (Name match only -- the caller
+// gates on width so a sub-256 name here would never reach this; SKY1 is excluded
+// by absence.) Returns 1 to take the 2x (half) tier, 0 to leave the texture on
+// whatever its width verdict was (native for >=256, collapse for narrower).
+static int DL_Tex2xDownsample(int texnum)
+{
+    int i;
+    if (!dl_ds2x_resolved)
+    {
+        for (i = 0; i < DL_DS2X_N; i++)
+            dl_ds2x_tex[i] = dl_downsample2x_names[i]
+                ? R_CheckTextureNumForName((char*)dl_downsample2x_names[i])
+                : -1;                       // sentinel slot -> never matches
+        dl_ds2x_resolved = 1;
+    }
+    for (i = 0; i < DL_DS2X_N; i++)
+        if (dl_ds2x_tex[i] == texnum)       // (-1 absent/sentinel never match)
+            return 1;
+    return 0;
+}
+
+// Per-texture downsample verdict (3-way classifier on width + the named lists):
+//   DL_TIER_NATIVE  -- full resolution (protected >=256-wide not in 2x list, or
+//                      a width that fails the collapse gate). ds=ts=0.
+//   DL_TIER_HALF    -- 2x downsample (named >=256-wide): ds_shift=1, ts_shift=1
+//                      for pow2 height; band-splits (not one-quad).
+//   DL_TIER_ONEQUAD -- collapse-to-64 (the 128-wide tiling walls): ds/ts toward 64.
+// The HALF tier takes priority over NATIVE for a named >=256-wide; ONEQUAD is the
+// existing sub-256 collapse path (gated by the box-filter error metric downstream).
+#define DL_TIER_NATIVE   0
+#define DL_TIER_HALF     1
+#define DL_TIER_ONEQUAD  2
+static int DL_TexDownsampleTier(int texnum, int tw, int th)
+{
+    if (DL_TexIsProtectedWide(texnum, tw))      // >=256-wide (or name-pinned native)
+        return DL_Tex2xDownsample(texnum) ? DL_TIER_HALF : DL_TIER_NATIVE;
+    // Below the width boundary: the existing one-quad collapse, still gated by the
+    // box-filter reconstruction-error metric (detailed wides stay native).
+    if (tw > 64 && DL_DownsampleErr(texnum, tw, th) < DL_DS_ERR_THRESH)
+        return DL_TIER_ONEQUAD;
+    return DL_TIER_NATIVE;
+}
+
 // Produce (or fetch) the full-height row-major CI8 block for texnum.
 // Column-major DOOM posts -> row-major: for each of the width columns,
 // R_GetColumn gives that column's texel run (textureheight texels); scatter it
@@ -875,13 +949,15 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
         int ds_shift = 0;       // S downsample shift (0 native, 1 = halve width)
         int ts_shift = 0;       // 0: native T (height never downsampled -- see above)
 
-        // SELECTIVE S+T DOWNSAMPLE DECISION (the collapse-to-one-quad lever).
-        // A wide texture COLLAPSES only if it is NOT protected (below the width
-        // boundary DL_PROTECT_MIN_W and not name-pinned) AND its box-filter
-        // reconstruction error is below threshold. The width boundary pins the
-        // must-stay-native wides (COMPUTE2 and any >=256-wide) regardless of the
-        // luma metric; the metric guards the remaining (collapsing) wides. When a
-        // wide collapses we take BOTH axes down toward 64 in ONE halving step each:
+        // SELECTIVE S+T DOWNSAMPLE DECISION (3-way: native / 2x half / one-quad).
+        // DL_TexDownsampleTier classifies by width + the named lists:
+        //   - >=256-wide in dl_downsample2x_names -> HALF (2x, band-split below).
+        //   - >=256-wide NOT in that list (or name-pinned) -> NATIVE (full res).
+        //   - sub-256, low box-filter error -> ONEQUAD collapse-to-64.
+        //   - sub-256, high error (detailed) -> NATIVE.
+        // The width boundary still pins the >=256-wides native by DEFAULT; the 2x
+        // list carves a named subset back out. When a wide DOWNSAMPLES (HALF or
+        // ONEQUAD) we take its axes down in ONE halving step each:
         //   - S 128->64 (or 256->128, capped at 64): halve the stored width so the
         //     CI4 row fits the TMEM half (the load-band lever).
         //   - T 128->64: halve the stored HEIGHT too, but ONLY for a pow2 height
@@ -894,11 +970,13 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
         //     protect boundary + error gate now prevent.
         // store_h tracks the T downsample so blkh / T-mask / load-extent / T-scale
         // all reference the SAME (downsampled) height downstream -- no desync.
-        int is_collapsing =
-            (tw > 64
-             && !DL_TexIsProtectedWide(texnum, tw)
-             && DL_DownsampleErr(texnum, tw, th) < DL_DS_ERR_THRESH);
-        if (is_collapsing)
+        // 3-WAY VERDICT: native (0), 2x half-downsample (1), one-quad collapse (2).
+        // The 2x tier is a named >=256-wide carved out of native (see
+        // DL_TexDownsampleTier / dl_downsample2x_names): it halves BOTH axes ONCE
+        // (256->128 width, pow2 128->64 height) and stays >2 KB so it BAND-SPLITS,
+        // NOT one-quad. The one-quad tier is the unchanged sub-256 collapse-to-64.
+        int tier = DL_TexDownsampleTier(texnum, tw, th);
+        if (tier == DL_TIER_ONEQUAD)
         {
             // --- S axis: halve width toward 64 (one step; cap at 64) ----------
             store_w  = tw >> 1;
@@ -915,6 +993,25 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
             // (log2(store_h)) wraps the downsampled block exactly; the common
             // wall height is 128 -> store_h 64. Heights <=64 (already one-quad-
             // tall) or non-pow2 (56/72/...) keep ts_shift 0 and stay native T.
+            if (th > 64 && (th & (th - 1)) == 0)
+            {
+                store_h  = th >> 1;         // 128 -> 64 (one step)
+                ts_shift = 1;
+            }
+        }
+        else if (tier == DL_TIER_HALF)
+        {
+            // --- 2x TIER: one halving per axis, NOT capped at 64 --------------
+            // S: 256 -> 128 (one step). ds_shift=1. Width stays 128 (above the
+            // 64 one-quad target) so the 128x64 CI4 tile is 4 KB > DL_TMEM_HALF
+            // and the fits_hw test below comes out 0 -> band-split (2 S-bands).
+            store_w  = tw >> 1;             // 256 -> 128
+            ds_shift = 1;
+
+            // T: halve a pow2 height 128 -> 64 once (same exactness gate as the
+            // one-quad path: hardware T-mask = log2(store_h) must wrap exactly).
+            // Non-pow2 heights (COMPUTE2 56, etc.) keep native T -- they still
+            // drop out of native via the S halving alone (the load-volume lever).
             if (th > 64 && (th & (th - 1)) == 0)
             {
                 store_h  = th >> 1;         // 128 -> 64 (one step)
