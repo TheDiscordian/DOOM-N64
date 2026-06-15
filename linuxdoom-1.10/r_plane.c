@@ -553,6 +553,22 @@ R_PlaneCornerAttr
     // length = FixedMul(distance, distscale[xci]).
     length_f = distance_f * ((float)distscale[xci] * (1.0f / (float)FRACUNIT));
 
+    // World-distance bound. A real DOOM map fits within +-32768 world units, so
+    // any interior floor pixel has length well under ~5e4; software's R_MapPlane
+    // never maps farther because its visplanes are bounded away from the horizon.
+    // The ONLY corner that reaches a pathological length is the half-pixel run-end
+    // extrapolation at dyrows~=1 (just past the horizon, OUTSIDE the covered span)
+    // and/or a screen-edge column whose distscale blows up -- it produced u,v of
+    // ~9e7 texels, whose raw S=u*32 (~3e9) overflows rdpq_triangle_rsp's float->
+    // int16 S cast (rdpq_tri.c:521, trunc.w.s NOTIMPL trap). Clamp length to a
+    // generous 1e6 (>20x the map diagonal): every real sampled pixel is far below
+    // it, so its u,v / u*INV_W / INV_W keep their exact planar values (the RDP's
+    // perspective divide stays exact); only the sub-pixel extrapolated edge corner
+    // is bounded -- the documented near-horizon artifact, never a crash and never
+    // the interior distortion the old per-vertex +-960 S/T clamp caused.
+    if (length_f >  1.0e6f) length_f =  1.0e6f;
+    else if (length_f < -1.0e6f) length_f = -1.0e6f;
+
     ang  = (viewangle + xtoviewangle[xci]) >> ANGLETOFINESHIFT;
     cosf = (float)finecosine[ang] * (1.0f / (float)FRACUNIT);
     sinf = (float)finesine[ang]   * (1.0f / (float)FRACUNIT);
