@@ -80,6 +80,9 @@ typedef struct
     uint16_t drawsegs;
     uint16_t visplanes;
     uint16_t tile_loads;    // RDP wall band LOAD_TILEs this frame (CI4 diagnostic)
+    uint16_t recs;          // RDP wall records drawn this present (A/B lever)
+    uint16_t uploads;       // RDP wall upload calls this present (A/B lever)
+    uint16_t tris;          // RDP wall triangles emitted this present (A/B lever)
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -423,6 +426,14 @@ void N64Bench_LoopEnd(void)
             extern uint32_t DL_TileLoadCount(void) __attribute__((weak));
             f->tile_loads = DL_TileLoadCount ?
                             (uint16_t)DL_TileLoadCount() : 0;
+            // Sibling per-present primitive counters (records/uploads/tris).
+            // Same weak-ref pattern so non-RDP builds link clean.
+            extern uint32_t DL_RecCount(void)    __attribute__((weak));
+            extern uint32_t DL_UploadCount(void) __attribute__((weak));
+            extern uint32_t DL_TriCount(void)    __attribute__((weak));
+            f->recs    = DL_RecCount    ? (uint16_t)DL_RecCount()    : 0;
+            f->uploads = DL_UploadCount ? (uint16_t)DL_UploadCount() : 0;
+            f->tris    = DL_TriCount    ? (uint16_t)DL_TriCount()    : 0;
         }
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
@@ -632,6 +643,7 @@ static void N64Bench_ReportPhases(void)
     unsigned long long leftover_sum = 0;
     unsigned long long vissprite_sum = 0, drawseg_sum = 0, visplane_sum = 0;
     unsigned long long tileload_sum = 0;
+    unsigned long long rec_sum = 0, upload_sum = 0, tri_sum = 0;
     unsigned long tics_frames = 0;
 
     unsigned long tail_thresh, tail_target, tail_n = 0;
@@ -675,6 +687,9 @@ static void N64Bench_ReportPhases(void)
         drawseg_sum   += f->drawsegs;
         visplane_sum  += f->visplanes;
         tileload_sum  += f->tile_loads;
+        rec_sum       += f->recs;
+        upload_sum    += f->uploads;
+        tri_sum       += f->tris;
         if (f->tics_ran) tics_frames++;
 
         // tail accumulation
@@ -729,10 +744,13 @@ static void N64Bench_ReportPhases(void)
                "leftover", mean, pct10 / 10, pct10 % 10);
     }
     debugf("BENCH_COUNTS mean_vissprites=%lu mean_drawsegs=%lu mean_visplanes=%lu "
-           "mean_tile_loads=%lu\n",
+           "mean_recs=%lu mean_uploads=%lu mean_tris=%lu mean_tile_loads=%lu\n",
            (unsigned long)(vissprite_sum / bench_frame_count),
            (unsigned long)(drawseg_sum / bench_frame_count),
            (unsigned long)(visplane_sum / bench_frame_count),
+           (unsigned long)(rec_sum / bench_frame_count),
+           (unsigned long)(upload_sum / bench_frame_count),
+           (unsigned long)(tri_sum / bench_frame_count),
            (unsigned long)(tileload_sum / bench_frame_count));
 
     // --- tail report (worst BENCH_TAIL_PCT%) ------------------------------

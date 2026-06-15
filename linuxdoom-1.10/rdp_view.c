@@ -249,6 +249,19 @@ static uint16_t       dl_subpal_up[16][16] __attribute__((aligned(8)));
 static uint32_t       dl_tile_loads;
 uint32_t DL_TileLoadCount(void) { return dl_tile_loads; }
 
+// Sibling per-present primitive counters (bench A/B instrumentation). Mirror
+// dl_tile_loads exactly: summed across DL_DrawRecord, read by the bench report,
+// reset each DL_BeginFrame. dl_recs = records drawn, dl_uploads = LOAD_TILE
+// upload calls (deduped, tracks dl_tile_loads), dl_tris = triangles emitted
+// (2 per quad/band slice). For band-split walls every load also draws, so the
+// identity tris = 2 * uploads holds; the one-quad fast path is 2 tris / 1 upload.
+static uint32_t       dl_recs;
+static uint32_t       dl_uploads;
+static uint32_t       dl_tris;
+uint32_t DL_RecCount(void)    { return dl_recs; }
+uint32_t DL_UploadCount(void) { return dl_uploads; }
+uint32_t DL_TriCount(void)    { return dl_tris; }
+
 // Present generation counter for the in-flight pin/demote schedule (see the
 // in-flight block tracking section below). Declared here because fresh
 // transposes in DL_RowMajorBlock stamp their slot with it.
@@ -1211,6 +1224,10 @@ void DL_BeginFrame(void)
 
     // Per-frame band-load counter reset (bench diagnostic).
     dl_tile_loads = 0;
+    // Sibling per-present primitive counters reset (same lifecycle).
+    dl_recs    = 0;
+    dl_uploads = 0;
+    dl_tris    = 0;
 
     // Per-frame generation bump invalidates every bucket head/tail in O(1):
     // a bucket whose gen stamp != dl_frame_gen is treated as empty, so the
@@ -2128,6 +2145,7 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
             rdpq_load_tile(TILE1, 0, 0, blkw / 2, blkh);
             rdpq_set_tile_size(TILE0, 0, 0, blkw, blkh);
             dl_tile_loads++;
+            dl_uploads++;       // deduped upload, tracks dl_tile_loads
             dl_last_up_block = block;
             dl_last_up_lo    = 0;
             dl_last_up_rows  = blkh;
@@ -2146,7 +2164,9 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
 
             rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
             rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+            dl_tris += 2;       // one-quad fast path: 2 tris / 1 upload
         }
+        dl_recs++;              // one record drawn (one-quad path)
         return 1;
     }
 
@@ -2244,6 +2264,7 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
             rdpq_load_tile(TILE1, 0, src_lo, blkw / 2, src_lo + rows_up);
             rdpq_set_tile_size(TILE0, 0, src_lo, blkw, src_lo + rows_up);
             dl_tile_loads++;
+            dl_uploads++;       // deduped band upload, tracks dl_tile_loads
             dl_last_up_block = bandsrc;
             dl_last_up_lo    = src_lo;
             dl_last_up_rows  = rows_up;
@@ -2300,11 +2321,13 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
 
             rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
             rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+            dl_tris += 2;       // band slice: 2 tris (held to tris = 2 * uploads)
         }
 
         cur = band_end;
     }
     }
+    dl_recs++;                  // one record drawn (band-walk path)
     return 1;
 }
 
