@@ -2894,23 +2894,22 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
         dl_uploads++;
     }
 
-    // s10.5 CAST GUARD. rdpq_triangle casts each vertex texel to s10.5 (S*32,
-    // range |S| < 1024). After the per-axis whole-64 bias the min corner sits in
-    // [0,64); the remaining spread is bounded by the Y-deviation run split for
-    // typical floors, but a pathological steep near-floor run could still exceed
-    // 1024 texels of spread. Clamp each vertex into +-960 (< 1024) so the cast
-    // never traps -- a bounded near-floor minification on those rare runs (the
-    // documented overflow class), never a crash. Whole texels preserved for the
-    // common case (no clamp hit). HW mask-6 wrap folds the survivors into [0,64).
-    #define DL_PP_SCLAMP 960.0f
-    if (u_tl >  DL_PP_SCLAMP) u_tl =  DL_PP_SCLAMP; else if (u_tl < -DL_PP_SCLAMP) u_tl = -DL_PP_SCLAMP;
-    if (u_tr >  DL_PP_SCLAMP) u_tr =  DL_PP_SCLAMP; else if (u_tr < -DL_PP_SCLAMP) u_tr = -DL_PP_SCLAMP;
-    if (u_bl >  DL_PP_SCLAMP) u_bl =  DL_PP_SCLAMP; else if (u_bl < -DL_PP_SCLAMP) u_bl = -DL_PP_SCLAMP;
-    if (u_br >  DL_PP_SCLAMP) u_br =  DL_PP_SCLAMP; else if (u_br < -DL_PP_SCLAMP) u_br = -DL_PP_SCLAMP;
-    if (v_tl >  DL_PP_SCLAMP) v_tl =  DL_PP_SCLAMP; else if (v_tl < -DL_PP_SCLAMP) v_tl = -DL_PP_SCLAMP;
-    if (v_tr >  DL_PP_SCLAMP) v_tr =  DL_PP_SCLAMP; else if (v_tr < -DL_PP_SCLAMP) v_tr = -DL_PP_SCLAMP;
-    if (v_bl >  DL_PP_SCLAMP) v_bl =  DL_PP_SCLAMP; else if (v_bl < -DL_PP_SCLAMP) v_bl = -DL_PP_SCLAMP;
-    if (v_br >  DL_PP_SCLAMP) v_br =  DL_PP_SCLAMP; else if (v_br < -DL_PP_SCLAMP) v_br = -DL_PP_SCLAMP;
+    // NO per-vertex S/T clamp. The four corner texels are NOT independent: under
+    // perspective the RDP reconstructs S_px = interp(S*INV_W)/interp(INV_W), which
+    // is exact ONLY when (S*INV_W) is planar across the corners (it is -- u*INV_W
+    // is screen-affine for a constant-z plane). Clamping a SUBSET of corners (a
+    // far/near corner only) perturbs (S*INV_W) non-uniformly, breaks that
+    // planarity, and the per-pixel divide then reconstructs garbage -> the
+    // horizontal-streak white noise. The cast can't trap here regardless: the
+    // uniform whole-64 bias above lands the min corner in [0,64), and libdragon's
+    // perspective setup multiplies each S by its NORMALISED INV_W (invw*minw <= 1)
+    // before the s16.16 cast -- a far corner's large raw S is scaled by its small
+    // (far) INV_W, so S*INV_W stays bounded exactly as it does for wide walls. And
+    // the vendored float_to_s16_16 SATURATES (>=32768 -> 0x7FFFFFFF) rather than
+    // trapping, so even a degenerate corner can't fault the tri setup. (The only
+    // genuine (int)x trunc.w.s trap risk is the V-window IFLOOR on huge extents,
+    // already bounded by the +-1e8 extent clamp above -- those feed window
+    // selection only, never the emitted vertex coords.)
 
     // Trapezoid quad: left edge at column x1, right edge at column x2+1; each
     // edge spans its own [ytop..ybot] screen rows. Per-corner S/T (texels) +
