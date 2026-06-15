@@ -309,9 +309,14 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
     if (slot->subpal_inited)
         return;
 
+    // Histogram the FULL-resolution texture (its complete colour set), NOT the
+    // stored downsampled dims: slot->width/height may be the post-downsample 64x64
+    // block, but the sub-palette must represent every colour the texture contains
+    // so the box-filter averages snap to in-gamut entries. Use the original
+    // sampling period / texture height directly.
     playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
-    th = slot->height;
-    tw = slot->width;
+    tw = texturewidthmask[texnum] + 1;
+    th = textureheight[texnum] >> FRACBITS;
     if (!playpal || th < 1 || tw < 1)
     {
         // Degenerate: a single black entry, everything maps to it. Marks the
