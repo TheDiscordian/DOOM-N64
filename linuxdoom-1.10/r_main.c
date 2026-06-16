@@ -54,6 +54,18 @@ extern visplane_t*	visplanes;
 extern visplane_t*	lastvisplane;
 #endif
 
+#ifdef PVS_PROBE
+// View sector index for this frame (count-only PVS probe). Computed once in
+// R_SetupFrame; r_bsp.c R_Subsector indexes the REJECT matrix against it per
+// visited subsector. -1 = not yet computed / invalid.
+int		pvs_view_sector = -1;
+// Per-frame accumulators: subsectors VISITED (= sscount) and how many of those
+// the REJECT matrix would cull from pvs_view_sector. Reset in R_SetupFrame,
+// read at the SetCounts call site below.
+int		pvs_frame_visited = 0;
+int		pvs_frame_cullable = 0;
+#endif
+
 
 
 
@@ -961,8 +973,17 @@ void R_SetupFrame (player_t* player)
 
     viewsin = finesine[viewangle>>ANGLETOFINESHIFT];
     viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
-	
+
     sscount = 0;
+
+#ifdef PVS_PROBE
+    // Count-only PVS probe: resolve the view sector once (viewx/viewy are now
+    // settled for both the interpolated and snapped paths) so R_Subsector can
+    // index the REJECT matrix against it. Reset the per-frame accumulators here.
+    pvs_view_sector = (int)(R_PointInSubsector(viewx, viewy)->sector - sectors);
+    pvs_frame_visited = 0;
+    pvs_frame_cullable = 0;
+#endif
 	
     if (player->fixedcolormap)
     {
@@ -1088,6 +1109,12 @@ void R_RenderPlayerView (player_t* player)
     // does), so tessellate-count it now. Pure measurement -- reads top[]/bottom[],
     // emits nothing, does not perturb the geometry fingerprint.
     N64Bench_SetPlanePolyTris(R_CountPlanePolyTris());
+#endif
+#ifdef PVS_PROBE
+    // Count-only PVS/occlusion-bake go/no-go: latch the per-frame subsectors
+    // VISITED and REJECT-cullable totals accumulated during this frame's BSP
+    // walk (r_bsp.c R_Subsector). Pure measurement -- perturbs no geometry.
+    N64Bench_SetPvsCounts(pvs_frame_visited, pvs_frame_cullable);
 #endif
 #else
     R_DrawMasked ();

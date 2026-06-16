@@ -42,6 +42,17 @@ rcsid[] = "$Id: r_bsp.c,v 1.4 1997/02/03 22:45:12 b1 Exp $";
 
 //#include "r_local.h"
 
+#ifdef PVS_PROBE
+#include "p_local.h"        // rejectmatrix (the sector-visibility REJECT lump)
+#include "n64_bench.h"
+// Count-only PVS/occlusion-bake probe. pvs_view_sector + the per-frame
+// accumulators live in r_main.c (R_SetupFrame sets view_sector and resets the
+// counters; R_RenderPlayerView latches them via N64Bench_SetPvsCounts).
+extern int	pvs_view_sector;
+extern int	pvs_frame_visited;
+extern int	pvs_frame_cullable;
+#endif
+
 
 
 seg_t*		curline;
@@ -512,6 +523,22 @@ void R_Subsector (int num)
     frontsector = sub->sector;
     count = sub->numlines;
     line = &segs[sub->firstline];
+
+#ifdef PVS_PROBE
+    // Count-only PVS probe: this subsector was VISITED (survived the R_CheckBBox
+    // node prune + 1-D solidsegs occlusion). Would the existing sector-granular
+    // REJECT matrix have culled it from the view sector? Index REJECT exactly as
+    // P_CheckSight does (p_sight.c): pnum = s1*numsectors + s2, bit (pnum&7) of
+    // byte (pnum>>3). Pure measurement -- changes NO geometry, NO rendering.
+    pvs_frame_visited++;
+    if (pvs_view_sector >= 0)
+    {
+        int	s2 = (int)(frontsector - sectors);
+        int	pnum = pvs_view_sector * numsectors + s2;
+        if (rejectmatrix[pnum >> 3] & (1 << (pnum & 7)))
+            pvs_frame_cullable++;   // REJECT says "not visible" -> a PVS could cull
+    }
+#endif
 
     if (frontsector->floorheight < viewz)
     {

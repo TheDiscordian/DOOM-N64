@@ -102,6 +102,15 @@ void N64Bench_SetCounts(int vissprites, int drawsegs, int visplanes);
 void N64Bench_SetPlanePolyTris(int polytris);
 #endif
 
+#ifdef PVS_PROBE
+// Latch the count-only PVS/occlusion-bake go/no-go measurement: subsectors
+// VISITED this frame (= sscount) and how many of those the existing REJECT
+// matrix would have culled from the view sector (a free LOWER-bound stand-in
+// for a true subsector PVS). Accumulated in r_bsp.c R_Subsector; latched at the
+// SetCounts call site (r_main.c). COUNT-ONLY -- perturbs no geometry.
+void N64Bench_SetPvsCounts(int visited, int cullable);
+#endif
+
 // Called once per gametic from G_Ticker to advance scenario timing/phases.
 void N64Bench_TicHook(void);
 

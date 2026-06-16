@@ -48,6 +48,16 @@ CFLAGS += -DN64_BENCH=1
 # geometry fingerprint is unperturbed. Always on for bench builds (the visplanes
 # exist regardless of which wall/plane renderer is selected).
 CFLAGS += -DPLANETESS_COUNT=1
+# PVS_PROBE=1: one-off count-only go/no-go instrumentation for a PVS/occlusion
+# bake. Every bench frame, R_Subsector (r_bsp.c) indexes the existing REJECT
+# lump (view sector vs each VISITED subsector's sector) and counts how many the
+# REJECT matrix would have culled -- a free, conservative LOWER bound on what a
+# true subsector PVS could cull. Reports mean + p95-tail cull_pct on the
+# BENCH_PVS line. NO render / NO geometry change (the fingerprint is unperturbed),
+# so it is OFF by default -- pass PVS_PROBE=1 on the make line for the one probe run.
+ifeq ($(PVS_PROBE),1)
+CFLAGS += -DPVS_PROBE=1
+endif
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

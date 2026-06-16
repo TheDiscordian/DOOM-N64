@@ -90,6 +90,15 @@ typedef struct
                              // for the "visplanes as RDP polygons" feature; no
                              // render, no UV -- R_CountPlanePolyTris in r_plane.c)
 #endif
+#ifdef PVS_PROBE
+    uint16_t pvs_visited;    // count-only: subsectors VISITED this frame (= sscount;
+                             // the BSP-walk-survivors AFTER R_CheckBBox node prune).
+    uint16_t pvs_cullable;   // count-only: of those visited, how many the existing
+                             // REJECT matrix (view sector vs subsector frontsector)
+                             // says are NOT visible -- a free LOWER-bound stand-in
+                             // for what a real PVS would cull. go/no-go for the
+                             // PVS/occlusion bake. (r_bsp.c R_Subsector)
+#endif
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -133,6 +142,10 @@ static uint16_t         cur_drawsegs;
 static uint16_t         cur_visplanes;
 #ifdef PLANETESS_COUNT
 static uint16_t         cur_plane_polytris;	// count-only plane-poly tris this frame
+#endif
+#ifdef PVS_PROBE
+static uint16_t         cur_pvs_visited;	// count-only subsectors visited this frame
+static uint16_t         cur_pvs_cullable;	// count-only REJECT-cullable of those visited
 #endif
 
 // Outlier (level-reload) frames: counted separately, kept out of tail stats.
@@ -193,6 +206,9 @@ void N64Bench_Init(void)
     cur_vissprites = cur_drawsegs = cur_visplanes = 0;
 #ifdef PLANETESS_COUNT
     cur_plane_polytris = 0;
+#endif
+#ifdef PVS_PROBE
+    cur_pvs_visited = cur_pvs_cullable = 0;
 #endif
     outlier_frames = 0;
     outlier_max_us = 0;
@@ -309,6 +325,9 @@ void N64Bench_LoopBegin(void)
 #ifdef PLANETESS_COUNT
     cur_plane_polytris = 0;
 #endif
+#ifdef PVS_PROBE
+    cur_pvs_visited = cur_pvs_cullable = 0;
+#endif
     loop_start_ticks = get_ticks();
     loop_open = 1;
 }
@@ -384,6 +403,23 @@ void N64Bench_SetPlanePolyTris(int polytris)
     if (!loop_open)
         return;
     cur_plane_polytris = (uint16_t)polytris;
+}
+#endif
+
+#ifdef PVS_PROBE
+// Count-only latch for the PVS/occlusion-bake go/no-go measurement: how many
+// subsectors this frame's BSP walk VISITED (= sscount, the survivors after the
+// R_CheckBBox node prune) and how many of those the existing REJECT matrix would
+// have culled as not-visible from the view sector. The REJECT cull rate is a
+// conservative LOWER bound on what a true subsector PVS could cull. Accumulated
+// per-frame in r_bsp.c R_Subsector; latched here at the SetCounts call site so
+// the SetCounts path stays byte-identical when the flag is off.
+void N64Bench_SetPvsCounts(int visited, int cullable)
+{
+    if (!loop_open)
+        return;
+    cur_pvs_visited  = (uint16_t)visited;
+    cur_pvs_cullable = (uint16_t)cullable;
 }
 #endif
 
@@ -477,6 +513,10 @@ void N64Bench_LoopEnd(void)
         }
 #ifdef PLANETESS_COUNT
         f->plane_polytris = cur_plane_polytris;
+#endif
+#ifdef PVS_PROBE
+        f->pvs_visited  = cur_pvs_visited;
+        f->pvs_cullable = cur_pvs_cullable;
 #endif
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
@@ -683,6 +723,70 @@ static unsigned long N64Bench_PlanePolyTrisP95(void)
 }
 #endif
 
+#ifdef PVS_PROBE
+// EXACT p95 of the per-frame REJECT-cullable subsector count (count-only
+// PVS/occlusion go/no-go). Mirrors N64Bench_PlanePolyTrisP95: counts are small
+// integers, so bucket the value directly (no quantization) for an exact p95.
+static unsigned long N64Bench_PvsCullableP95(void)
+{
+    static unsigned long fhist[BENCH_HIST_BUCKETS];
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long b = bench_frames[i].pvs_cullable;
+        if (b >= BENCH_HIST_BUCKETS) b = BENCH_HIST_OVERFLOW;
+        fhist[b]++;
+    }
+    target = (bench_frame_count * 95UL + 99) / 100;
+    cum = 0;
+    for (i = 0; i < BENCH_HIST_BUCKETS; i++)
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return i;       // exact cullable count at the 95th percentile frame
+    }
+    return BENCH_HIST_OVERFLOW;
+}
+
+// p95-TAIL cull PERCENTAGE: the highest-cull-rate frames are the ones a PVS bake
+// would help most, so this scans the per-frame cull-pct (cullable*1000/visited,
+// tenths of a percent) histogram from the TOP and returns the worst 5% threshold
+// -- i.e. the cull rate at/above which the best-5% of frames cull. This is the
+// number the go/no-go gate reads (>250 tenths = >25% -> headroom; <100 = NO-GO).
+// Returns tenths of a percent. Direct integer buckets (0..1000), no quantization.
+static unsigned long N64Bench_PvsCullPctP95Tail(void)
+{
+    static unsigned long fhist[1001];   // 0..1000 tenths of a percent
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long v = bench_frames[i].pvs_visited;
+        unsigned long pct10 = v ?
+            ((unsigned long)bench_frames[i].pvs_cullable * 1000UL) / v : 0;
+        if (pct10 > 1000) pct10 = 1000;
+        fhist[pct10]++;
+    }
+    // worst 5% of frames by cull-pct: cumulative from the top.
+    target = (bench_frame_count * 5UL + 99) / 100;
+    cum = 0;
+    for (i = 1001; i-- > 0; )
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return i;       // tenths-of-percent threshold for the best-culling 5%
+    }
+    return 0;
+}
+#endif
+
 // us threshold at/above which a frame is in the worst BENCH_TAIL_PCT, found by
 // scanning the frame-total histogram from the top.
 static unsigned long N64Bench_TailThreshold(unsigned long* out_tail_target)
@@ -722,6 +826,9 @@ static void N64Bench_ReportPhases(void)
     unsigned long long rec_sum = 0, upload_sum = 0, tri_sum = 0;
 #ifdef PLANETESS_COUNT
     unsigned long long plane_polytris_sum = 0;
+#endif
+#ifdef PVS_PROBE
+    unsigned long long pvs_visited_sum = 0, pvs_cullable_sum = 0;
 #endif
     unsigned long tics_frames = 0;
 
@@ -771,6 +878,10 @@ static void N64Bench_ReportPhases(void)
         tri_sum       += f->tris;
 #ifdef PLANETESS_COUNT
         plane_polytris_sum += f->plane_polytris;
+#endif
+#ifdef PVS_PROBE
+        pvs_visited_sum  += f->pvs_visited;
+        pvs_cullable_sum += f->pvs_cullable;
 #endif
         if (f->tics_ran) tics_frames++;
 
@@ -843,6 +954,28 @@ static void N64Bench_ReportPhases(void)
     debugf("BENCH_PLANETESS mean_plane_polytris=%lu p95_plane_polytris=%lu\n",
            (unsigned long)(plane_polytris_sum / bench_frame_count),
            N64Bench_PlanePolyTrisP95());
+#endif
+#ifdef PVS_PROBE
+    // DECISIVE go/no-go for the PVS/occlusion bake: of the subsectors the BSP
+    // walk VISITS (survivors of the existing R_CheckBBox node prune + 1-D
+    // solidsegs occlusion), what fraction would the existing sector-granular
+    // REJECT matrix have culled from the view sector. REJECT is coarser than a
+    // true subsector PVS, so this cull rate is a conservative LOWER bound on PVS
+    // headroom. cull_pct_mean = whole-run cullable/visited; cull_pct_p95tail =
+    // the cull rate at the best-culling 5% of frames (tenths of a percent).
+    // Gate: p95tail > 25.0% -> real headroom, build the bake; < 10.0% -> NO-GO.
+    {
+        unsigned long mean_vis = (unsigned long)(pvs_visited_sum / bench_frame_count);
+        unsigned long mean_cul = (unsigned long)(pvs_cullable_sum / bench_frame_count);
+        unsigned long pct_mean10 = pvs_visited_sum ?
+            (unsigned long)((pvs_cullable_sum * 1000ULL) / pvs_visited_sum) : 0;
+        unsigned long pct_tail10 = N64Bench_PvsCullPctP95Tail();
+        debugf("BENCH_PVS mean_visited=%lu mean_cullable=%lu p95_cullable=%lu "
+               "cull_pct_mean=%lu.%lu cull_pct_p95tail=%lu.%lu\n",
+               mean_vis, mean_cul, N64Bench_PvsCullableP95(),
+               pct_mean10 / 10, pct_mean10 % 10,
+               pct_tail10 / 10, pct_tail10 % 10);
+    }
 #endif
 
     // --- tail report (worst BENCH_TAIL_PCT%) ------------------------------
