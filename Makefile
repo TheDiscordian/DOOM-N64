@@ -83,6 +83,18 @@ endif
 ifeq ($(RDPWAIT_PROBE),1)
 CFLAGS += -DRDPWAIT_PROBE=1
 endif
+# DPLANES_PROBE=1: one-off time-only sub-bracket of the `planes` BPH bracket. Every
+# bench frame, R_DrawPlanes (r_plane.c) accumulates RAW CP0 ticks into three
+# counters -- the per-visplane W_CacheLumpNum/Z_ChangeTag flat-lump cache, the
+# recursive R_EmitIslandRuns run-fitter (MINUS the un-projection it calls), and the
+# R_PlaneCornerAttr float un-projections -- and N64Bench_SetDPlanes latches them.
+# Reports mean + EXACT p95 us per sub-part on the BENCH_DPLANES line, to split the
+# ~1646us `planes` cost across its constituents so the optimizer attacks the real
+# one. The emit body is timed in place but NOT changed (the geometry fingerprint is
+# unperturbed), so it is OFF by default -- pass DPLANES_PROBE=1 on the make line.
+ifeq ($(DPLANES_PROBE),1)
+CFLAGS += -DDPLANES_PROBE=1
+endif
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

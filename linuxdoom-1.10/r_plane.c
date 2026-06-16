@@ -149,6 +149,35 @@ static float pgt_prev_ytr    = 0.0f;    // ... its right-edge top Y (at x2+1)
 static float pgt_prev_ybr    = 0.0f;    // ... its right-edge bottom Y (at x2+1)
 #endif // PLANE_GEOM_TRACE
 
+// ---- DPLANES_PROBE: sub-bracket the RDP plane work (diagnostic, no render -----
+// change). When -DDPLANES_PROBE=1 (Makefile DPLANES_PROBE=1; default 0 -> compiled
+// out), R_DrawPlanes accumulates RAW CP0 ticks (get_ticks()) into three per-frame
+// counters splitting the `planes` BPH bracket:
+//   * dpp_lump_tk   -- per-visplane W_CacheLumpNum + the trailing Z_ChangeTag;
+//   * dpp_emit_tk   -- the whole R_EmitPlanePolys run-fitter (it CALLS the
+//                      un-projection, so the pure fitter cost is dpp_emit_tk minus
+//                      dpp_unproj_tk -- subtracted at the latch);
+//   * dpp_unproj_tk -- the R_PlaneCornerAttr clusters in R_EmitRunPoly /
+//                      R_EmitPlaneBand (timed around the 4-corner call group, one
+//                      get_ticks pair per emitted quad to keep overhead low).
+// Latched once per frame via N64Bench_SetDPlanes at the R_DrawPlanes return. The
+// emit body runs UNCHANGED; only get_ticks() reads are added, so the geometry
+// fingerprint is unperturbed (verify BENCH_RESULT stays identical).
+#ifndef DPLANES_PROBE
+#define DPLANES_PROBE 0
+#endif
+#if DPLANES_PROBE
+#include <libdragon.h>          // get_ticks (flag-gated only)
+#include "n64_bench.h"          // N64Bench_SetDPlanes
+static uint32_t dpp_lump_tk;    // ticks: lump cache (per frame)
+static uint32_t dpp_emit_tk;    // ticks: R_EmitPlanePolys total (per frame)
+static uint32_t dpp_unproj_tk;  // ticks: R_PlaneCornerAttr clusters (per frame)
+static uint32_t dpp_scan_cols;  // total deviation-scan column iterations (per frame)
+static uint32_t dpp_nodes;      // R_EmitIslandRuns invocations (per frame)
+#define DPP_T0()  uint64_t _dpp_t0 = get_ticks()
+#define DPP_ACC(acc)  do { (acc) += (uint32_t)(get_ticks() - _dpp_t0); } while (0)
+#endif
+
 
 
 planefunction_t		floorfunc;
@@ -968,10 +997,16 @@ R_EmitPlaneBand
     q.x1 = x1;  q.x2 = x2;
     q.ytop_l = ytl;  q.ybot_l = ybl;
     q.ytop_r = ytr;  q.ybot_r = ybr;
+#if DPLANES_PROBE
+    { DPP_T0();
+#endif
     R_PlaneCornerAttr(xl, ytl, &q.u_tl, &q.v_tl, &q.invw_tl);
     R_PlaneCornerAttr(xr, ytr, &q.u_tr, &q.v_tr, &q.invw_tr);
     R_PlaneCornerAttr(xl, ybl, &q.u_bl, &q.v_bl, &q.invw_bl);
     R_PlaneCornerAttr(xr, ybr, &q.u_br, &q.v_br, &q.invw_br);
+#if DPLANES_PROBE
+    DPP_ACC(dpp_unproj_tk); }
+#endif
     q.flatlump = flatlump;
     q.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
     DL_EmitPlanePoly(&q, cm);
@@ -1022,10 +1057,16 @@ R_EmitRunPoly
     p.ytop_r = ytr;  p.ybot_r = ybr;
 
     // Four corner texel U/V + INV_W (left edge at column xa, right at xb+1).
+#if DPLANES_PROBE
+    { DPP_T0();
+#endif
     R_PlaneCornerAttr(xl, ytl, &p.u_tl, &p.v_tl, &p.invw_tl);
     R_PlaneCornerAttr(xr, ytr, &p.u_tr, &p.v_tr, &p.invw_tr);
     R_PlaneCornerAttr(xl, ybl, &p.u_bl, &p.v_bl, &p.invw_bl);
     R_PlaneCornerAttr(xr, ybr, &p.u_br, &p.v_br, &p.invw_br);
+#if DPLANES_PROBE
+    DPP_ACC(dpp_unproj_tk); }
+#endif
 
     p.flatlump = (uint16_t)flatlump;
     p.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
@@ -1343,6 +1384,10 @@ R_EmitIslandRuns
     float	width = (float)(xb + 1 - xa);
     int		x;
 
+#if DPLANES_PROBE
+    dpp_nodes++;
+#endif
+
     // Shared-boundary TOP corners (seam fix) + original BOTTOM extrapolation.
     R_PlaneRunTopCorners(top, xa, xb, islx_lo, islx_hi, &ytl, &ytr);
     {
@@ -1373,10 +1418,24 @@ R_EmitIslandRuns
     {
 	float	maxdev = 0.0f;
 	int	xmax   = -1;
+	// Strength-reduce the per-column f = (x+0.5-xa)/width DIVIDE (the run-
+	// fitter's hottest op -- this scan dominated the `planes` bracket) to ONE
+	// reciprocal per node + a multiply per column. width > 0 always (xb >= xa).
+	// f is recomputed FROM SCRATCH each column (no running accumulation), so the
+	// only arithmetic change vs the divide is reciprocal-then-multiply for the
+	// single f term -- the deviation values, the argmax column (xmax) and the
+	// split test are otherwise the SAME algebra. The emit twin (here) and the
+	// count twin (R_CountIslandRuns) apply the IDENTICAL reduction so the
+	// tessellation stays in lockstep, and the emitted geometry is verified
+	// pixel-stable against the canonical software reference.
+	float	inv_w = 1.0f / width;
 
+#if DPLANES_PROBE
+	dpp_scan_cols += (uint32_t)(xb - xa + 1);
+#endif
 	for (x = xa; x <= xb; x++)
 	{
-	    float f  = ((float)x + 0.5f - (float)xa) / width;
+	    float f  = ((float)x + 0.5f - (float)xa) * inv_w;
 	    float lt = ytl + (ytr - ytl) * f;
 	    float lb = ybl + (ybr - ybl) * f;
 	    float dT = lt - (float)top[x];
@@ -1490,7 +1549,12 @@ void R_DrawPlanes (void)
     int			x;
     int			stop;
     int			angle;
-				
+
+#if DPLANES_PROBE
+    dpp_lump_tk = dpp_emit_tk = dpp_unproj_tk = 0;
+    dpp_scan_cols = dpp_nodes = 0;
+#endif
+
 #ifdef RANGECHECK
     if (ds_p - drawsegs > MAXDRAWSEGS)
 	I_Error ("R_DrawPlanes: drawsegs overflow (%i)",
@@ -1541,9 +1605,15 @@ void R_DrawPlanes (void)
 	}
 	
 	// regular flat
+#if DPLANES_PROBE
+	{ DPP_T0();
+#endif
 	ds_source = W_CacheLumpNum(firstflat +
 				   flattranslation[pl->picnum],
 				   PU_STATIC);
+#if DPLANES_PROBE
+	DPP_ACC(dpp_lump_tk); }
+#endif
 #ifdef N64
 	// Stage-4: remember the resolved flat lump for R_MapPlane's RDP emit
 	// (animation-correct -- flattranslation advances per tic). The RDP path
@@ -1573,8 +1643,17 @@ void R_DrawPlanes (void)
 	// blit shows the RDP floor through the CI8 overlay (DL_FlushPlanePolys).
 	if (DL_PlanePolyOn())
 	{
+#if DPLANES_PROBE
+	    { DPP_T0();
+	      R_EmitPlanePolys(pl);
+	      DPP_ACC(dpp_emit_tk); }
+	    { DPP_T0();
+	      Z_ChangeTag (ds_source, PU_CACHE);
+	      DPP_ACC(dpp_lump_tk); }
+#else
 	    R_EmitPlanePolys(pl);
 	    Z_ChangeTag (ds_source, PU_CACHE);
+#endif
 	    continue;
 	}
 #endif
@@ -1594,6 +1673,15 @@ void R_DrawPlanes (void)
 
 	Z_ChangeTag (ds_source, PU_CACHE);
     }
+
+#if DPLANES_PROBE
+    // Latch the three sub-bracket tick accumulators for this frame. The run-fitter
+    // (R_EmitPlanePolys) CALLS the un-projection, so report the pure fitter cost as
+    // emit-minus-unproj; n64_bench.c converts to us and reports mean + p95 per part.
+    N64Bench_SetDPlanes(dpp_lump_tk,
+			(dpp_emit_tk > dpp_unproj_tk) ? (dpp_emit_tk - dpp_unproj_tk) : 0,
+			dpp_unproj_tk, dpp_scan_cols, dpp_nodes);
+#endif
 }
 
 
@@ -1684,10 +1772,16 @@ R_CountIslandRuns
     {
 	float	maxdev = 0.0f;
 	int	xmax   = -1;
+	// IDENTICAL strength-reduction to R_EmitIslandRuns (the emit twin): the
+	// per-column f = (x+0.5-xa)/width divide becomes one reciprocal + a multiply,
+	// f recomputed from scratch each column. The two twins MUST run the same
+	// arithmetic so the counted tessellation equals the emitted poly count (the
+	// bench fingerprint); keep this in lockstep with R_EmitIslandRuns.
+	float	inv_w = 1.0f / width;
 
 	for (x = xa; x <= xb; x++)
 	{
-	    float f  = ((float)x + 0.5f - (float)xa) / width;
+	    float f  = ((float)x + 0.5f - (float)xa) * inv_w;
 	    float lt = ytl + (ytr - ytl) * f;
 	    float lb = ybl + (ybr - ybl) * f;
 	    float dT = lt - (float)top[x];

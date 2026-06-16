@@ -106,6 +106,13 @@ typedef struct
                              // plane). A/B vs plane_polytris (the runtime trapezoid
                              // tessellation the bake replaces). r_bsp.c R_Subsector.
 #endif
+#ifdef DPLANES_PROBE
+    uint32_t dpl_lump_us;    // sub-bracket of `planes`: per-visplane W_CacheLumpNum
+    uint32_t dpl_fitter_us;  //   + Z_ChangeTag / the run-fitter (minus un-projection)
+    uint32_t dpl_unproj_us;  //   / the R_PlaneCornerAttr float un-projections.
+    uint32_t dpl_scan_cols;  // deviation-scan column iterations this frame
+    uint32_t dpl_nodes;      // R_EmitIslandRuns invocations this frame
+#endif
 #ifdef RDPWAIT_PROBE
     uint32_t async_us[BPH_COUNT];  // async RDP-completion interrupt us charged to
                                    // each open phase this frame (where the DP
@@ -165,6 +172,16 @@ static uint16_t         cur_pvs_cullable;	// count-only REJECT-cullable of those
 #endif
 #ifdef BAKEFAN_PROBE
 static uint16_t         cur_bakefan_tris;	// count-only baked-leaf-fan tris this frame
+#endif
+#ifdef DPLANES_PROBE
+// Sub-bracket of the `planes` BPH bracket. r_plane.c accumulates RAW CP0 ticks
+// into its own per-frame counters during R_DrawPlanes and passes them here via
+// N64Bench_SetDPlanes (called at the R_DrawPlanes return). Stored as us per frame.
+static uint32_t         cur_dpl_lump_us;
+static uint32_t         cur_dpl_fitter_us;
+static uint32_t         cur_dpl_unproj_us;
+static uint32_t         cur_dpl_scan_cols;
+static uint32_t         cur_dpl_nodes;
 #endif
 
 #ifdef RDPWAIT_PROBE
@@ -371,6 +388,10 @@ void N64Bench_LoopBegin(void)
 #ifdef BAKEFAN_PROBE
     cur_bakefan_tris = 0;
 #endif
+#ifdef DPLANES_PROBE
+    cur_dpl_lump_us = cur_dpl_fitter_us = cur_dpl_unproj_us = 0;
+    cur_dpl_scan_cols = cur_dpl_nodes = 0;
+#endif
 #ifdef RDPWAIT_PROBE
     memset(cur_async_tk, 0, sizeof(cur_async_tk));
     cur_async_fires = 0;
@@ -535,6 +556,25 @@ void N64Bench_SetBakefanTris(int tris)
 }
 #endif
 
+#ifdef DPLANES_PROBE
+// Latch the three `planes` sub-bracket tick accumulators r_plane.c builds during
+// R_DrawPlanes (lump-cache / run-fitter / un-projection), converting RAW CP0 ticks
+// to us per frame. Called once per frame at the R_DrawPlanes return. The probe
+// times the emit body in place but changes nothing it does, so the geometry
+// fingerprint is unperturbed (verify the BENCH_RESULT line stays identical).
+void N64Bench_SetDPlanes(uint32_t lump_tk, uint32_t fitter_tk, uint32_t unproj_tk,
+                         uint32_t scan_cols, uint32_t nodes)
+{
+    if (!loop_open)
+        return;
+    cur_dpl_lump_us   = (uint32_t)TICKS_TO_US(lump_tk);
+    cur_dpl_fitter_us = (uint32_t)TICKS_TO_US(fitter_tk);
+    cur_dpl_unproj_us = (uint32_t)TICKS_TO_US(unproj_tk);
+    cur_dpl_scan_cols = scan_cols;
+    cur_dpl_nodes     = nodes;
+}
+#endif
+
 void N64Bench_DisplayBegin(void)
 {
     if (!loop_open)
@@ -632,6 +672,13 @@ void N64Bench_LoopEnd(void)
 #endif
 #ifdef BAKEFAN_PROBE
         f->bakefan_tris = cur_bakefan_tris;
+#endif
+#ifdef DPLANES_PROBE
+        f->dpl_lump_us   = cur_dpl_lump_us;
+        f->dpl_fitter_us = cur_dpl_fitter_us;
+        f->dpl_unproj_us = cur_dpl_unproj_us;
+        f->dpl_scan_cols = cur_dpl_scan_cols;
+        f->dpl_nodes     = cur_dpl_nodes;
 #endif
 #ifdef RDPWAIT_PROBE
         for (i = 0; i < BPH_COUNT; i++)
@@ -811,6 +858,38 @@ static unsigned long N64Bench_FieldP95(int phase)
     }
     return (unsigned long)BENCH_HIST_OVERFLOW << BENCH_HIST_US_SHIFT;
 }
+
+#ifdef DPLANES_PROBE
+// p95 of one `planes` sub-bracket us field over the retained frames, same 64-us
+// histogram trick as N64Bench_FieldP95. sel: 0=lump, 1=fitter, 2=unproj.
+static unsigned long N64Bench_DPlanesP95(int sel)
+{
+    static unsigned long fhist[BENCH_HIST_BUCKETS];
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long v = (sel == 0) ? bench_frames[i].dpl_lump_us
+                        : (sel == 1) ? bench_frames[i].dpl_fitter_us
+                                     : bench_frames[i].dpl_unproj_us;
+        unsigned long b = v >> BENCH_HIST_US_SHIFT;
+        if (b >= BENCH_HIST_BUCKETS) b = BENCH_HIST_OVERFLOW;
+        fhist[b]++;
+    }
+    target = (bench_frame_count * 95UL + 99) / 100;
+    cum = 0;
+    for (i = 0; i < BENCH_HIST_BUCKETS; i++)
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return (i << BENCH_HIST_US_SHIFT) + (1UL << (BENCH_HIST_US_SHIFT - 1));
+    }
+    return (unsigned long)BENCH_HIST_OVERFLOW << BENCH_HIST_US_SHIFT;
+}
+#endif
 
 #ifdef RDPWAIT_PROBE
 // p95 of the async RDP-completion-interrupt us, same 64us-bucket histogram trick
@@ -1030,6 +1109,10 @@ static void N64Bench_ReportPhases(void)
 #ifdef PVS_PROBE
     unsigned long long pvs_visited_sum = 0, pvs_cullable_sum = 0;
 #endif
+#ifdef DPLANES_PROBE
+    unsigned long long dpl_lump_sum = 0, dpl_fitter_sum = 0, dpl_unproj_sum = 0;
+    unsigned long long dpl_scan_cols_sum = 0, dpl_nodes_sum = 0;
+#endif
     unsigned long tics_frames = 0;
 
     unsigned long tail_thresh, tail_target, tail_n = 0;
@@ -1085,6 +1168,13 @@ static void N64Bench_ReportPhases(void)
 #ifdef PVS_PROBE
         pvs_visited_sum  += f->pvs_visited;
         pvs_cullable_sum += f->pvs_cullable;
+#endif
+#ifdef DPLANES_PROBE
+        dpl_lump_sum   += f->dpl_lump_us;
+        dpl_fitter_sum += f->dpl_fitter_us;
+        dpl_unproj_sum += f->dpl_unproj_us;
+        dpl_scan_cols_sum += f->dpl_scan_cols;
+        dpl_nodes_sum     += f->dpl_nodes;
 #endif
         if (f->tics_ran) tics_frames++;
 
@@ -1157,6 +1247,21 @@ static void N64Bench_ReportPhases(void)
     debugf("BENCH_PLANETESS mean_plane_polytris=%lu p95_plane_polytris=%lu\n",
            (unsigned long)(plane_polytris_sum / bench_frame_count),
            N64Bench_PlanePolyTrisP95());
+#endif
+#ifdef DPLANES_PROBE
+    // Sub-bracket of the `planes` BPH bracket: mean + EXACT p95 us of the three
+    // constituents (lump-cache / run-fitter / corner un-projection). The three
+    // means sum to ~the `planes` mean (modulo the get_ticks read overhead the probe
+    // adds). Read it directly against the BENCH_PHASE name=planes line to decide
+    // which sub-part to attack. fitter is the run-fitter MINUS the un-projection it
+    // calls (un-projection is timed and subtracted in r_plane.c).
+    debugf("BENCH_DPLANES lump_mean=%lu lump_p95=%lu fitter_mean=%lu fitter_p95=%lu "
+           "unproj_mean=%lu unproj_p95=%lu scan_cols_mean=%lu nodes_mean=%lu\n",
+           (unsigned long)(dpl_lump_sum   / bench_frame_count), N64Bench_DPlanesP95(0),
+           (unsigned long)(dpl_fitter_sum / bench_frame_count), N64Bench_DPlanesP95(1),
+           (unsigned long)(dpl_unproj_sum / bench_frame_count), N64Bench_DPlanesP95(2),
+           (unsigned long)(dpl_scan_cols_sum / bench_frame_count),
+           (unsigned long)(dpl_nodes_sum     / bench_frame_count));
 #endif
 #ifdef BAKEFAN_PROBE
     // DECISIVE go/no-go for the native offline-baked RDP renderer (per-subsector

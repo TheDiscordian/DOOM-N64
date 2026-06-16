@@ -132,6 +132,23 @@ void N64Bench_SetPvsCounts(int visited, int cullable);
 void N64Bench_SetBakefanTris(int tris);
 #endif
 
+#ifdef DPLANES_PROBE
+// Sub-bracket the RDP plane work (the ~1646us `planes` BPH bracket) into its
+// three constituents so the optimizer attacks the real cost, not a guess:
+//   (a) lump   -- per-visplane W_CacheLumpNum + Z_ChangeTag (the flat lump cache);
+//   (b) fitter -- the recursive R_EmitIslandRuns run-fitter (island walk +
+//                 deviation scan + split), MINUS the corner un-projection it calls;
+//   (c) unproj -- the R_PlaneCornerAttr float un-projections (the 4-corner clusters
+//                 in R_EmitRunPoly / R_EmitPlaneBand).
+// r_plane.c accumulates RAW CP0 ticks per frame into three counters and calls this
+// once per frame (at the R_DrawPlanes return) to latch them; n64_bench.c converts
+// to us and reports mean + EXACT p95 per sub-part on the BENCH_DPLANES line. The
+// emit-path body is timed in place but NOT changed -- the geometry fingerprint is
+// unperturbed, so it is OFF by default (pass DPLANES_PROBE=1 on the make line).
+void N64Bench_SetDPlanes(uint32_t lump_tk, uint32_t fitter_tk, uint32_t unproj_tk,
+                         uint32_t scan_cols, uint32_t nodes);
+#endif
+
 // Called once per gametic from G_Ticker to advance scenario timing/phases.
 void N64Bench_TicHook(void);
 
