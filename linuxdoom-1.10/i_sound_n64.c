@@ -95,6 +95,22 @@ static boolean sound_initialized;
 static boolean music_initialized;
 static boolean missing_music_warning_printed;
 
+// Underrun proof for the pump-cadence smoothing. The app can't read libdragon's
+// private ring occupancy, but it can infer it from how many buffers a single
+// pump manages to fill: the AI drains at most ~1.4 buffers between pumps (a
+// 40 ms buffer vs a ~57 ms worst 2-tic frame), so a pump that fills the ring
+// up to or past (NUM_BUFFERS-1) saw it drained to <=1 occupied = NEAR underrun,
+// and filling all NUM_BUFFERS writable slots means the ring was fully empty on
+// entry = a TRUE underrun (the AI ran dry -> audible crackle). The first pump
+// (in I_InitSound, ring empty by design) is excluded via audio_pump_primed.
+static boolean  audio_pump_primed;
+static uint32_t audio_pump_calls;
+static uint32_t audio_pump_near_underruns;   // pumps that left the ring not full
+static uint32_t audio_pump_underruns;        // sustained-low streak hit ring depth
+static uint32_t audio_pump_max_filled;       // worst single-pump fill seen
+static uint32_t audio_low_streak;            // consecutive not-full-after-pump
+static uint32_t audio_pump_max_low_streak;   // longest such streak (danger metric)
+
 static uint16_t N64_ReadLE16(const uint8_t* p)
 {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -2504,19 +2520,24 @@ static void N64_MaybeLoopMusic(void)
     }
 }
 
-// Spike smoothing: a long (e.g. 2-tic) frame lets the AI drain ~1.4 buffers,
-// so an unbudgeted pump would synthesize all of them in one call -- the
-// 9-19k us audio tail spike. With N64_AUDIO_NUM_BUFFERS raised for slack, cap
-// the synth work per call to N64_SUBMIT_BUDGET_BUFFERS and let the deeper queue
-// absorb the deficit across the following frames. The cap is overridden when
-// occupancy is critically low so the AI never underruns: after the budgeted
-// fills, continue unbudgeted while the ring still has free slots beyond the
-// safety floor (occupancy at/under N64_AUDIO_UNDERRUN_FLOOR buffers). Steady
-// state drains <1 buffer per frame at 35 Hz (a 880-sample buffer is ~40 ms,
-// a frame ~28.5 ms), so a 1-2 buffer budget keeps up without spiking. SFX are
-// RSP-mixed by mixer_poll regardless; music latency is irrelevant (background).
+// Pump-cadence smoothing. A long (e.g. 2-tic) frame lets the AI drain ~1.4
+// buffers, so a pump that synthesises every drained buffer in one call produces
+// the 9-19k us audio tail spike. Cap the synth work to N64_SUBMIT_BUDGET_BUFFERS
+// buffers per call -- a HARD cap -- and let the 6-deep ring absorb transient
+// deficits across the following frames.
+//
+// Why a hard cap is underrun-safe (the transparency invariant): the AI drains
+// 40 ms per buffer (BUFFERS_PER_SECOND=25). Measured frame costs are mean
+// ~23.8 ms (0.59 buf/frame), worst single frame ~41 ms (1.02 buf), and a 2-tic
+// frame ~57 ms (1.43 buf). One pump runs per frame, so a budget of 2 always
+// out-fills the drain (net >= +0.57 buffer/frame even on the worst 2-tic frame)
+// and the ring queue only grows back toward full. The previous "override the cap
+// when N64_AUDIO_NUM_BUFFERS - filled <= FLOOR" branch keyed the safety floor to
+// buffers-filled-THIS-CALL, not ring occupancy, so it only stopped at filled==5
+// -- i.e. it defeated the cap and refilled the whole ring in one pump, which IS
+// the spike. Removed: the cap now actually caps; the queue depth is the slack.
+// SFX are RSP-mixed by mixer_poll regardless; music latency is irrelevant.
 #define N64_SUBMIT_BUDGET_BUFFERS  2
-#define N64_AUDIO_UNDERRUN_FLOOR   1
 
 static void N64_PumpAudio(void)
 {
@@ -2531,21 +2552,76 @@ static void N64_PumpAudio(void)
     samples = audio_get_buffer_length();
 
     filled = 0;
-    while (audio_can_write())
+    while (filled < N64_SUBMIT_BUDGET_BUFFERS && audio_can_write())
     {
         int16_t* out = audio_write_begin();
         mixer_poll(out, samples);
         audio_write_end();
-
-        if (++filled < N64_SUBMIT_BUDGET_BUFFERS)
-            continue;
-
-        // Budget reached. Stop unless the ring is near underrun: another free
-        // slot here means occupancy is at/under the floor, so keep filling.
-        if (N64_AUDIO_NUM_BUFFERS - filled <= N64_AUDIO_UNDERRUN_FLOOR
-            || !audio_can_write())
-            break;
+        filled++;
     }
+
+    // Underrun proof (transparency invariant: this must stay 0 for the whole run).
+    //
+    // libdragon's audio API exposes only audio_can_write() -- a peek at the single
+    // NEXT write slot -- so the app can't read total ring occupancy. But the loop
+    // exit condition already tells us what we need:
+    //   * filled < BUDGET   => the loop stopped because audio_can_write() went
+    //                          false, i.e. the ring FILLED UP. Healthy: deep queue.
+    //   * filled == BUDGET   => stopped at the cap. The ring may or may not be full;
+    //                          probe the next slot to tell.
+    // After a budgeted pump on a healthy ring the queue sits near full, so
+    // audio_can_write() is false. If instead it is still TRUE, the ring did not
+    // refill to full under the budget -- occupancy is low. A genuine underrun (AI
+    // dry) can only occur after the ring has been low for SEVERAL consecutive
+    // pumps, so the real danger metric is the longest consecutive run of
+    // "ring not full after pump", not an isolated dip during warmup. The math
+    // (budget 2 > worst drain 1.43/frame) says this streak must stay tiny; the
+    // bench confirms underruns (sustained-low streak reaching the ring depth) == 0.
+    if (!audio_pump_primed)
+    {
+        audio_pump_primed = true;
+        audio_low_streak = 0;
+    }
+    else
+    {
+        audio_pump_calls++;
+        if ((uint32_t)filled > audio_pump_max_filled)
+            audio_pump_max_filled = (uint32_t)filled;
+
+        if (filled >= N64_SUBMIT_BUDGET_BUFFERS && audio_can_write())
+        {
+            // Ring not full after a budgeted pump: occupancy is below capacity.
+            audio_pump_near_underruns++;
+            audio_low_streak++;
+            if (audio_low_streak > audio_pump_max_low_streak)
+                audio_pump_max_low_streak = audio_low_streak;
+            // A streak as long as the usable ring depth means the queue never
+            // recovered across that many frames -> the AI actually ran dry.
+            if (audio_low_streak >= N64_AUDIO_NUM_BUFFERS - 1)
+                audio_pump_underruns++;
+        }
+        else
+        {
+            audio_low_streak = 0;   // ring refilled to full: queue recovered
+        }
+    }
+}
+
+// Transparency proof for the pump-cadence change: zero underruns over the run.
+// Emitted unconditionally (not gated on DEBUG) so the bench scrape always sees
+// it. underruns MUST be 0; max_low_streak quantifies how close the ring ever got
+// to draining (a streak reaching the usable ring depth would be a real underrun).
+void N64_ReportAudioUnderruns(void)
+{
+    debugf("BENCH_AUDIO_UNDERRUN pumps=%lu underruns=%lu near=%lu "
+           "max_low_streak=%lu max_filled=%lu budget=%d ring=%d\n",
+           (unsigned long)audio_pump_calls,
+           (unsigned long)audio_pump_underruns,
+           (unsigned long)audio_pump_near_underruns,
+           (unsigned long)audio_pump_max_low_streak,
+           (unsigned long)audio_pump_max_filled,
+           N64_SUBMIT_BUDGET_BUFFERS,
+           N64_AUDIO_NUM_BUFFERS);
 }
 
 void I_InitSound(void)

@@ -19,4 +19,9 @@
 #define N64_DEBUGF(...) ((void)0)
 #endif
 
+// Emit the audio-pump underrun proof (BENCH_AUDIO_UNDERRUN line). Defined in
+// i_sound_n64.c; called from the bench phase report so the cadence change's
+// transparency invariant (zero underruns) is captured in the bench output.
+void N64_ReportAudioUnderruns(void);
+
 #endif

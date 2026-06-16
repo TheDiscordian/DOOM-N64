@@ -16,6 +16,7 @@
 #include "d_ticcmd.h"
 #include "g_game.h"
 #include "n64_bench.h"
+#include "n64_debug.h"
 
 // m_menu.c font helpers (external linkage, not in m_menu.h).
 extern int  M_StringWidth(char* string);
@@ -904,6 +905,7 @@ static void N64Bench_ReportPhases(void)
 
     debugf("BENCH_OUTLIER level_reload_frames=%lu max_us=%lu (excluded from tail)\n",
            outlier_frames, outlier_max_us);
+    N64_ReportAudioUnderruns();   // transparency proof for the audio-pump cadence
     debugf("BENCH_REPORT_END\n");
 }
 
