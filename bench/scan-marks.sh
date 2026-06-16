@@ -48,8 +48,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-# wait for the first marker (boot + warmup)
-for _ in $(seq 1 40); do grep -q 'BENCH_MARK' "$LOG" 2>/dev/null && break; sleep 1; done
+# wait for the first marker (boot + warmup); ABORT if the ROM never loads.
+# ares has a ~1-in-4 silent launch flake (window opens, ROM never boots). Without
+# this, the capture loop below would hold that empty no-ROM window open for the full
+# CAPSECS cap -- the "ares window with no rom loaded" that lingers. Bail at the boot
+# deadline so trap cleanup reaps it within ~45s instead.
+booted=0
+for _ in $(seq 1 45); do
+    grep -q 'BENCH_MARK' "$LOG" 2>/dev/null && { booted=1; break; }
+    kill -0 -- -"$APGID" 2>/dev/null || break   # ares already died during boot
+    sleep 1
+done
+if [ "$booted" -eq 0 ]; then
+    echo "scan-marks: no BENCH_MARK within the boot window -- ares launch flaked (no ROM loaded); aborting" >&2
+    exit 3   # trap cleanup EXIT reaps the empty ares window
+fi
 
 GEOM="$(hyprctl clients -j 2>/dev/null | python3 -c "
 import json,sys
