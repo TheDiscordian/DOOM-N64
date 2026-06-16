@@ -605,6 +605,26 @@ R_MakeSpans
 #define PLANETESS_SPLIT_DEVY  1.25f
 #endif
 
+// Per-poly far/near INV_W (depth) ratio ceiling -- the floor-garbage fix.
+// R_PlaneCornerAttr's INV_W is the corner's row offset from the horizon (dyrows);
+// the RDP reconstructs each pixel's texel as (S*INV_W)/INV_W in fixed point. When
+// a single emitted quad spans a large depth range its top/bottom INV_W differ by
+// a big ratio, and that hyperbolic divide loses precision / the per-pixel S*INV_W
+// setup slope overflows the RDP's fixed point -> the view-dependent floor "garbage
+// + stretches forever" (the trace measured 7-11x far/near INV_W on garbage frames,
+// ~1x on the clean ones). A tall run is therefore split into horizontal depth
+// bands so NO emitted quad's far/near INV_W ratio exceeds PLANE_INVW_RATIO -- each
+// band stays in the RDP's exact range. The split is GEOMETRIC in INV_W (equal-ratio
+// bands), so a deep run needs only ceil(log_ratio(R)) bands; PLANE_MAX_BANDS caps
+// the worst case. Both run-fitter twins (emit + count) compute the SAME band count
+// from the SAME corner Ys, so the bench tessellation count tracks the emitted polys.
+#ifndef PLANE_INVW_RATIO
+#define PLANE_INVW_RATIO  2.0f
+#endif
+#ifndef PLANE_MAX_BANDS
+#define PLANE_MAX_BANDS   6
+#endif
+
 // One corner's screen->texel un-projection + INV_W. xc/yc are the corner's
 // screen column/row (fractional). Fills *u/*v (texel coords) and *invw.
 //
@@ -847,6 +867,70 @@ R_PlaneExpectedTexel
 }
 #endif // PLANE_UV_TRACE
 
+// Depth-band count for a run with corner Ys [ytl,ytr,ybl,ybr]. INV_W at a corner
+// is its |row offset from the horizon| (R_PlaneCornerAttr's dyrows, clamped >=1);
+// the left edge sizes the split (the run-fitter holds top/bottom edge deviation
+// within PLANETESS_SPLIT_DEVY ~1.25 rows, so left and right ratios track). Returns
+// ceil(log_PLANE_INVW_RATIO(R)) bands, R = far/near INV_W ratio, capped at
+// PLANE_MAX_BANDS. The ybl horizon/degenerate clamp mirrors R_EmitRunPoly so the
+// emit and count twins derive an IDENTICAL count from the same inputs.
+static int
+R_PlaneRunBands
+( float	ytl,
+  float	ytr,
+  float	ybl,
+  float	ybr )
+{
+    float	cyf = (float)centery - 0.5f;
+    float	wtop, wbot, lo, hi, R, acc;
+    int		N;
+
+    (void)ytr; (void)ybr;                   // left edge sizes the split
+
+    if (ybl < ytl + 0.05f) ybl = ytl + 0.05f;   // mirror R_EmitRunPoly's clamp
+
+    wtop = ytl - cyf;  if (wtop < 0.0f) wtop = -wtop;  if (wtop < 1.0f) wtop = 1.0f;
+    wbot = ybl - cyf;  if (wbot < 0.0f) wbot = -wbot;  if (wbot < 1.0f) wbot = 1.0f;
+
+    lo = (wtop < wbot) ? wtop : wbot;
+    hi = (wtop < wbot) ? wbot : wtop;
+    R  = hi / lo;
+
+    N = 1;  acc = PLANE_INVW_RATIO;
+    while (acc < R && N < PLANE_MAX_BANDS) { acc *= PLANE_INVW_RATIO; N++; }
+    return N;
+}
+
+// Emit ONE depth band as a quad: four corner U/V/INV_W at screen (xl|xr, yt*|yb*)
+// + flat + light, exactly as R_EmitRunPoly builds its single quad. x1/x2 are the
+// run's column span (shared by every band); only the Y edges + corner attrs differ.
+static void
+R_EmitPlaneBand
+( int16_t	x1,
+  int16_t	x2,
+  float		xl,
+  float		xr,
+  float		ytl,
+  float		ytr,
+  float		ybl,
+  float		ybr,
+  uint16_t	flatlump,
+  const void*	cm )
+{
+    rdp_ppoly_t	q;
+
+    q.x1 = x1;  q.x2 = x2;
+    q.ytop_l = ytl;  q.ybot_l = ybl;
+    q.ytop_r = ytr;  q.ybot_r = ybr;
+    R_PlaneCornerAttr(xl, ytl, &q.u_tl, &q.v_tl, &q.invw_tl);
+    R_PlaneCornerAttr(xr, ytr, &q.u_tr, &q.v_tr, &q.invw_tr);
+    R_PlaneCornerAttr(xl, ybl, &q.u_bl, &q.v_bl, &q.invw_bl);
+    R_PlaneCornerAttr(xr, ybr, &q.u_br, &q.v_br, &q.invw_br);
+    q.flatlump = flatlump;
+    q.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
+    DL_EmitPlanePoly(&q, cm);
+}
+
 // Emit ONE trapezoid run [xa..xb] of a covered island as a quad. top[]/bottom[]
 // are the visplane's per-column edges; the corner Y geometry uses the EXACT same
 // half-pixel extrapolation R_CountIslandRuns builds (so the emitted quad's screen
@@ -900,7 +984,56 @@ R_EmitRunPoly
     p.flatlump = (uint16_t)flatlump;
     p.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
 
-    DL_EmitPlanePoly(&p, cm);
+    // Depth-band split: if this run's far/near INV_W ratio is too wide for the
+    // RDP's fixed-point perspective divide, slice it into PLANE_INVW_RATIO-bounded
+    // horizontal bands (geometric in INV_W) so each emitted quad stays in range.
+    // N==1 emits the single quad p unchanged (identical to the pre-split path).
+    {
+	int N = R_PlaneRunBands(ytl, ytr, ybl, ybr);
+
+	if (N <= 1)
+	{
+	    DL_EmitPlanePoly(&p, cm);
+	}
+	else
+	{
+	    float	cyf  = (float)centery - 0.5f;
+	    float	wtop = ytl - cyf, wbot = ybl - cyf;
+	    float	f, denom, bk;
+	    int		k;
+
+	    if (wtop < 0.0f) wtop = -wtop;
+	    if (wtop < 1.0f) wtop = 1.0f;
+	    if (wbot < 0.0f) wbot = -wbot;
+	    if (wbot < 1.0f) wbot = 1.0f;
+
+	    // March band boundaries geometrically from the near edge's INV_W toward
+	    // the far edge's; t = (invw-wtop)/(wbot-wtop) is the edge parameter (INV_W
+	    // is linear in screen Y, so t doubles as the screen-Y lerp factor). denom
+	    // is safe: N>1 => the far/near ratio exceeds PLANE_INVW_RATIO, so wbot!=wtop.
+	    f     = (wbot >= wtop) ? PLANE_INVW_RATIO : (1.0f / PLANE_INVW_RATIO);
+	    denom = wbot - wtop;
+	    bk    = wtop;
+
+	    for (k = 0; k < N; k++)
+	    {
+		float	bk1 = (k + 1 == N) ? wbot : (bk * f);
+		float	t0, t1, btl, btr, bbl, bbr;
+
+		if (f > 1.0f) { if (bk1 > wbot) bk1 = wbot; }
+		else          { if (bk1 < wbot) bk1 = wbot; }
+
+		t0 = (bk  - wtop) / denom;
+		t1 = (bk1 - wtop) / denom;
+		btl = ytl + t0 * (ybl - ytl);  btr = ytr + t0 * (ybr - ytr);
+		bbl = ytl + t1 * (ybl - ytl);  bbr = ytr + t1 * (ybr - ytr);
+
+		R_EmitPlaneBand(p.x1, p.x2, xl, xr, btl, btr, bbl, bbr,
+				p.flatlump, cm);
+		bk = bk1;
+	    }
+	}
+    }
 
 #if PLANE_GEOM_TRACE
     // ---- floor-poly COVERAGE/geometry trace (diagnostic, no render effect) ----
@@ -1500,8 +1633,10 @@ R_CountIslandRuns
 	}
     }
 
-    // One trapezoid run covers this island span.
-    return 1;
+    // One trapezoid run covers this island span -- but a deep run is emitted as
+    // R_PlaneRunBands() depth bands (the INV_W-ratio floor-garbage fix), so the
+    // count must equal the emitted band count, not 1. Same corner Ys as emit.
+    return R_PlaneRunBands(ytl, ytr, ybl, ybr);
 }
 
 // Walk every visplane in the frame, split each into covered islands over
