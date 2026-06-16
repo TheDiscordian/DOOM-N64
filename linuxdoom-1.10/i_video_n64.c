@@ -754,10 +754,21 @@ int I_N64DrawBufferIndex(void)
 static void I_N64BufferDone(void* arg)
 {
     int idx = (int)(intptr_t)arg;
+#if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
+    // This runs in the DP SYNC_FULL interrupt. Time its wall-clock service and
+    // charge it to whichever BPH_* render bracket is open right now -- proving
+    // WHERE the async RDP-completion stall lands (the "phantom" bracket cost that
+    // survives a body no-op). Probe-only; compiled out of timing/ship builds.
+    uint64_t isr_t0 = get_ticks();
+#endif
 
     if (doom_screen8_disp[idx])
         display_show(doom_screen8_disp[idx]);
     doom_screen8_rdp_busy[idx] = false;
+
+#if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
+    N64Bench_NoteAsyncStall(get_ticks() - isr_t0);
+#endif
 }
 
 // Mark every palette index a single patch lump touches. The lump is decoded as
@@ -1171,7 +1182,18 @@ void I_FinishUpdate(void)
             return;
     }
 
+#if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
+    // Time the free-framebuffer acquire separately from the rest of PRESENT: this
+    // is the vsync-coupled wait (display_get blocks when no display buffer is free)
+    // -- a HARD serialization if it spins, ~0 if buffers are available. Probe-only.
+    {
+        uint64_t dg_t0 = get_ticks();
+        disp = display_get();
+        N64Bench_NoteDispGet(get_ticks() - dg_t0);
+    }
+#else
     disp = display_get();
+#endif
     if (!disp)
         return;
 
@@ -1448,8 +1470,20 @@ void I_FinishUpdate(void)
     N64Bench_PhaseSwitch(BPH_PRESENT, BPH_RDP_BUSY);
 #endif
     next_idx = n64_draw_idx ^ 1;
+#if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
+    {
+        // Count spin iterations to prove the buffer-flip RDP-busy wait is the ~0
+        // it's claimed to be (the only explicit CPU spin-on-RDP-completion). The
+        // volatile read keeps the loop semantics byte-identical to the ship spin.
+        uint32_t spins = 0;
+        while (doom_screen8_rdp_busy[next_idx])
+            spins++;
+        N64Bench_NoteRdpBusySpins(spins);
+    }
+#else
     while (doom_screen8_rdp_busy[next_idx])
         ;
+#endif
 #ifdef N64_BENCH
     N64Bench_PhaseSwitch(BPH_RDP_BUSY, BPH_PRESENT);
 #endif

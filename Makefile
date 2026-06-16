@@ -71,6 +71,18 @@ endif
 ifeq ($(BAKEFAN_PROBE),1)
 CFLAGS += -DBAKEFAN_PROBE=1
 endif
+# RDPWAIT_PROBE=1: one-off time/count-only instrumentation pinning WHERE the CPU
+# blocks on the RDP/RDRAM. Attributes the async RDP-completion interrupt
+# (I_N64BufferDone, fired via rdpq_detach_cb on DP SYNC_FULL) to whichever BPH_*
+# bracket is open at fire time (BENCH_ASYNC lines: which phase's "phantom" time is
+# really a CP0-completion interrupt, not CPU work), and splits the two present-seam
+# waits -- display_get() free-framebuffer acquire and the buffer-flip RDP-busy spin
+# -- out of PRESENT/RDP_BUSY (BENCH_ASYNC_HDR). NO render / NO bracket-boundary
+# change (fingerprint unperturbed), so it is OFF by default -- pass RDPWAIT_PROBE=1
+# on the make line for the probe run.
+ifeq ($(RDPWAIT_PROBE),1)
+CFLAGS += -DRDPWAIT_PROBE=1
+endif
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

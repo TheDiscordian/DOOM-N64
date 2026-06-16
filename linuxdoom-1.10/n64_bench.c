@@ -106,6 +106,15 @@ typedef struct
                              // plane). A/B vs plane_polytris (the runtime trapezoid
                              // tessellation the bake replaces). r_bsp.c R_Subsector.
 #endif
+#ifdef RDPWAIT_PROBE
+    uint32_t async_us[BPH_COUNT];  // async RDP-completion interrupt us charged to
+                                   // each open phase this frame (where the DP
+                                   // SYNC_FULL stall actually lands)
+    uint16_t async_fires;          // DP-completion interrupts serviced this frame
+    uint16_t dispget_us;           // display_get() wall us (PRESENT sub-bracket:
+                                   // the vsync-coupled free-framebuffer wait)
+    uint16_t rdpbusy_spins;        // buffer-flip spin iterations this frame
+#endif
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -156,6 +165,24 @@ static uint16_t         cur_pvs_cullable;	// count-only REJECT-cullable of those
 #endif
 #ifdef BAKEFAN_PROBE
 static uint16_t         cur_bakefan_tris;	// count-only baked-leaf-fan tris this frame
+#endif
+
+#ifdef RDPWAIT_PROBE
+// Async RDP/RDRAM stall attribution. The RDP-completion callback (I_N64BufferDone,
+// fired from the DP interrupt handler via rdpq_detach_cb) runs in INTERRUPT
+// context: its wall-clock service time is charged to whatever BPH_* bracket is
+// open at the instant the DP raises SYNC_FULL. This probe attributes that
+// interrupt-service time per open phase, proving WHERE the "phantom" async stall
+// (e.g. the ~1644us planes residual that survives an R_DrawPlanes body no-op)
+// actually lands -- a CP0-completion interrupt, not CPU work in that phase.
+//
+// Accumulated per FRAME into cur_async_tk[phase] (interrupt adds raw ticks to the
+// open phase) and committed to the frame record at LoopEnd, alongside fire counts.
+// COUNT/TIME-ONLY -- changes no rendering and no phase bracket boundary.
+static uint32_t         cur_async_tk[BPH_COUNT];   // async interrupt ticks per open phase this frame
+static uint32_t         cur_async_fires;           // DP-completion interrupts this frame
+static uint32_t         cur_dispget_tk;            // display_get() wall ticks (PRESENT sub-bracket)
+static uint32_t         cur_rdpbusy_spins;         // buffer-flip spin iterations this frame
 #endif
 
 // Outlier (level-reload) frames: counted separately, kept out of tail stats.
@@ -344,6 +371,12 @@ void N64Bench_LoopBegin(void)
 #ifdef BAKEFAN_PROBE
     cur_bakefan_tris = 0;
 #endif
+#ifdef RDPWAIT_PROBE
+    memset(cur_async_tk, 0, sizeof(cur_async_tk));
+    cur_async_fires = 0;
+    cur_dispget_tk = 0;
+    cur_rdpbusy_spins = 0;
+#endif
     loop_start_ticks = get_ticks();
     loop_open = 1;
 }
@@ -392,6 +425,54 @@ void N64Bench_PhaseSwitch(int end_id, int begin_id)
         phase_open_mask |= (1u << begin_id);
     }
 }
+
+#ifdef RDPWAIT_PROBE
+// Called from the RDP-completion interrupt (I_N64BufferDone, via rdpq_detach_cb)
+// with the wall-clock ticks the interrupt handler spent. Attributes that time to
+// whichever render phase bracket is OPEN right now -- the phase the async DP
+// SYNC_FULL interrupt happened to land in. The lowest open render-phase bit is
+// the innermost active bracket. COUNT/TIME-ONLY: no bracket boundary moves.
+//
+// loop_open / the phase mask are plain statics touched by the main render thread
+// AND this interrupt; the interrupt is brief and the main thread only reads these
+// fields right after this returns (at the next get_ticks boundary), so a torn read
+// would at worst misattribute one fire by one phase -- acceptable for a probe.
+void N64Bench_NoteAsyncStall(uint64_t ticks)
+{
+    int p;
+    if (!loop_open)
+        return;
+    cur_async_fires++;
+    // Attribute to the innermost open render phase (skip GAMETIC, which is sim,
+    // and the derived HUD slot). If nothing render-ish is open, charge GAMETIC.
+    for (p = BPH_BSP_WALK; p < BPH_COUNT; p++)
+    {
+        if (phase_open_mask & (1u << p))
+        {
+            cur_async_tk[p] += (uint32_t)ticks;
+            return;
+        }
+    }
+    cur_async_tk[BPH_GAMETIC] += (uint32_t)ticks;
+}
+
+// Sub-bracket helpers for the present-seam waits (display_get + buffer-flip spin).
+// Called from i_video_n64.c around the two specific blocking points so their cost
+// is split out of the PRESENT/RDP_BUSY brackets. TIME/COUNT-ONLY.
+void N64Bench_NoteDispGet(uint64_t ticks)
+{
+    if (!loop_open)
+        return;
+    cur_dispget_tk += (uint32_t)ticks;
+}
+
+void N64Bench_NoteRdpBusySpins(uint32_t spins)
+{
+    if (!loop_open)
+        return;
+    cur_rdpbusy_spins += spins;
+}
+#endif
 
 void N64Bench_SetTicsRan(int tics)
 {
@@ -551,6 +632,13 @@ void N64Bench_LoopEnd(void)
 #endif
 #ifdef BAKEFAN_PROBE
         f->bakefan_tris = cur_bakefan_tris;
+#endif
+#ifdef RDPWAIT_PROBE
+        for (i = 0; i < BPH_COUNT; i++)
+            f->async_us[i] = (uint32_t)TICKS_TO_US(cur_async_tk[i]);
+        f->async_fires   = (uint16_t)cur_async_fires;
+        f->dispget_us    = (uint16_t)TICKS_TO_US(cur_dispget_tk);
+        f->rdpbusy_spins = (uint16_t)cur_rdpbusy_spins;
 #endif
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
@@ -723,6 +811,48 @@ static unsigned long N64Bench_FieldP95(int phase)
     }
     return (unsigned long)BENCH_HIST_OVERFLOW << BENCH_HIST_US_SHIFT;
 }
+
+#ifdef RDPWAIT_PROBE
+// p95 of the async RDP-completion-interrupt us, same 64us-bucket histogram trick
+// as N64Bench_FieldP95. `phase` < 0 selects the per-frame async TOTAL (sum over
+// all phases); otherwise async_us[phase] (the interrupt time charged to that
+// phase). 32us return (one bucket midpoint) means the interrupt never landed in
+// that phase across the run.
+static unsigned long N64Bench_AsyncFieldP95(int phase)
+{
+    static unsigned long fhist[BENCH_HIST_BUCKETS];
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long v;
+        if (phase < 0)
+        {
+            int pp; v = 0;
+            for (pp = 0; pp < BPH_COUNT; pp++) v += bench_frames[i].async_us[pp];
+        }
+        else
+            v = bench_frames[i].async_us[phase];
+        {
+            unsigned long b = v >> BENCH_HIST_US_SHIFT;
+            if (b >= BENCH_HIST_BUCKETS) b = BENCH_HIST_OVERFLOW;
+            fhist[b]++;
+        }
+    }
+    target = (bench_frame_count * 95UL + 99) / 100;
+    cum = 0;
+    for (i = 0; i < BENCH_HIST_BUCKETS; i++)
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return (i << BENCH_HIST_US_SHIFT) + (1UL << (BENCH_HIST_US_SHIFT - 1));
+    }
+    return (unsigned long)BENCH_HIST_OVERFLOW << BENCH_HIST_US_SHIFT;
+}
+#endif
 
 #ifdef PLANETESS_COUNT
 // p95 of the per-frame plane-poly-tri count (count-only go/no-go measurement).
@@ -1060,6 +1190,58 @@ static void N64Bench_ReportPhases(void)
                mean_vis, mean_cul, N64Bench_PvsCullableP95(),
                pct_mean10 / 10, pct_mean10 % 10,
                pct_tail10 / 10, pct_tail10 % 10);
+    }
+#endif
+#ifdef RDPWAIT_PROBE
+    // DECISIVE async-stall attribution: where the RDP-completion interrupt
+    // (I_N64BufferDone, fired from the DP SYNC_FULL interrupt via rdpq_detach_cb)
+    // charges its wall-clock service time. The interrupt runs in whichever BPH_*
+    // bracket is open at fire time. If the per-phase async_us here accounts for a
+    // phase's "phantom" cost (a bracket time that survives a body no-op -- e.g.
+    // the ~1644us planes residual), that phase is NOT CPU work: it is the CPU
+    // stalled in an async DP-completion interrupt charged to whatever was open.
+    //
+    // dispget_us: display_get() wall time -- the vsync-coupled wait for a free
+    // framebuffer (a HARD serialization if it blocks; a SOFT ~0 if buffers free).
+    // rdpbusy_spins: iterations of the buffer-flip RDP-busy spin (the only CPU
+    // spin-on-RDP-completion); ~0 confirms the CPU never locks on the RDP there.
+    {
+        unsigned long async_sum[BPH_COUNT];
+        unsigned long fires_sum = 0, dispget_sum = 0, spins_sum = 0;
+        unsigned long async_total = 0;
+        unsigned long ii;
+        memset(async_sum, 0, sizeof(async_sum));
+        for (ii = 0; ii < bench_frame_count; ii++)
+        {
+            bench_frame_t* f = &bench_frames[ii];
+            int pp;
+            for (pp = 0; pp < BPH_COUNT; pp++)
+            {
+                async_sum[pp] += f->async_us[pp];
+                async_total   += f->async_us[pp];
+            }
+            fires_sum   += f->async_fires;
+            dispget_sum += f->dispget_us;
+            spins_sum   += f->rdpbusy_spins;
+        }
+        debugf("BENCH_ASYNC_HDR frames=%lu total_async_us_mean=%lu fires_mean=%lu.%lu "
+               "dispget_us_mean=%lu p95=%lu spins_mean=%lu.%lu\n",
+               bench_frame_count,
+               (unsigned long)(async_total / bench_frame_count),
+               (fires_sum * 10UL / bench_frame_count) / 10,
+               (fires_sum * 10UL / bench_frame_count) % 10,
+               (unsigned long)(dispget_sum / bench_frame_count),
+               N64Bench_AsyncFieldP95(-1),
+               (spins_sum * 10UL / bench_frame_count) / 10,
+               (spins_sum * 10UL / bench_frame_count) % 10);
+        for (p = 0; p < BPH_COUNT; p++)
+        {
+            unsigned long mean = (unsigned long)(async_sum[p] / bench_frame_count);
+            if (mean == 0 && N64Bench_AsyncFieldP95(p) == 32)
+                continue;   // skip phases the interrupt never lands in
+            debugf("BENCH_ASYNC name=%-8s mean_us=%lu p95_us=%lu\n",
+                   bench_phase_name[p], mean, N64Bench_AsyncFieldP95(p));
+        }
     }
 #endif
 

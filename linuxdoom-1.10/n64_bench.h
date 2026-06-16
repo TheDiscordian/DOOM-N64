@@ -102,6 +102,19 @@ void N64Bench_SetCounts(int vissprites, int drawsegs, int visplanes);
 void N64Bench_SetPlanePolyTris(int polytris);
 #endif
 
+#ifdef RDPWAIT_PROBE
+// Async RDP/RDRAM stall attribution (where the CPU blocks on the GPU).
+// N64Bench_NoteAsyncStall is called FROM the RDP-completion interrupt
+// (I_N64BufferDone, fired via rdpq_detach_cb on DP SYNC_FULL) with the wall-clock
+// ticks that interrupt spent; it charges them to whichever BPH_* render bracket is
+// open at fire time. NoteDispGet/NoteRdpBusySpins split the two present-seam waits
+// (free-framebuffer acquire, buffer-flip spin) out of PRESENT/RDP_BUSY. All three
+// are TIME/COUNT-ONLY -- no bracket boundary moves, no rendering changes.
+void N64Bench_NoteAsyncStall(uint64_t ticks);
+void N64Bench_NoteDispGet(uint64_t ticks);
+void N64Bench_NoteRdpBusySpins(uint32_t spins);
+#endif
+
 #ifdef PVS_PROBE
 // Latch the count-only PVS/occlusion-bake go/no-go measurement: subsectors
 // VISITED this frame (= sscount) and how many of those the existing REJECT
