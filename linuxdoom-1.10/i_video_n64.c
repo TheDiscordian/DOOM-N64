@@ -1546,6 +1546,31 @@ void I_N64ForceTLUTReupload(void)
     n64_palette_dirty = true;
 }
 
+// SYNCHRONOUS variant: actually re-upload the master 256-TLUT into TMEM NOW,
+// in the current rspq stream, not just arm the dirty flag for the later present
+// blit. The CI4 wall pass (DL_Flush bucket walk) overwrites the 256-entry TLUT
+// region with up to 16 per-texture 16-colour CI4 sub-palettes (rdpq_tex_upload_-
+// tlut at slot*16). When BOTH wall and plane routes are on, the CI8 plane pass
+// drains INSIDE the same DL_Flush, AFTER the wall pass, but BEFORE I_FinishUpdate
+// re-uploads the master TLUT for the present blit -- so the planes would sample
+// the corrupted (CI4-sub-palette) TLUT and render garbage colours. Re-uploading
+// here, between the wall and plane passes, restores the master 256-TLUT in TMEM
+// so the CI8 flats sample the right colours. The world textured mode (TLUT_-
+// RGBA16) the caller already set keeps the upper TMEM half addressable for the
+// LOAD_TLUT. Mirrors the world-pass upload in I_FinishUpdate (no entry changes,
+// the master already carries the key alpha). One 512 B writeback + one LOAD_TLUT.
+void I_N64UploadMasterTLUT(void)
+{
+    uint16_t* slot = doom_tlut_up[n64_draw_idx];
+
+    memcpy(slot, doom_tlut_master, sizeof(doom_tlut_master));
+    data_cache_hit_writeback(slot, sizeof(doom_tlut_master));
+    rdpq_tex_upload_tlut(slot, 0, 256);
+    // The present-blit path still re-uploads under its own COPY-mode TLUT; leave
+    // the dirty flag untouched so that path is unaffected (it idempotently re-
+    // uploads the identical master TLUT).
+}
+
 void I_InitGraphics(void)
 {
     int i;

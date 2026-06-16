@@ -3400,6 +3400,20 @@ void DL_Flush(void)
     // the arena grown if it ever bites; with DL_WALL_ARENA=512 it should not.
     (void)dl_arena_overflow;
 
+    // TLUT COLLISION FIX (combined full-RDP): the CI4 wall pass above overwrote
+    // the 256-entry TLUT region with up to 16 per-texture sub-palettes. The CI8
+    // plane pass below samples the MASTER 256-TLUT, and it runs in THIS rspq
+    // stream BEFORE I_FinishUpdate's present-blit re-upload -- so without a re-
+    // upload here it would read the wall sub-palettes and render garbage-coloured
+    // planes (the combined-build plane corruption; planes-only never hits this
+    // because dl_touched_count==0 leaves the master TLUT untouched). Re-load the
+    // master TLUT into TMEM NOW, only when walls actually drew. The caller's world
+    // textured mode (TLUT_RGBA16) keeps the upper TMEM half addressable for the
+    // LOAD_TLUT. I_N64ForceTLUTReupload above still arms the present-blit path for
+    // the CI8 sprites/HUD/COPY blit; this is the in-flush synchronous counterpart.
+    if (dl_touched_count > 0)
+        I_N64UploadMasterTLUT();
+
     // Stage-4: drain the floors/ceilings after the walls, same rspq stream,
     // still scissored to the view window. Two mutually-exclusive paths (only one
     // queued this frame, per DL_PlanePolyOn): the Stage-4b POLYGON path (trapezoid

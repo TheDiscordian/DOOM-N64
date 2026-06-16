@@ -95,6 +95,14 @@ void I_N64MarkPaletteDirty(void);
 // sample the right colours. Called by DL_Flush at the end of the wall pass.
 void I_N64ForceTLUTReupload(void);
 
+// SYNCHRONOUS master-TLUT re-upload: re-load the master 256-entry TLUT into TMEM
+// NOW (in the current rspq stream), not just arm the present-blit dirty flag.
+// DL_Flush calls this between the CI4 wall pass and the CI8 plane pass when walls
+// drew, so the plane flats (which sample the master TLUT) do not read the CI4 sub-
+// palettes the wall pass left in the 256-entry TLUT region. Caller must be in a
+// TLUT-addressable mode (the world TLUT_RGBA16 textured mode satisfies this).
+void I_N64UploadMasterTLUT(void);
+
 // Scrub transparency-key pixels out of a wipe-captured CI8 screen (replace
 // each with the pixel above; top row falls back to palette 0). The wipe
 // captures recycle buffers that contain the routed seg's key-suppressed
