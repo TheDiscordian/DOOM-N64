@@ -184,16 +184,19 @@ extern int          numflats;
 
 byte* R_GetColumn(int tex, int col);
 
-// --- per-seg A/B toggle (graft #4) -----------------------------------------
-// Defaults to the RDP path so Stage 3 exercises the new wall pipeline. The task
-// allows defaulting this to CPU (0) if walls render wrong and cannot be fixed
-// within the iteration budget.
-int n64_rdp_wall_ab = 1;
+// --- per-seg wall A/B toggle -----------------------------------------------
+// Defaults to CPU walls (0): the shipped "RENDERER: RDP" menu option is RDP
+// floors/ceilings + SOFTWARE walls (the "planes-only" config). Benched 2026-06-16:
+// planes-only beats software on BOTH avg and p95 (18814/30432 vs 19793/31648),
+// with no wall glancing-smear and full COMPUTE2 fidelity. Full RDP (walls on, =1)
+// ties on avg but loses the p95 tail (+12.6%) and carries the smear, so it is NOT
+// shipped. BENCH_FORCE_WALLS_ONLY pins this to 1 for the isolation A/B (d_main.c).
+int n64_rdp_wall_ab = 0;
 
-// Plane A/B toggle (Stage-4 symmetry-completion of the wall toggle). Defaults to
-// the RDP path so a full RDP build routes both walls AND planes. The ISOLATION
-// experiment (SW walls + RDP planes) is n64_rdp_wall_ab=0 && n64_rdp_plane_ab=1,
-// pinned at build time by BENCH_FORCE_PLANES_ONLY (d_main.c).
+// Plane A/B toggle. Defaults to the RDP path (1): combined with the CPU-wall
+// default above, the shipped "RDP" toggle routes PLANES to the RDP and keeps
+// walls on the CPU = the planes-only ship config. BENCH_FORCE_WALLS_ONLY pins
+// this to 0; BENCH_FORCE_PLANES_ONLY pins wall=0 & plane=1 (the same config).
 int n64_rdp_plane_ab = 1;
 
 // Stage-4b sub-path selector: 1 = emit visplanes as RDP POLYGONS (trapezoid
