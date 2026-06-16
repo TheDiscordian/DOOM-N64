@@ -139,7 +139,9 @@ extern int viewwindowy; // r_draw.c
 #define PLANE_UV_TRACE_FRAME2 384   // clean frame (Ryan); 0 to dump one frame
 #endif
 #ifndef PLANE_UV_TRACE_POLYS
-#define PLANE_UV_TRACE_POLYS  6     // dump at most this many polys per frame
+#define PLANE_UV_TRACE_POLYS  16    // dump at most this many polys per frame (high
+                                    // enough to reach CEILING polys -- the per-flat
+                                    // bucket walk emits floors first, ceilings later)
 #endif
 // Float -> int + signed milli-frac (debugf has no %f here). Match r_plane.c's.
 #ifndef IFLOORF
@@ -154,8 +156,16 @@ extern int viewwindowy; // r_draw.c
 #define PUVT2_SAT_LIMIT 32767
 #define PUVT2_SAT(uv)   ( (((float)(uv)) * 32.0f >=  (float)PUVT2_SAT_LIMIT) || \
                           (((float)(uv)) * 32.0f <= -(float)PUVT2_SAT_LIMIT) )
-static unsigned long puvt2_last_frame = (unsigned long)-1; // frame currently armed
-static int           puvt2_polys_left = -1;                // polys still to dump
+// Per-slot capture state. Each target frame fires ONCE: the first plane-poly
+// render whose committed-frame-no reaches (FRAME-1) ARMS the slot and dumps up
+// to PLANE_UV_TRACE_POLYS polys, all within that one frame (puvt2_arm_fno pins
+// the frame so later frames can't re-trigger a fired slot). Latching on ">=
+// FRAME-1" (not "== FRAME-1") makes the capture robust to the bench's excluded
+// level-reload frames skewing which exact fno the target render lands on -- a
+// skipped frame can't make the slot silently miss its window.
+static int           puvt2_fired[2]   = { 0, 0 };          // slot already dumped?
+static unsigned long puvt2_arm_fno[2] = { (unsigned long)-1, (unsigned long)-1 };
+static int           puvt2_polys_left[2] = { -1, -1 };     // polys left this slot
 #endif // PLANE_UV_TRACE
 
 // Texture system globals (r_data.c).
@@ -2954,24 +2964,43 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     // hypothesis (spread overruns s10.5 at glancing/deep views).
     {
         unsigned long fno = N64Bench_FrameNo();
-        // Which marker frame, if any, does THIS render commit into? The committing
-        // render sees fno == FRAME-1. Match either configured slot (FRAME2==0 off).
-        unsigned long want = 0;
-        if (fno + 1 == (unsigned long)PLANE_UV_TRACE_FRAME)       want = PLANE_UV_TRACE_FRAME;
-        else if (PLANE_UV_TRACE_FRAME2 &&
-                 fno + 1 == (unsigned long)PLANE_UV_TRACE_FRAME2) want = PLANE_UV_TRACE_FRAME2;
-
-        if (want)
+        const unsigned long puvt2_target[2] = {
+            (unsigned long)PLANE_UV_TRACE_FRAME,
+            (unsigned long)PLANE_UV_TRACE_FRAME2     // 0 == slot disabled
+        };
+        int slot = -1;
+        int s;
+        // Pick the slot this draw belongs to. A slot that is ALREADY ARMED this
+        // frame keeps draining (matches puvt2_arm_fno). Otherwise the FIRST
+        // not-yet-fired enabled slot whose target has been reached (fno+1 >=
+        // FRAME) arms NOW and latches to this fno. The ">=" (not "==") tolerates
+        // the bench's excluded level-reload frames skewing the exact fno a target
+        // render lands on, so a slot can never silently miss its window.
+        for (s = 0; s < 2; s++)
         {
-            if (puvt2_last_frame != fno)            // first poly of this frame: arm
+            if (puvt2_arm_fno[s] == fno) { slot = s; break; }   // still draining
+        }
+        if (slot < 0)
+        {
+            for (s = 0; s < 2; s++)
             {
-                puvt2_last_frame = fno;
-                puvt2_polys_left = PLANE_UV_TRACE_POLYS;
-                debugf("PUVT2_FRAME marker=%lu fno=%lu centery=%d\n",
-                       want, fno, centery);
+                if (puvt2_target[s] == 0 || puvt2_fired[s]) continue;
+                if (fno + 1 >= puvt2_target[s])
+                {
+                    slot = s;
+                    puvt2_arm_fno[s]    = fno;
+                    puvt2_fired[s]      = 1;
+                    puvt2_polys_left[s] = PLANE_UV_TRACE_POLYS;
+                    debugf("PUVT2_FRAME slot=%d marker=%lu fno=%lu centery=%d\n",
+                           s, puvt2_target[s], fno, centery);
+                    break;
+                }
             }
+        }
 
-            if (puvt2_polys_left > 0)
+        if (slot >= 0)
+        {
+            if (puvt2_polys_left[slot] > 0)
             {
                 // Post-bias texel extents (the SPREAD the s10.5 cast must hold).
                 float umn = u_tl, umx = u_tl, vmn = v_tl, vmx = v_tl;
@@ -2999,7 +3028,7 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
                     debugf("PUVT2_POLY n=%d kind=%s x1=%d x2=%d "
                            "ytop=%d.%03d..%d.%03d ybot=%d.%03d..%d.%03d "
                            "u_spread=%d.%03d v_spread=%d.%03d\n",
-                           PLANE_UV_TRACE_POLYS - puvt2_polys_left, kind,
+                           PLANE_UV_TRACE_POLYS - puvt2_polys_left[slot], kind,
                            p->x1, p->x2,
                            IFLOORF(p->ytop_l), MILLIFRAC(p->ytop_l),
                            IFLOORF(p->ytop_r), MILLIFRAC(p->ytop_r),
@@ -3029,17 +3058,15 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
                     }
                     debugf("PUVT2_SUM n=%d kind=%s u_spread=%d v_spread=%d "
                            "SAT=%d\n",
-                           PLANE_UV_TRACE_POLYS - puvt2_polys_left, kind,
+                           PLANE_UV_TRACE_POLYS - puvt2_polys_left[slot], kind,
                            (int)floorf(u_spread), (int)floorf(v_spread), sat_any);
 
-                    puvt2_polys_left--;
+                    puvt2_polys_left[slot]--;
                 }
             }
-        }
-        else if (puvt2_polys_left >= 0)
-        {
-            puvt2_polys_left = -1;          // re-arm for a future matching frame
-            puvt2_last_frame = (unsigned long)-1;
+            // Slot self-terminates: once puvt2_polys_left[slot] hits 0 the dump
+            // stops, and puvt2_fired[slot] keeps the slot from re-arming on any
+            // later frame. No cross-frame re-arm bookkeeping needed.
         }
     }
 #endif // PLANE_UV_TRACE
