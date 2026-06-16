@@ -692,17 +692,29 @@ R_PlaneCornerAttr
 //
 // A run [xa..xb] lives inside a covered island [islx_lo..islx_hi]. Its top-edge
 // corners sit at the pixel EDGES xa and xb+1 (half a column outside the end
-// column centres). Two cases per side:
+// column centres). Three cases per side:
 //
-//   * INTERNAL split boundary -- a covered column exists on the outward side
-//     (xa > islx_lo on the left, xb < islx_hi on the right). The boundary is
-//     SHARED with the neighbouring run, so the corner Y MUST be a value both
-//     runs compute identically: the visplane edge AT the pixel boundary, i.e.
-//     the midpoint of the two columns straddling it, 0.5*(top[c]+top[c+1]).
-//     Run N's right corner 0.5*(top[xb]+top[xb+1]) == run N+1's left corner
+//   * INTERNAL boundary, GENTLE slope -- a covered column exists outward
+//     (xa > islx_lo on the left, xb < islx_hi on the right) and the top[] step
+//     ACROSS that boundary is <= PLANETESS_SPLIT_DEVY. The boundary is SHARED
+//     with the neighbouring run, so the corner Y MUST be a value both runs
+//     compute identically: the visplane edge AT the pixel boundary, the
+//     midpoint of the two columns straddling it, 0.5*(top[c]+top[c+1]). Run N's
+//     right corner 0.5*(top[xb]+top[xb+1]) == run N+1's left corner
 //     0.5*(top[xa-1]+top[xa]) when xa == xb+1 -> the two quads meet EXACTLY,
 //     no +-0.5-row seam. (The OLD code extrapolated each boundary corner half
 //     a pixel PAST the run independently, so adjacent corners never coincided.)
+//
+//   * INTERNAL boundary, STEEP step -- a covered column exists outward but the
+//     top[] step across the boundary EXCEEDS PLANETESS_SPLIT_DEVY. This is a
+//     real height DISCONTINUITY (a wall rises between two floor heights), not a
+//     smooth edge: a shared midpoint there sits ~half the step from BOTH
+//     columns' true top (the +-12-row over-shoot -- floor short on one side,
+//     slicing UP into the wall on the other). So the corner is pinned to THIS
+//     column's OWN top[] -- a vertical step edge. Each side independently
+//     evaluates the same |top[c+1]-top[c]| predicate, so they agree it is a
+//     step and each owns its corner; coverage is then exact (dtop == 0) and the
+//     "seam" is the correct vertical floor-height discontinuity, not a bleed.
 //
 //   * TRUE island edge -- no covered column outward (xa == islx_lo / xb ==
 //     islx_hi). Keep the half-pixel outward extrapolation along the end
@@ -728,8 +740,13 @@ R_PlaneRunTopCorners
     // -- left-top corner at column xa --
     if (xa > islx_lo)
     {
-	// shared internal boundary with the previous run's RIGHT corner
-	tl0 = 0.5f * ((float)top[xa - 1] + (float)top[xa]);
+	// internal boundary shared with the previous run's RIGHT corner.
+	float step = (float)top[xa] - (float)top[xa - 1];
+	if (step < 0.0f) step = -step;
+	if (step > PLANETESS_SPLIT_DEVY)
+	    tl0 = (float)top[xa];			// steep step: own column (vertical edge)
+	else
+	    tl0 = 0.5f * ((float)top[xa - 1] + (float)top[xa]);	// gentle: shared midpoint
     }
     else if (xb > xa)
     {
@@ -748,8 +765,13 @@ R_PlaneRunTopCorners
     // -- right-top corner at column xb --
     if (xb < islx_hi)
     {
-	// shared internal boundary with the next run's LEFT corner
-	tr0 = 0.5f * ((float)top[xb] + (float)top[xb + 1]);
+	// internal boundary shared with the next run's LEFT corner.
+	float step = (float)top[xb + 1] - (float)top[xb];
+	if (step < 0.0f) step = -step;
+	if (step > PLANETESS_SPLIT_DEVY)
+	    tr0 = (float)top[xb];			// steep step: own column (vertical edge)
+	else
+	    tr0 = 0.5f * ((float)top[xb] + (float)top[xb + 1]);	// gentle: shared midpoint
     }
     else if (xb > xa)
     {
