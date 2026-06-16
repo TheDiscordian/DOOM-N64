@@ -93,6 +93,17 @@ endif
 ifeq ($(PLANE_UV_TRACE),1)
 CFLAGS += -DPLANE_UV_TRACE=1
 endif
+# PLANE_GEOM_TRACE=1: one-off diagnostic builds only -- floor-poly COVERAGE/geometry
+# trace (PGT_* lines on the ISViewer log; r_plane.c PLANE_GEOM_TRACE). Dumps, for the
+# first few floor trapezoid RUNS of an early frame, the emitted run's screen coverage
+# (x1/x2 + four corner ytop/ybot), the visplane's TRUE per-column extent (top[x]/
+# bottom[x] at x1/mid/x2 with the poly-vs-visplane row delta), and the adjacent-run
+# boundary (prev run right edge vs this run left edge -> overlap/gap/clean). Localises
+# the floor-bleed/clip-wrong COVERAGE bug (NOT the texel bug -- that is PLANE_UV_TRACE).
+# Never for timing runs (the debugf cost + log traffic skew the numbers); default off.
+ifeq ($(PLANE_GEOM_TRACE),1)
+CFLAGS += -DPLANE_GEOM_TRACE=1
+endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
 CFLAGS += -I$(CURDIR)/libdragon/include

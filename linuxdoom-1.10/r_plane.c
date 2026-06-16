@@ -79,6 +79,64 @@ static int plane_uv_trace_polys_left = -1;  // armed each matching frame
 #define MILLIFRAC(f) ((int)(( (float)(f) - floorf((float)(f)) ) * 1000.0f))
 #endif
 
+// ---- PLANE_GEOM_TRACE: debug-gated floor-poly COVERAGE/geometry trace --------
+// Diagnostic ONLY (no rendering change). When -DPLANE_GEOM_TRACE=1 (Makefile
+// PLANE_GEOM_TRACE=1; default 0 -> compiled out of normal/timing builds), dump,
+// for the first few floor trapezoid runs of an early frame, the numbers that pin
+// the COVERAGE/SHAPE bug (NOT the texel bug -- that is PLANE_UV_TRACE's job):
+//   1. per emitted run: screen x1,x2 (column span) and the FOUR corner screen
+//      (x, ytop, ybot) -- the poly's actual screen coverage;
+//   2. the visplane's TRUE coverage at those columns: top[x]/bottom[x] for
+//      x = x1, mid, x2 -- the per-column floor extent software would fill, plus
+//      the emitted poly's interpolated [ytop,ybot] AT those same columns so the
+//      poly-vs-visplane per-column row delta is directly readable;
+//   3. consecutive-run boundary: run N's right edge (x2, ytr/ybr at x2+1) vs run
+//      N+1's left edge (x1, ytl/ybl at x1) within the SAME island -> OVERLAP /
+//      GAP / clean-meet, reported in px;
+//   4. the island [minx,maxx] and how the half-pixel run-end extrapolation placed
+//      the run-edge corners (raw top[xa]/top[xb] vs extrapolated ytl/ytr...).
+// Uses debugf -> ISViewer (libdragon pulled in only under the flag). Mirrors the
+// PLANE_UV_TRACE gating exactly: independent flag, default OFF, fully compiled
+// out of normal/timing builds. The orchestrator analyses + fixes from the dump.
+#ifndef PLANE_GEOM_TRACE
+#define PLANE_GEOM_TRACE 0
+#endif
+#if PLANE_GEOM_TRACE
+#include <math.h>               // floorf (trace float formatting)
+#include <libdragon.h>          // debugf -> ISViewer (flag-gated only)
+#ifndef PLANE_GEOM_TRACE_FRAME
+#define PLANE_GEOM_TRACE_FRAME 8 // dump on this R_DrawPlanes call (post-warmup)
+#endif
+#ifndef PLANE_GEOM_TRACE_POLYS
+#define PLANE_GEOM_TRACE_POLYS 6 // dump at most this many runs that frame
+#endif
+#ifndef framecount
+extern int framecount;          // shared with PLANE_UV_TRACE; guard double-decl
+#endif
+// Float -> int + signed milli-frac, same convention PLANE_UV_TRACE uses. Define
+// independently so the two traces compile in isolation (either flag alone).
+#ifndef IFLOORF
+#define IFLOORF(f)   ((int)floorf((float)(f)))
+#endif
+#ifndef MILLIFRAC
+#define MILLIFRAC(f) ((int)(( (float)(f) - floorf((float)(f)) ) * 1000.0f))
+#endif
+static int   pgt_runs_left = -1;        // runs still to dump this matching frame
+static int   pgt_island_minx = -1;      // current island [minx,maxx] (set by the
+static int   pgt_island_maxx = -1;      //   R_EmitPlanePolys island loop)
+static int   pgt_island_seq  = 0;       // 0,1,2... islands seen this dumped frame
+static int   pgt_run_in_isl  = -1;      // run index within the current island
+// Previous emitted run's RIGHT edge, for the adjacent-run boundary check. Valid
+// only while pgt_prev_valid and we are still inside the same island (the island
+// loop clears pgt_prev_valid at each new island). Because R_EmitIslandRuns emits
+// strictly left-to-right, the immediately preceding R_EmitRunPoly in the same
+// island IS the spatially adjacent run to the left.
+static int   pgt_prev_valid  = 0;
+static int   pgt_prev_x2     = 0;       // previous run's last column
+static float pgt_prev_ytr    = 0.0f;    // ... its right-edge top Y (at x2+1)
+static float pgt_prev_ybr    = 0.0f;    // ... its right-edge bottom Y (at x2+1)
+#endif // PLANE_GEOM_TRACE
+
 
 
 planefunction_t		floorfunc;
@@ -724,6 +782,132 @@ R_EmitRunPoly
 
     DL_EmitPlanePoly(&p, cm);
 
+#if PLANE_GEOM_TRACE
+    // ---- floor-poly COVERAGE/geometry trace (diagnostic, no render effect) ----
+    // Fires for the first PLANE_GEOM_TRACE_POLYS emitted runs of frame
+    // PLANE_GEOM_TRACE_FRAME only. Dumps the run's screen coverage, the visplane's
+    // true per-column extent at the run's columns (poly-vs-visplane delta), and the
+    // boundary against the immediately-preceding run in the same island.
+    if (framecount == PLANE_GEOM_TRACE_FRAME)
+    {
+        if (pgt_runs_left < 0)          // first run seen this frame: arm + header
+        {
+            pgt_runs_left = PLANE_GEOM_TRACE_POLYS;
+            debugf("PGT_FRAME frame=%d centery=%d viewwidth=%d viewheight=%d "
+                   "planeheight=%d\n",
+                   framecount, (int)centery, viewwidth, viewheight,
+                   (int)planeheight);
+        }
+
+        if (pgt_runs_left > 0)
+        {
+            int   xm = (xa + xb) >> 1;          // mid column of the run
+            float width = (float)(xb + 1 - xa);
+            // Emitted poly's interpolated [ytop,ybot] AT a given column center xs,
+            // so the per-column poly-vs-visplane delta is directly comparable.
+            // (lerp of the corner edges, exactly what the rasterizer interpolates.)
+            #define PGT_LERP(a,b,xs) \
+                ((a) + ((b) - (a)) * (((float)(xs) + 0.5f - (float)xa) / width))
+            float poly_top_xa = ytl,                         poly_bot_xa = ybl;
+            float poly_top_xm = PGT_LERP(ytl, ytr, xm),      poly_bot_xm = PGT_LERP(ybl, ybr, xm);
+            float poly_top_xb = ytr,                         poly_bot_xb = ybr;
+
+            // ---- 1+4: run screen coverage + island context + corner Ys ----------
+            // Raw column samples (top[xa], top[xb], bottom[xa]+1, bottom[xb]+1) vs
+            // the extrapolated corner Ys (ytl/ytr/ybl/ybr) show exactly how the
+            // half-pixel run-end extrapolation displaced the run-edge corners.
+            debugf("PGT_RUN n=%d isl=%d run=%d islx=%d..%d x1=%d x2=%d "
+                   "xl=%d xr=%d ytl=%d.%03d ytr=%d.%03d ybl=%d.%03d ybr=%d.%03d "
+                   "raw_top_xa=%d raw_top_xb=%d raw_bot_xa=%d raw_bot_xb=%d\n",
+                   PLANE_GEOM_TRACE_POLYS - pgt_runs_left,
+                   pgt_island_seq, pgt_run_in_isl,
+                   pgt_island_minx, pgt_island_maxx,
+                   xa, xb, (int)xl, (int)xr,
+                   IFLOORF(ytl), MILLIFRAC(ytl), IFLOORF(ytr), MILLIFRAC(ytr),
+                   IFLOORF(ybl), MILLIFRAC(ybl), IFLOORF(ybr), MILLIFRAC(ybr),
+                   (int)top[xa], (int)top[xb],
+                   (int)bottom[xa] + 1, (int)bottom[xb] + 1);
+
+            // ---- 2: visplane TRUE coverage vs emitted poly, per column ----------
+            // For x = xa, xm, xb: the software-fill extent [top[x], bottom[x]+1]
+            // vs the poly's interpolated [polytop, polybot] at that column. dtop /
+            // dbot are the poly-minus-visplane row deltas; nonzero => the poly clips
+            // wrong (into a wall if poly extent < visplane, or short if > ). The
+            // half-pixel extrapolation makes a HALF-row delta expected at the END
+            // columns (xa,xb); a delta >> 0.5 row, or any nonzero at the MID column,
+            // is the real coverage bug.
+            debugf("PGT_COV x=%d vp_top=%d vp_bot=%d poly_top=%d.%03d "
+                   "poly_bot=%d.%03d dtop=%d.%03d dbot=%d.%03d\n",
+                   xa, (int)top[xa], (int)bottom[xa] + 1,
+                   IFLOORF(poly_top_xa), MILLIFRAC(poly_top_xa),
+                   IFLOORF(poly_bot_xa), MILLIFRAC(poly_bot_xa),
+                   IFLOORF(poly_top_xa - (float)top[xa]),
+                   MILLIFRAC(poly_top_xa - (float)top[xa]),
+                   IFLOORF(poly_bot_xa - ((float)bottom[xa] + 1.0f)),
+                   MILLIFRAC(poly_bot_xa - ((float)bottom[xa] + 1.0f)));
+            debugf("PGT_COV x=%d vp_top=%d vp_bot=%d poly_top=%d.%03d "
+                   "poly_bot=%d.%03d dtop=%d.%03d dbot=%d.%03d\n",
+                   xm, (int)top[xm], (int)bottom[xm] + 1,
+                   IFLOORF(poly_top_xm), MILLIFRAC(poly_top_xm),
+                   IFLOORF(poly_bot_xm), MILLIFRAC(poly_bot_xm),
+                   IFLOORF(poly_top_xm - (float)top[xm]),
+                   MILLIFRAC(poly_top_xm - (float)top[xm]),
+                   IFLOORF(poly_bot_xm - ((float)bottom[xm] + 1.0f)),
+                   MILLIFRAC(poly_bot_xm - ((float)bottom[xm] + 1.0f)));
+            debugf("PGT_COV x=%d vp_top=%d vp_bot=%d poly_top=%d.%03d "
+                   "poly_bot=%d.%03d dtop=%d.%03d dbot=%d.%03d\n",
+                   xb, (int)top[xb], (int)bottom[xb] + 1,
+                   IFLOORF(poly_top_xb), MILLIFRAC(poly_top_xb),
+                   IFLOORF(poly_bot_xb), MILLIFRAC(poly_bot_xb),
+                   IFLOORF(poly_top_xb - (float)top[xb]),
+                   MILLIFRAC(poly_top_xb - (float)top[xb]),
+                   IFLOORF(poly_bot_xb - ((float)bottom[xb] + 1.0f)),
+                   MILLIFRAC(poly_bot_xb - ((float)bottom[xb] + 1.0f)));
+
+            // ---- 3: adjacent-run boundary (prev run RIGHT edge vs this LEFT) -----
+            // prev run's right SCREEN edge is column pgt_prev_x2+1; this run's left
+            // SCREEN edge is column xa. gap_cols = xa - (pgt_prev_x2+1): 0 = they
+            // abut, >0 = uncovered GAP columns, <0 = OVERLAP columns (bleed). dtop/
+            // dbot = this run's left corner Y minus prev run's right corner Y at the
+            // shared boundary; nonzero with gap_cols==0 means a seam (the two quads
+            // meet at the column but at different rows -> a visible notch/bleed).
+            if (pgt_prev_valid)
+            {
+                int gap_cols = xa - (pgt_prev_x2 + 1);
+                debugf("PGT_BND prev_x2=%d prev_xr=%d prev_ytr=%d.%03d "
+                       "prev_ybr=%d.%03d this_x1=%d this_xl=%d this_ytl=%d.%03d "
+                       "this_ybl=%d.%03d gap_cols=%d dtop=%d.%03d dbot=%d.%03d\n",
+                       pgt_prev_x2, pgt_prev_x2 + 1,
+                       IFLOORF(pgt_prev_ytr), MILLIFRAC(pgt_prev_ytr),
+                       IFLOORF(pgt_prev_ybr), MILLIFRAC(pgt_prev_ybr),
+                       xa, (int)xl,
+                       IFLOORF(ytl), MILLIFRAC(ytl),
+                       IFLOORF(ybl), MILLIFRAC(ybl),
+                       gap_cols,
+                       IFLOORF(ytl - pgt_prev_ytr), MILLIFRAC(ytl - pgt_prev_ytr),
+                       IFLOORF(ybl - pgt_prev_ybr), MILLIFRAC(ybl - pgt_prev_ybr));
+            }
+            #undef PGT_LERP
+
+            pgt_runs_left--;
+        }
+
+        // Record THIS run's right edge as the "previous" for the next adjacent run.
+        // R_EmitPlanePolys clears pgt_prev_valid at each new island, so this only
+        // pairs runs that are spatially adjacent within one island.
+        pgt_prev_valid = 1;
+        pgt_prev_x2    = xb;
+        pgt_prev_ytr   = ytr;
+        pgt_prev_ybr   = ybr;
+        pgt_run_in_isl++;
+    }
+    else if (pgt_runs_left >= 0)
+    {
+        pgt_runs_left  = -1;            // re-arm for a future matching frame
+        pgt_prev_valid = 0;
+    }
+#endif // PLANE_GEOM_TRACE
+
 #if PLANE_UV_TRACE
     // ---- floor-poly texel self-trace (diagnostic, no render effect) ----------
     // Fires for the first PLANE_UV_TRACE_POLYS polys of frame PLANE_UV_TRACE_FRAME
@@ -947,6 +1131,17 @@ static void R_EmitPlanePolys (visplane_t* pl)
 	       && pl->top[x] != 0xff && pl->top[x] <= pl->bottom[x])
 	    x++;
 	xb = x - 1;
+
+#if PLANE_GEOM_TRACE
+	// New island: publish its [minx,maxx] for the run trace and break the
+	// adjacent-run chain so runs of DIFFERENT islands are never paired.
+	pgt_island_minx = xa;
+	pgt_island_maxx = xb;
+	pgt_prev_valid  = 0;
+	pgt_run_in_isl  = 0;
+	if (framecount == PLANE_GEOM_TRACE_FRAME)
+	    pgt_island_seq++;
+#endif
 
 	cm = R_PlaneRunColormap(pl->top, pl->bottom, xa, xb);
 	R_EmitIslandRuns(pl->top, pl->bottom, xa, xb, 0, flatlump, cm);
