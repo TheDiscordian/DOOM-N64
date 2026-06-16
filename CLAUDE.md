@@ -76,14 +76,21 @@ pull — fixed in `0951cb3`).
   there. Use NCC only as a candidate filter; confirm each hit with the trace or eye.
 
 ## ares lifecycle — MANDATORY (leaked / stuck windows are a hard no)
-- **ALWAYS launch ares via `bench/run-bench.sh`** (the only sanctioned launcher).
-  It `setsid`s ares into its own session and wraps it in `timeout -s KILL "$((TIMEOUT
-  + 15))"`, so ares self-reaps at the deadline **even if the script — or the agent
-  that launched it — is hard-killed (SIGKILL) before the EXIT trap runs.** That
-  SIGKILL path (a subagent dying on an API error mid-run) is how orphaned ares
-  windows leaked; the inner `timeout` closes it. If you must launch ares directly
-  (a bespoke capture loop), use the SAME idiom — `setsid … timeout -s KILL <T> ares
-  …` — never a bare `ares &`, or it can leak when your process dies.
+- **NEVER launch ares directly. Use a committed launcher:** `bench/run-bench.sh`
+  for timing runs, `bench/scan-marks.sh <marks-rom> <outdir>` for frozen-marks
+  frame capture. Both `setsid` ares into its own session under a `timeout -s KILL`
+  backstop and trap EXIT/INT/TERM, so ares is reaped on normal exit, on a signal,
+  AND even if the script (or the agent running it) is hard-killed before any trap
+  runs — the detached `timeout` still SIGKILLs ares at the deadline.
+- **The leak that plagued this effort was hand-rolled `/tmp` capture scripts** that
+  ran `setsid ares & ; trap cleanup EXIT` with NO `timeout` backstop: a capture that
+  ran to completion closed ares, but one interrupted partway (agent death, abandon,
+  force-stop) orphaned the `setsid`'d window forever (~"half don't close"). Do NOT
+  write another. If you genuinely need a one-off launch, copy `scan-marks.sh`'s
+  idiom exactly: `setsid … timeout -s KILL <T> ares …` + `trap cleanup EXIT INT TERM`.
+  (Separately: `setsid ares & ARES_PGID=$!` captures the WRONG pgid when the caller
+  has job control ON — `$!` is the dead fork-parent — so a later `kill -- -$!` misses
+  ares. Read the pgid from the setsid leader's own `$$`, as the committed scripts do.)
 - ares **ignores SIGTERM**. Teardown must `kill -9` the process GROUP:
   `kill -9 -- -<pgid>` (pgid via `ps -o pgid= -p <pid>`).
 - After EVERY ares run, verify ZERO via BOTH `pgrep -x ares` (exact name — `-f`
