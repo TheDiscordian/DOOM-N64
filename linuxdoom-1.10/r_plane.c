@@ -913,6 +913,40 @@ R_PlaneRunBands
     return N;
 }
 
+// Resolve the light table at a depth-BAND's own representative row, mirroring
+// R_MapPlane's exact per-distance light chain. Software shades floors per ROW
+// (planezlight[distance>>LIGHTZSHIFT] each scanline); a single emitted run picks
+// ONE light at its mid row (R_PlaneRunColormap), so a deep run that the INV_W
+// band split slices into several quads inherits one flat light across all bands
+// -- the floor reads a touch bright/flat where software darkens into the
+// distance. This re-resolves the colormap PER BAND at the band's mid screen row
+// (the vertical centre of its four corners; INV_W is linear in screen Y, so the
+// band's mid row IS its representative depth), so each band tracks software's
+// depth falloff. Adds NO triangles -- one extra yslope/planezlight lookup per
+// band, the PRIM light register only. fixedcolormap (invuln/light-amp) overrides
+// per-distance light exactly as R_MapPlane does, so a band under it is unchanged.
+static const void*
+R_PlaneBandColormap
+( float		band_mid_row )
+{
+    int		yrow;
+    fixed_t	distance;
+    unsigned	index;
+
+    if (fixedcolormap)
+	return fixedcolormap;
+
+    yrow = (int)(band_mid_row + 0.5f);
+    if (yrow < 0) yrow = 0;
+    if (yrow >= viewheight) yrow = viewheight - 1;
+
+    distance = FixedMul(planeheight, yslope[yrow]);
+    index = distance >> LIGHTZSHIFT;
+    if (index >= MAXLIGHTZ)
+	index = MAXLIGHTZ - 1;
+    return planezlight[index];
+}
+
 // Emit ONE depth band as a quad: four corner U/V/INV_W at screen (xl|xr, yt*|yb*)
 // + flat + light, exactly as R_EmitRunPoly builds its single quad. x1/x2 are the
 // run's column span (shared by every band); only the Y edges + corner attrs differ.
@@ -1029,8 +1063,9 @@ R_EmitRunPoly
 
 	    for (k = 0; k < N; k++)
 	    {
-		float	bk1 = (k + 1 == N) ? wbot : (bk * f);
-		float	t0, t1, btl, btr, bbl, bbr;
+		float		bk1 = (k + 1 == N) ? wbot : (bk * f);
+		float		t0, t1, btl, btr, bbl, bbr;
+		const void*	bcm;
 
 		if (f > 1.0f) { if (bk1 > wbot) bk1 = wbot; }
 		else          { if (bk1 < wbot) bk1 = wbot; }
@@ -1040,8 +1075,15 @@ R_EmitRunPoly
 		btl = ytl + t0 * (ybl - ytl);  btr = ytr + t0 * (ybr - ytr);
 		bbl = ytl + t1 * (ybl - ytl);  bbr = ytr + t1 * (ybr - ytr);
 
+		// PER-BAND light: re-resolve the colormap at THIS band's mid screen
+		// row (vertical centre of its four corners) instead of inheriting the
+		// run's single mid-distance light, so a deep multi-band run graduates
+		// its light across bands and tracks software's per-row depth falloff.
+		// Adds no triangles -- the PRIM light register only.
+		bcm = R_PlaneBandColormap(0.25f * (btl + btr + bbl + bbr));
+
 		R_EmitPlaneBand(p.x1, p.x2, xl, xr, btl, btr, bbl, bbr,
-				p.flatlump, cm);
+				p.flatlump, bcm);
 		bk = bk1;
 	    }
 	}
