@@ -115,6 +115,14 @@ endif
 ifeq ($(PLANE_GEOM_TRACE),1)
 CFLAGS += -DPLANE_GEOM_TRACE=1
 endif
+# Optional marker-frame overrides for the geom trace (default 3200/3328 in source):
+#   PLANE_GEOM_TRACE=1 PLANE_GEOM_TRACE_FRAME=3200 PLANE_GEOM_TRACE_FRAME2=3328
+ifneq ($(PLANE_GEOM_TRACE_FRAME),)
+CFLAGS += -DPLANE_GEOM_TRACE_FRAME=$(PLANE_GEOM_TRACE_FRAME)
+endif
+ifneq ($(PLANE_GEOM_TRACE_FRAME2),)
+CFLAGS += -DPLANE_GEOM_TRACE_FRAME2=$(PLANE_GEOM_TRACE_FRAME2)
+endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
 CFLAGS += -I$(CURDIR)/libdragon/include

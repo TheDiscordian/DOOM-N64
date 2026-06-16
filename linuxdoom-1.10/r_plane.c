@@ -104,15 +104,27 @@ static int plane_uv_trace_polys_left = -1;  // armed each matching frame
 #if PLANE_GEOM_TRACE
 #include <math.h>               // floorf (trace float formatting)
 #include <libdragon.h>          // debugf -> ISViewer (flag-gated only)
+#include "n64_bench.h"          // N64Bench_FrameNo (marker-frame pairing)
+// Which BENCH marker frame(s) to dump. Keyed to N64Bench_FrameNo() exactly like
+// rdp_view.c's PLANE_UV_TRACE: the render whose COMMIT produces marker N sees
+// N64Bench_FrameNo() == N-1, so we dump when the counter is FRAME-1 to pair the
+// lines with `BENCH_MARK frame=FRAME`. 0 disables a slot.
 #ifndef PLANE_GEOM_TRACE_FRAME
-#define PLANE_GEOM_TRACE_FRAME 8 // dump on this R_DrawPlanes call (post-warmup)
+#define PLANE_GEOM_TRACE_FRAME 3200 // primary defect frame (red ceiling triangle)
+#endif
+#ifndef PLANE_GEOM_TRACE_FRAME2
+#define PLANE_GEOM_TRACE_FRAME2 3328 // second defect frame (nukage smear); 0=off
 #endif
 #ifndef PLANE_GEOM_TRACE_POLYS
-#define PLANE_GEOM_TRACE_POLYS 6 // dump at most this many runs that frame
+#define PLANE_GEOM_TRACE_POLYS 64 // dump at most this many runs that frame (high
+                                  // enough to reach CEILING polys -- floors emit
+                                  // first, ceilings later)
 #endif
-#ifndef framecount
-extern int framecount;          // shared with PLANE_UV_TRACE; guard double-decl
-#endif
+// True on the render that pairs with BENCH_MARK frame=FRAME (counter == FRAME-1).
+#define PGT_FRAME_HIT() \
+    ( (N64Bench_FrameNo() == (unsigned long)(PLANE_GEOM_TRACE_FRAME) - 1UL) \
+   || (PLANE_GEOM_TRACE_FRAME2 != 0 \
+       && N64Bench_FrameNo() == (unsigned long)(PLANE_GEOM_TRACE_FRAME2) - 1UL) )
 // Float -> int + signed milli-frac, same convention PLANE_UV_TRACE uses. Define
 // independently so the two traces compile in isolation (either flag alone).
 #ifndef IFLOORF
@@ -1041,14 +1053,14 @@ R_EmitRunPoly
     // PLANE_GEOM_TRACE_FRAME only. Dumps the run's screen coverage, the visplane's
     // true per-column extent at the run's columns (poly-vs-visplane delta), and the
     // boundary against the immediately-preceding run in the same island.
-    if (framecount == PLANE_GEOM_TRACE_FRAME)
+    if (PGT_FRAME_HIT())
     {
         if (pgt_runs_left < 0)          // first run seen this frame: arm + header
         {
             pgt_runs_left = PLANE_GEOM_TRACE_POLYS;
-            debugf("PGT_FRAME frame=%d centery=%d viewwidth=%d viewheight=%d "
+            debugf("PGT_FRAME frame=%lu centery=%d viewwidth=%d viewheight=%d "
                    "planeheight=%d\n",
-                   framecount, (int)centery, viewwidth, viewheight,
+                   N64Bench_FrameNo() + 1UL, (int)centery, viewwidth, viewheight,
                    (int)planeheight);
         }
 
@@ -1414,7 +1426,7 @@ static void R_EmitPlanePolys (visplane_t* pl)
 	pgt_island_maxx = xb;
 	pgt_prev_valid  = 0;
 	pgt_run_in_isl  = 0;
-	if (framecount == PLANE_GEOM_TRACE_FRAME)
+	if (PGT_FRAME_HIT())
 	    pgt_island_seq++;
 #endif
 
