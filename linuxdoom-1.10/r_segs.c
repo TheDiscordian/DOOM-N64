@@ -169,7 +169,11 @@ R_RenderMaskedSegRange
 			
     if (fixedcolormap)
 	dc_colormap = fixedcolormap;
-    
+
+    // texnum is constant across the column loop -- resolve its column tables
+    // once instead of paying R_GetColumn's per-tex work every column.
+    const texcol_t	tc_masked = R_GetColumnTex(texnum);
+
     // draw the columns
     for (dc_x = x1 ; dc_x <= x2 ; dc_x++)
     {
@@ -190,8 +194,8 @@ R_RenderMaskedSegRange
 	    dc_iscale = 0xffffffffu / (unsigned)spryscale;
 	    
 	    // draw the texture
-	    col = (column_t *)( 
-		(byte *)R_GetColumn(texnum,maskedtexturecol[dc_x]) -3);
+	    col = (column_t *)(
+		(byte *)R_GetColumnIn(&tc_masked,maskedtexturecol[dc_x]) -3);
 			
 	    R_DrawMaskedColumn (col);
 	    maskedtexturecol[dc_x] = MAXSHORT;
@@ -239,6 +243,17 @@ void R_RenderSegLoop (void)
     const int		l_midtexture = midtexture;
     const int		l_toptexture = toptexture;
     const int		l_bottomtexture = bottomtexture;
+    // Each tier's texture is constant across the whole column loop, so resolve
+    // its column-lookup tables ONCE here (texturecolumnlump[tex] /
+    // texturecolumnofs[tex] / texturewidthmask[tex]) instead of paying
+    // R_GetColumn's per-tex work -- the call, the two scattered Z_Malloc array
+    // indexes, and the width-mask lookup -- on every column. Only active tiers
+    // are resolved (inactive tex is 0 and never sampled), matching the original
+    // R_GetColumn call guard exactly.
+    texcol_t		tc_mid, tc_top, tc_bot;
+    if (l_midtexture)	tc_mid = R_GetColumnTex(l_midtexture);
+    if (l_toptexture)	tc_top = R_GetColumnTex(l_toptexture);
+    if (l_bottomtexture) tc_bot = R_GetColumnTex(l_bottomtexture);
     const int		l_maskedtexture = maskedtexture;
     const int		l_segtextured = segtextured;
     const int		l_viewheight = viewheight;
@@ -415,7 +430,7 @@ void R_RenderSegLoop (void)
 	    else
 #endif
 	    {
-	    dc_source = R_GetColumn(l_midtexture,texturecolumn);
+	    dc_source = R_GetColumnIn(&tc_mid,texturecolumn);
 	    l_colfunc ();
 	    }
 	    l_ceilingclip[l_rw_x] = l_viewheight;
@@ -453,7 +468,7 @@ void R_RenderSegLoop (void)
 		    else
 #endif
 		    {
-		    dc_source = R_GetColumn(l_toptexture,texturecolumn);
+		    dc_source = R_GetColumnIn(&tc_top,texturecolumn);
 		    l_colfunc ();
 		    }
 		    l_ceilingclip[l_rw_x] = mid;
@@ -503,7 +518,7 @@ void R_RenderSegLoop (void)
 		    else
 #endif
 		    {
-		    dc_source = R_GetColumn(l_bottomtexture,
+		    dc_source = R_GetColumnIn(&tc_bot,
 					    texturecolumn);
 		    l_colfunc ();
 		    }
