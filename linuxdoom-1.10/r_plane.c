@@ -619,7 +619,7 @@ R_MakeSpans
 // the worst case. Both run-fitter twins (emit + count) compute the SAME band count
 // from the SAME corner Ys, so the bench tessellation count tracks the emitted polys.
 #ifndef PLANE_INVW_RATIO
-#define PLANE_INVW_RATIO  2.0f
+#define PLANE_INVW_RATIO  4.0f
 #endif
 #ifndef PLANE_MAX_BANDS
 #define PLANE_MAX_BANDS   6
