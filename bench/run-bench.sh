@@ -164,7 +164,14 @@ echo "[bench] launching ares (timeout ${TIMEOUT}s)" >&2
 # same GDB port ([::1]:9123); with concurrent runs only the first wins the bind.
 # Bench runs never attach a debugger, so disable it per-invocation (CLI override
 # only -- the user's own ares config is untouched).
-setsid stdbuf -oL "$ARES" --setting DebugServer/Enabled=false \
+# timeout -s KILL: a SIGKILL-proof teardown backstop. ares is setsid'd into its
+# own session, so if run-bench.sh (or the agent that launched it) is HARD-killed
+# before the EXIT trap can run -- e.g. a subagent dying on an API error mid-run --
+# this timeout, which lives in that same detached session, still reaps ares at the
+# deadline instead of leaking the window forever. -s KILL because ares ignores
+# SIGTERM. Set a bit beyond the wait-loop's own TIMEOUT so the clean trap path wins
+# in the normal case and this only fires when the script is already gone.
+setsid stdbuf -oL timeout -s KILL "$(( TIMEOUT + 15 ))" "$ARES" --setting DebugServer/Enabled=false \
     --system "Nintendo 64" "$RUN_ROM" >"$ARES_LOG" 2>&1 &
 LAUNCH_PID=$!
 ARES_PGID="$LAUNCH_PID"
