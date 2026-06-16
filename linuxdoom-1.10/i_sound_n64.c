@@ -313,6 +313,28 @@ static boolean N64_EnsureSfxLoaded(int sfx_id)
         && sfx_cache[sfx_id].length > 0;
 }
 
+// Warm every real SFX into the cache up front (sound init), so the first time
+// a sound plays we never pay the W_CacheLumpNum cart-DMA + per-byte PCM convert
+// inside the per-frame audio timing bracket -- that lazy first-play path was the
+// 9-12k us worst-frame audio tail. Timing-only: the mixer reads the SAME cached
+// sample buffers; this only changes WHEN they load (init, not first play), never
+// WHICH samples play. N64_EnsureSfxLoaded is idempotent and self-guards bad ids
+// / missing lumps (returns false harmlessly), so a blanket warm is safe; the
+// per-tic S_StartSound path then always hits the loaded cache.
+static void N64_PrecacheSfx(void)
+{
+    int id;
+    int warmed = 0;
+
+    for (id = 1; id < NUMSFX; id++)
+    {
+        if (N64_EnsureSfxLoaded(id))
+            warmed++;
+    }
+
+    N64_DEBUGF("I_InitSound: pre-cached %d/%d SFX at init\n", warmed, NUMSFX - 1);
+}
+
 static void N64_ClearVoice(int voice)
 {
     voices[voice].active = false;
@@ -2559,6 +2581,11 @@ void I_InitSound(void)
         mixer_ch_set_limits(i, 16, 48000.0f, 0);
 
     memset(sfx_cache, 0, sizeof(sfx_cache));
+
+    // Warm the SFX cache up front so the cart-DMA + PCM-convert never lands
+    // inside the per-frame audio timing bracket on first play (the worst-frame
+    // audio tail). Timing-only: same buffers, loaded earlier.
+    N64_PrecacheSfx();
 
     if (!music_initialized)
         I_InitMusic();
