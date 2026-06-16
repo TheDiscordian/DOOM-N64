@@ -58,6 +58,19 @@ CFLAGS += -DPLANETESS_COUNT=1
 ifeq ($(PVS_PROBE),1)
 CFLAGS += -DPVS_PROBE=1
 endif
+# BAKEFAN_PROBE=1: one-off count-only go/no-go for the future native offline-baked
+# RDP renderer (DOOM 64's model: per-subsector floor/ceiling LEAF FANS instead of
+# runtime visplane trapezoid tessellation). Every bench frame, R_Subsector
+# (r_bsp.c) counts the leaf-fan triangles a bake WOULD emit -- (numsegs - 2),
+# clamp >=1 -- for each subsector whose floor and/or ceiling is actually drawn
+# (floorplane/ceilingplane != NULL, the same visibility the runtime planes use),
+# floor + ceiling separately. Reports mean + EXACT p95 on the BENCH_BAKEFAN line,
+# directly A/B-able against BENCH_PLANETESS (the runtime trapezoid-run tris the
+# bake would replace). NO render / NO geometry change (fingerprint unperturbed),
+# so it is OFF by default -- pass BAKEFAN_PROBE=1 on the make line for the probe run.
+ifeq ($(BAKEFAN_PROBE),1)
+CFLAGS += -DBAKEFAN_PROBE=1
+endif
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

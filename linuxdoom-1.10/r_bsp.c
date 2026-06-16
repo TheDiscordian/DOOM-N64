@@ -53,6 +53,14 @@ extern int	pvs_frame_visited;
 extern int	pvs_frame_cullable;
 #endif
 
+#ifdef BAKEFAN_PROBE
+// Count-only baked-leaf-fan probe accumulator (lives in r_main.c; R_SetupFrame
+// resets it, R_RenderPlayerView latches it via N64Bench_SetBakefanTris). For each
+// subsector whose floor and/or ceiling is drawn this frame, R_Subsector adds the
+// leaf-fan tris a bake WOULD emit -- (numsegs - 2) clamp >=1 -- per visible plane.
+extern int	bakefan_frame_tris;
+#endif
+
 
 
 seg_t*		curline;
@@ -559,7 +567,24 @@ void R_Subsector (int num)
     else
 	ceilingplane = NULL;
 		
-    R_AddSprites (frontsector);	
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan go/no-go: a native offline bake (DOOM 64's model)
+    // would draw this subsector's floor/ceiling as a LEAF FAN of (numsegs - 2)
+    // triangles -- a convex subsector of N edge-segs fans to N-2 tris (clamp >=1
+    // for degenerate 1-2 seg subsectors). Count floor + ceiling SEPARATELY, gated
+    // on EXACTLY the runtime's plane visibility (floorplane/ceilingplane != NULL --
+    // the same NULL the span renderer keys off), so the A/B vs BENCH_PLANETESS
+    // (the trapezoid-run tris the bake replaces) is fair. COUNT-ONLY: no baking,
+    // no rendering -- reads the live subsector seg count and accumulates.
+    {
+	int fan = count - 2;		// count == sub->numlines (edge segs)
+	if (fan < 1) fan = 1;
+	if (floorplane)   bakefan_frame_tris += fan;
+	if (ceilingplane) bakefan_frame_tris += fan;
+    }
+#endif
+
+    R_AddSprites (frontsector);
 
     while (count--)
     {

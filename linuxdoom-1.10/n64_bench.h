@@ -111,6 +111,14 @@ void N64Bench_SetPlanePolyTris(int polytris);
 void N64Bench_SetPvsCounts(int visited, int cullable);
 #endif
 
+#ifdef BAKEFAN_PROBE
+// Latch the count-only baked-leaf-fan go/no-go: the leaf-fan triangle total this
+// frame's drawn subsector floors/ceilings WOULD emit under a native offline bake
+// ((numsegs - 2) clamp >=1 per visible plane). Accumulated in r_bsp.c R_Subsector;
+// latched at the SetCounts call site (r_main.c). COUNT-ONLY -- perturbs no geometry.
+void N64Bench_SetBakefanTris(int tris);
+#endif
+
 // Called once per gametic from G_Ticker to advance scenario timing/phases.
 void N64Bench_TicHook(void);
 

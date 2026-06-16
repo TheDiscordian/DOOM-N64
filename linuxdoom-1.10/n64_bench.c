@@ -99,6 +99,13 @@ typedef struct
                              // for what a real PVS would cull. go/no-go for the
                              // PVS/occlusion bake. (r_bsp.c R_Subsector)
 #endif
+#ifdef BAKEFAN_PROBE
+    uint16_t bakefan_tris;   // count-only: leaf-fan tris this frame's DRAWN
+                             // subsector floors/ceilings WOULD emit under a native
+                             // offline bake ((numsegs-2) clamp >=1 per visible
+                             // plane). A/B vs plane_polytris (the runtime trapezoid
+                             // tessellation the bake replaces). r_bsp.c R_Subsector.
+#endif
     uint8_t  tics_ran;
     uint8_t  is_outlier;
 } bench_frame_t;
@@ -146,6 +153,9 @@ static uint16_t         cur_plane_polytris;	// count-only plane-poly tris this f
 #ifdef PVS_PROBE
 static uint16_t         cur_pvs_visited;	// count-only subsectors visited this frame
 static uint16_t         cur_pvs_cullable;	// count-only REJECT-cullable of those visited
+#endif
+#ifdef BAKEFAN_PROBE
+static uint16_t         cur_bakefan_tris;	// count-only baked-leaf-fan tris this frame
 #endif
 
 // Outlier (level-reload) frames: counted separately, kept out of tail stats.
@@ -209,6 +219,9 @@ void N64Bench_Init(void)
 #endif
 #ifdef PVS_PROBE
     cur_pvs_visited = cur_pvs_cullable = 0;
+#endif
+#ifdef BAKEFAN_PROBE
+    cur_bakefan_tris = 0;
 #endif
     outlier_frames = 0;
     outlier_max_us = 0;
@@ -328,6 +341,9 @@ void N64Bench_LoopBegin(void)
 #ifdef PVS_PROBE
     cur_pvs_visited = cur_pvs_cullable = 0;
 #endif
+#ifdef BAKEFAN_PROBE
+    cur_bakefan_tris = 0;
+#endif
     loop_start_ticks = get_ticks();
     loop_open = 1;
 }
@@ -420,6 +436,21 @@ void N64Bench_SetPvsCounts(int visited, int cullable)
         return;
     cur_pvs_visited  = (uint16_t)visited;
     cur_pvs_cullable = (uint16_t)cullable;
+}
+#endif
+
+#ifdef BAKEFAN_PROBE
+// Count-only latch for the native baked-leaf-fan go/no-go: the leaf-fan triangle
+// total this frame's DRAWN subsector floors/ceilings WOULD emit under an offline
+// bake ((numsegs - 2) clamp >=1 per visible plane), accumulated per-frame in
+// r_bsp.c R_Subsector. Directly A/B-able against the runtime trapezoid tessellation
+// (cur_plane_polytris). Latched at the SetCounts call site (r_main.c); separate
+// setter so the SetCounts path stays byte-identical when the flag is off.
+void N64Bench_SetBakefanTris(int tris)
+{
+    if (!loop_open)
+        return;
+    cur_bakefan_tris = (uint16_t)tris;
 }
 #endif
 
@@ -517,6 +548,9 @@ void N64Bench_LoopEnd(void)
 #ifdef PVS_PROBE
         f->pvs_visited  = cur_pvs_visited;
         f->pvs_cullable = cur_pvs_cullable;
+#endif
+#ifdef BAKEFAN_PROBE
+        f->bakefan_tris = cur_bakefan_tris;
 #endif
         f->tics_ran   = (uint8_t)cur_tics_ran;
         f->is_outlier = 0;
@@ -723,6 +757,39 @@ static unsigned long N64Bench_PlanePolyTrisP95(void)
 }
 #endif
 
+#ifdef BAKEFAN_PROBE
+// EXACT p95 of the per-frame baked-leaf-fan triangle count (count-only go/no-go
+// for the native offline-baked RDP renderer). Mirrors N64Bench_PlanePolyTrisP95:
+// counts are small integers, so bucket the value DIRECTLY (one bucket per tri
+// count, no quantization) for an exact p95. Counts beyond BENCH_HIST_BUCKETS
+// (4096) clamp to the overflow bucket -- the E1M1 subsector fan totals never
+// approach it.
+static unsigned long N64Bench_BakefanTrisP95(void)
+{
+    static unsigned long fhist[BENCH_HIST_BUCKETS];
+    unsigned long i, target, cum;
+
+    if (!bench_frame_count)
+        return 0;
+    memset(fhist, 0, sizeof(fhist));
+    for (i = 0; i < bench_frame_count; i++)
+    {
+        unsigned long b = bench_frames[i].bakefan_tris;
+        if (b >= BENCH_HIST_BUCKETS) b = BENCH_HIST_OVERFLOW;
+        fhist[b]++;
+    }
+    target = (bench_frame_count * 95UL + 99) / 100;
+    cum = 0;
+    for (i = 0; i < BENCH_HIST_BUCKETS; i++)
+    {
+        cum += fhist[i];
+        if (cum >= target)
+            return i;       // exact fan-tri count at the 95th percentile frame
+    }
+    return BENCH_HIST_OVERFLOW;
+}
+#endif
+
 #ifdef PVS_PROBE
 // EXACT p95 of the per-frame REJECT-cullable subsector count (count-only
 // PVS/occlusion go/no-go). Mirrors N64Bench_PlanePolyTrisP95: counts are small
@@ -827,6 +894,9 @@ static void N64Bench_ReportPhases(void)
 #ifdef PLANETESS_COUNT
     unsigned long long plane_polytris_sum = 0;
 #endif
+#ifdef BAKEFAN_PROBE
+    unsigned long long bakefan_tris_sum = 0;
+#endif
 #ifdef PVS_PROBE
     unsigned long long pvs_visited_sum = 0, pvs_cullable_sum = 0;
 #endif
@@ -878,6 +948,9 @@ static void N64Bench_ReportPhases(void)
         tri_sum       += f->tris;
 #ifdef PLANETESS_COUNT
         plane_polytris_sum += f->plane_polytris;
+#endif
+#ifdef BAKEFAN_PROBE
+        bakefan_tris_sum += f->bakefan_tris;
 #endif
 #ifdef PVS_PROBE
         pvs_visited_sum  += f->pvs_visited;
@@ -954,6 +1027,18 @@ static void N64Bench_ReportPhases(void)
     debugf("BENCH_PLANETESS mean_plane_polytris=%lu p95_plane_polytris=%lu\n",
            (unsigned long)(plane_polytris_sum / bench_frame_count),
            N64Bench_PlanePolyTrisP95());
+#endif
+#ifdef BAKEFAN_PROBE
+    // DECISIVE go/no-go for the native offline-baked RDP renderer (per-subsector
+    // floor/ceiling LEAF FANS vs runtime visplane trapezoid tessellation): mean +
+    // EXACT p95 of the per-frame leaf-fan triangle count a bake WOULD emit
+    // ((numsegs-2) clamp >=1 per DRAWN floor/ceiling). Read it directly against
+    // the BENCH_PLANETESS line above (the runtime trapezoid-run tris the bake
+    // replaces): FEWER here -> the bake's RSP triangle-setup VOLUME case holds;
+    // MORE -> per-subsector fans cost more setup than the merged trapezoid runs.
+    debugf("BENCH_BAKEFAN mean_tris=%lu p95_tris=%lu\n",
+           (unsigned long)(bakefan_tris_sum / bench_frame_count),
+           N64Bench_BakefanTrisP95());
 #endif
 #ifdef PVS_PROBE
     // DECISIVE go/no-go for the PVS/occlusion bake: of the subsectors the BSP

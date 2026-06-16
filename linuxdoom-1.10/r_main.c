@@ -66,6 +66,18 @@ int		pvs_frame_visited = 0;
 int		pvs_frame_cullable = 0;
 #endif
 
+#ifdef BAKEFAN_PROBE
+// Per-frame leaf-fan triangle accumulator (count-only go/no-go for the native
+// offline-baked RDP renderer: per-subsector floor/ceiling LEAF FANS instead of
+// runtime visplane trapezoid tessellation). r_bsp.c R_Subsector adds, for each
+// subsector whose floor and/or ceiling is drawn this frame (floorplane/
+// ceilingplane != NULL -- the SAME visibility the runtime planes use), the fan
+// tris a bake WOULD emit = (numsegs - 2), clamp >=1, floor + ceiling separately.
+// Reset in R_SetupFrame, latched at the SetCounts call site below. COUNT-ONLY --
+// reads live subsector geometry, emits nothing, perturbs no fingerprint.
+int		bakefan_frame_tris = 0;
+#endif
+
 
 
 
@@ -984,6 +996,12 @@ void R_SetupFrame (player_t* player)
     pvs_frame_visited = 0;
     pvs_frame_cullable = 0;
 #endif
+
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan probe: reset the per-frame fan-tri accumulator
+    // before the BSP walk re-fills it in R_Subsector. Pure measurement.
+    bakefan_frame_tris = 0;
+#endif
 	
     if (player->fixedcolormap)
     {
@@ -1115,6 +1133,12 @@ void R_RenderPlayerView (player_t* player)
     // VISITED and REJECT-cullable totals accumulated during this frame's BSP
     // walk (r_bsp.c R_Subsector). Pure measurement -- perturbs no geometry.
     N64Bench_SetPvsCounts(pvs_frame_visited, pvs_frame_cullable);
+#endif
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan go/no-go: latch the per-frame fan-tri total
+    // accumulated during this frame's BSP walk (r_bsp.c R_Subsector). Directly
+    // A/B-able against BENCH_PLANETESS. Pure measurement -- perturbs no geometry.
+    N64Bench_SetBakefanTris(bakefan_frame_tris);
 #endif
 #else
     R_DrawMasked ();
