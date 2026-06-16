@@ -91,7 +91,23 @@ pull — fixed in `0951cb3`).
 - Both the RDP wall path and the RDP plane path land at **~parity** with the
   already-optimized software renderer at full fidelity (planes-only ≈ 19417 / 31456).
   Realistic goal: correctness + ~parity + shaving the tail, not 60.
-- DOOM 64 itself ran at 30fps; its floors were **offline-baked per-subsector convex
-  leaf fans** (no per-frame tessellation) — the runtime visplane→polygon path here
-  pays a tessellation cost that bake avoids. That's the lever if the tail is ever
-  attacked seriously.
+- The per-frame visplane→trapezoid tessellation is **NOT** a meaningful tail cost:
+  sub-timers measure it at ~2µs, and full-early-returning `R_DrawPlanes` leaves the
+  `planes` bracket at ~1644µs with **total frame time unchanged**. **Offline-baking
+  the tessellation (DOOM 64's leaf-fans) is a dead lever** — it saves ~2µs and adds
+  +57% triangles. The ~1644µs charged to `planes` is an **async RDP/RDRAM stall**
+  (the VR4300 blocking on the GPU) attributed to whichever bracket is open; the real
+  tail driver is **CPU↔RDP serialization**, not any single CPU phase. (Proven by the
+  `doom-three-levers` workflow, 2026-06-16.)
+
+## Profiling caveat — `BPH_*` phase timers are WALL-CLOCK, not CPU counters
+The `BPH_*` brackets measure wall-clock between `PhaseSwitch` boundaries, so an
+**async RDP/RDRAM stall** (CPU blocked on the GPU) is charged to whichever bracket
+happens to be open — NOT to the work that caused it. **Before targeting any phase,
+prove it is real CPU work: sub-bracket it AND no-op its body — if the phase time
+survives the body no-op (frame time unchanged), it is a stall-attribution artifact,
+not optimizable work in that phase.** Two phases proven artifactual this way: `planes`
+(~1644µs survives a full `R_DrawPlanes` early-return) and `hud` (a derived
+`display_wall − Σphases` residual that absorbs cumulative `get_ticks()` slippage across
+the dozens of per-seg `PhaseSwitch` boundaries). The earlier "broad multi-phase CPU
+swell" tail read mislabels these — frame time is real, the per-phase attribution is not.
