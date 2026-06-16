@@ -687,6 +687,104 @@ R_PlaneCornerAttr
     *invw = dyrows;     // dyrows >= 0.03125 (guarded above) -> 1/INV_W bounded
 }
 
+// ---------------------------------------------------------------------------
+// SHARED-EDGE top-corner construction (the coverage/seam fix).
+//
+// A run [xa..xb] lives inside a covered island [islx_lo..islx_hi]. Its top-edge
+// corners sit at the pixel EDGES xa and xb+1 (half a column outside the end
+// column centres). Two cases per side:
+//
+//   * INTERNAL split boundary -- a covered column exists on the outward side
+//     (xa > islx_lo on the left, xb < islx_hi on the right). The boundary is
+//     SHARED with the neighbouring run, so the corner Y MUST be a value both
+//     runs compute identically: the visplane edge AT the pixel boundary, i.e.
+//     the midpoint of the two columns straddling it, 0.5*(top[c]+top[c+1]).
+//     Run N's right corner 0.5*(top[xb]+top[xb+1]) == run N+1's left corner
+//     0.5*(top[xa-1]+top[xa]) when xa == xb+1 -> the two quads meet EXACTLY,
+//     no +-0.5-row seam. (The OLD code extrapolated each boundary corner half
+//     a pixel PAST the run independently, so adjacent corners never coincided.)
+//
+//   * TRUE island edge -- no covered column outward (xa == islx_lo / xb ==
+//     islx_hi). Keep the half-pixel outward extrapolation along the end
+//     column's local step (so the rasterizer's interpolation passes through
+//     the sampled value at the end column's centre), but CLAMP its outward
+//     reach to <= PLANETESS_SPLIT_DEVY rows past top[] at that column, so the
+//     extrapolation can never over-shoot a steep edge by tens of rows.
+//
+// The bottom edge is left to the caller's original construction (it runs to
+// screen bottom; its extrapolation is benign and unchanged).
+static void
+R_PlaneRunTopCorners
+( const byte*	top,
+  int		xa,
+  int		xb,
+  int		islx_lo,
+  int		islx_hi,
+  float*	ytl,
+  float*	ytr )
+{
+    float	tl0, tr0;
+
+    // -- left-top corner at column xa --
+    if (xa > islx_lo)
+    {
+	// shared internal boundary with the previous run's RIGHT corner
+	tl0 = 0.5f * ((float)top[xa - 1] + (float)top[xa]);
+    }
+    else if (xb > xa)
+    {
+	// true island left edge: half-pixel outward extrapolation, clamped so
+	// the outward reach past top[xa] never exceeds the split tolerance.
+	float lim = (float)top[xa];
+	tl0 = (float)top[xa] - 0.5f * ((float)top[xa + 1] - (float)top[xa]);
+	if (tl0 < lim - PLANETESS_SPLIT_DEVY) tl0 = lim - PLANETESS_SPLIT_DEVY;
+	if (tl0 > lim + PLANETESS_SPLIT_DEVY) tl0 = lim + PLANETESS_SPLIT_DEVY;
+    }
+    else
+    {
+	tl0 = (float)top[xa];		// width-1 island: column's own edge
+    }
+
+    // -- right-top corner at column xb --
+    if (xb < islx_hi)
+    {
+	// shared internal boundary with the next run's LEFT corner
+	tr0 = 0.5f * ((float)top[xb] + (float)top[xb + 1]);
+    }
+    else if (xb > xa)
+    {
+	float lim = (float)top[xb];
+	tr0 = (float)top[xb] + 0.5f * ((float)top[xb] - (float)top[xb - 1]);
+	if (tr0 < lim - PLANETESS_SPLIT_DEVY) tr0 = lim - PLANETESS_SPLIT_DEVY;
+	if (tr0 > lim + PLANETESS_SPLIT_DEVY) tr0 = lim + PLANETESS_SPLIT_DEVY;
+    }
+    else
+    {
+	tr0 = (float)top[xb];
+    }
+
+    *ytl = tl0;
+    *ytr = tr0;
+}
+
+// Does run [xa..xb]'s TOP edge step too steeply to be ONE trapezoid? The
+// per-column deviation scan only runs for width >= 3 (xb > xa+1); a width-2 run
+// is normally taken as exact, but if top[] jumps hard across its two columns the
+// single lerped top edge slices through the wall on one side and leaves floor
+// short on the other (the +-12-row over-shoot at a steep step). This forces the
+// split-scan to engage for such width-2 runs too, so each emitted piece tracks
+// the true visplane within tolerance. Returns nonzero => take the split scan.
+static int
+R_PlaneTopStepSteep
+( const byte*	top,
+  int		xa,
+  int		xb )
+{
+    float d = (float)top[xb] - (float)top[xa];
+    if (d < 0.0f) d = -d;
+    return d > PLANETESS_SPLIT_DEVY;
+}
+
 #if PLANE_UV_TRACE
 // GROUND TRUTH for the self-trace: R_MapPlane's EXACT per-pixel integer math at
 // an ARBITRARY screen pixel (xs,ys). Returns the masked texel (s,t)&63 the
@@ -737,6 +835,8 @@ R_EmitRunPoly
   const byte*	bottom,
   int		xa,
   int		xb,
+  int		islx_lo,
+  int		islx_hi,
   int		flatlump,
   const void*	cm )
 {
@@ -745,21 +845,19 @@ R_EmitRunPoly
     float	xl = (float)xa;
     float	xr = (float)xb + 1.0f;      // right SCREEN edge
 
-    // Corner Y edges, extrapolated half a pixel outward (identical construction
-    // to R_CountIslandRuns / DL_EmitRunPiece): the rasterizer's interpolation
-    // then passes through the sampled edge values at the end columns' centers.
+    // TOP-edge corners: shared-boundary construction (internal split boundaries
+    // get the SHARED visplane midpoint so adjacent runs coincide -- no seam --
+    // and true island edges use the clamped half-pixel extrapolation). BOTTOM
+    // edge keeps its original outward extrapolation (it runs to screen bottom).
+    R_PlaneRunTopCorners(top, xa, xb, islx_lo, islx_hi, &ytl, &ytr);
     {
-	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
 	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
 
 	if (xb > xa)
 	{
-	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
-	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
 	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
 	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
 	}
-	ytl = tl0;  ytr = tr0;
 	ybl = bl0;  ybr = br0;
     }
     // Keep each edge's screen span strictly positive (degenerate clip steps).
@@ -1026,6 +1124,8 @@ R_EmitIslandRuns
   const byte*	bottom,
   int		xa,
   int		xb,
+  int		islx_lo,
+  int		islx_hi,
   int		depth,
   int		flatlump,
   const void*	cm )
@@ -1034,22 +1134,23 @@ R_EmitIslandRuns
     float	width = (float)(xb + 1 - xa);
     int		x;
 
+    // Shared-boundary TOP corners (seam fix) + original BOTTOM extrapolation.
+    R_PlaneRunTopCorners(top, xa, xb, islx_lo, islx_hi, &ytl, &ytr);
     {
-	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
 	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
 
 	if (xb > xa)
 	{
-	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
-	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
 	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
 	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
 	}
-	ytl = tl0;  ytr = tr0;
 	ybl = bl0;  ybr = br0;
     }
 
-    if (xb > xa + 1)
+    // Run the per-column deviation scan for width >= 3 OR for a width-2 run
+    // whose top edge steps too steeply to be one trapezoid (the +-12-row
+    // over-shoot fix): a hard step across a width-2 run must be split per column.
+    if (xb > xa + 1 || (xb > xa && R_PlaneTopStepSteep(top, xa, xb)))
     {
 	for (x = xa; x <= xb; x++)
 	{
@@ -1065,14 +1166,16 @@ R_EmitIslandRuns
 		&& depth < 10)
 	    {
 		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
-		R_EmitIslandRuns(top, bottom, xa, xm, depth + 1, flatlump, cm);
-		R_EmitIslandRuns(top, bottom, xm + 1, xb, depth + 1, flatlump, cm);
+		R_EmitIslandRuns(top, bottom, xa, xm, islx_lo, islx_hi,
+				 depth + 1, flatlump, cm);
+		R_EmitIslandRuns(top, bottom, xm + 1, xb, islx_lo, islx_hi,
+				 depth + 1, flatlump, cm);
 		return;
 	    }
 	}
     }
 
-    R_EmitRunPoly(top, bottom, xa, xb, flatlump, cm);
+    R_EmitRunPoly(top, bottom, xa, xb, islx_lo, islx_hi, flatlump, cm);
 }
 
 // Resolve the run's light table at its representative (mid) distance -- the same
@@ -1144,7 +1247,7 @@ static void R_EmitPlanePolys (visplane_t* pl)
 #endif
 
 	cm = R_PlaneRunColormap(pl->top, pl->bottom, xa, xb);
-	R_EmitIslandRuns(pl->top, pl->bottom, xa, xb, 0, flatlump, cm);
+	R_EmitIslandRuns(pl->top, pl->bottom, xa, xb, xa, xb, 0, flatlump, cm);
     }
 }
 #endif // N64
@@ -1318,36 +1421,37 @@ R_CountIslandRuns
   const byte*	bottom,
   int		xa,
   int		xb,
+  int		islx_lo,
+  int		islx_hi,
   int		depth )
 {
     float	ytl, ytr, ybl, ybr;	// corner Y edges (ybot is bottom+1)
     float	width = (float)(xb + 1 - xa);
     int		x;
 
-    // Corner attributes, extrapolated half a pixel outward along each end
-    // column's local per-column step -- identical construction to
-    // DL_EmitRunPiece. A width-1 island gets the column's own constant edges.
+    // Corner Y edges -- MUST match R_EmitIslandRuns/R_EmitRunPoly exactly so the
+    // count equals what is emitted (fingerprint/tessellation stays consistent).
+    // TOP edge: shared-boundary construction (seam fix); BOTTOM: original half-
+    // pixel outward extrapolation. A width-1 island gets the column's own edges.
+    R_PlaneRunTopCorners(top, xa, xb, islx_lo, islx_hi, &ytl, &ytr);
     {
-	float tl0 = (float)top[xa],            tr0 = (float)top[xb];
 	float bl0 = (float)bottom[xa] + 1.0f,  br0 = (float)bottom[xb] + 1.0f;
 
 	if (xb > xa)
 	{
-	    tl0 -= 0.5f * ((float)top[xa + 1] - tl0);
-	    tr0 += 0.5f * (tr0 - (float)top[xb - 1]);
 	    bl0 -= 0.5f * (((float)bottom[xa + 1] + 1.0f) - bl0);
 	    br0 += 0.5f * (br0 - ((float)bottom[xb - 1] + 1.0f));
 	}
-	ytl = tl0;  ytr = tr0;
 	ybl = bl0;  ybr = br0;
     }
 
     // Deviation scan: linear-interp each edge across the run and compare to the
     // captured per-column values; split at the FIRST column whose top or bottom
-    // edge deviates beyond PLANETESS_SPLIT_DEVY. Width-1/2 islands are exact by
-    // construction (the lerp through two extrapolated corners passes through
-    // both column samples), so they skip the scan and terminate the recursion.
-    if (xb > xa + 1)
+    // edge deviates beyond PLANETESS_SPLIT_DEVY. Width-1/2 islands are normally
+    // exact by construction, but a width-2 run whose TOP edge steps too steeply
+    // must ALSO be split (matches R_EmitIslandRuns -- the +-12-row over-shoot
+    // fix), else the emitted tessellation would diverge from the count.
+    if (xb > xa + 1 || (xb > xa && R_PlaneTopStepSteep(top, xa, xb)))
     {
 	for (x = xa; x <= xb; x++)
 	{
@@ -1366,8 +1470,10 @@ R_CountIslandRuns
 		// non-empty so the recursion always shrinks (exactly the
 		// midpoint rule DL_EmitRunPiece uses).
 		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
-		return R_CountIslandRuns(top, bottom, xa, xm, depth + 1)
-		     + R_CountIslandRuns(top, bottom, xm + 1, xb, depth + 1);
+		return R_CountIslandRuns(top, bottom, xa, xm,
+					 islx_lo, islx_hi, depth + 1)
+		     + R_CountIslandRuns(top, bottom, xm + 1, xb,
+					 islx_lo, islx_hi, depth + 1);
 	    }
 	}
     }
@@ -1413,7 +1519,8 @@ int R_CountPlanePolyTris (void)
 		x++;
 	    xb = x - 1;
 
-	    total_runs += R_CountIslandRuns(pl->top, pl->bottom, xa, xb, 0);
+	    total_runs += R_CountIslandRuns(pl->top, pl->bottom, xa, xb,
+					    xa, xb, 0);
 	}
     }
 
