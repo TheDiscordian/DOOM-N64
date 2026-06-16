@@ -1305,8 +1305,21 @@ R_EmitIslandRuns
     // Run the per-column deviation scan for width >= 3 OR for a width-2 run
     // whose top edge steps too steeply to be one trapezoid (the +-12-row
     // over-shoot fix): a hard step across a width-2 run must be split per column.
+    //
+    // MAX-DEVIATION SPLIT (Ramer-Douglas-Peucker): split at the column of
+    // GREATEST edge deviation, not the first deviating column. The old
+    // first-deviation rule peeled one narrow piece off the left per recursion
+    // level, so a wide island with a curved (non-monotonic) top/bottom edge
+    // needed O(width) levels -- it hit the depth<10 cap and emitted the wide
+    // remainder as ONE trapezoid whose straight edges missed the real visplane
+    // by 14-24 rows (the stray-triangle / floor-smear / wall-pull defects on
+    // frames 3200/3328/4096). Bisecting at the worst-error column converges in
+    // O(log width) levels, so the cap is never the limiter for these runs.
     if (xb > xa + 1 || (xb > xa && R_PlaneTopStepSteep(top, xa, xb)))
     {
+	float	maxdev = 0.0f;
+	int	xmax   = -1;
+
 	for (x = xa; x <= xb; x++)
 	{
 	    float f  = ((float)x + 0.5f - (float)xa) / width;
@@ -1316,17 +1329,21 @@ R_EmitIslandRuns
 	    float dB = ((float)bottom[x] + 1.0f) - lb;
 	    float aT = (dT < 0.0f) ? -dT : dT;
 	    float aB = (dB < 0.0f) ? -dB : dB;
+	    float a  = (aT > aB) ? aT : aB;
 
-	    if ((aT > PLANETESS_SPLIT_DEVY || aB > PLANETESS_SPLIT_DEVY)
-		&& depth < 10)
-	    {
-		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
-		R_EmitIslandRuns(top, bottom, xa, xm, islx_lo, islx_hi,
-				 depth + 1, flatlump, cm);
-		R_EmitIslandRuns(top, bottom, xm + 1, xb, islx_lo, islx_hi,
-				 depth + 1, flatlump, cm);
-		return;
-	    }
+	    if (a > maxdev) { maxdev = a; xmax = x; }
+	}
+
+	if (maxdev > PLANETESS_SPLIT_DEVY && depth < 10)
+	{
+	    // Split at the worst-error column; clamp so both halves are non-empty
+	    // (a max at xa would otherwise make the left half empty).
+	    int xm = (xmax >= xb) ? (xb - 1) : ((xmax > xa) ? xmax : xa);
+	    R_EmitIslandRuns(top, bottom, xa, xm, islx_lo, islx_hi,
+			     depth + 1, flatlump, cm);
+	    R_EmitIslandRuns(top, bottom, xm + 1, xb, islx_lo, islx_hi,
+			     depth + 1, flatlump, cm);
+	    return;
 	}
     }
 
@@ -1601,13 +1618,19 @@ R_CountIslandRuns
     }
 
     // Deviation scan: linear-interp each edge across the run and compare to the
-    // captured per-column values; split at the FIRST column whose top or bottom
-    // edge deviates beyond PLANETESS_SPLIT_DEVY. Width-1/2 islands are normally
-    // exact by construction, but a width-2 run whose TOP edge steps too steeply
-    // must ALSO be split (matches R_EmitIslandRuns -- the +-12-row over-shoot
-    // fix), else the emitted tessellation would diverge from the count.
+    // captured per-column values. MUST match R_EmitIslandRuns EXACTLY (same
+    // max-deviation split) so the count equals the emitted poly count. Split at
+    // the column of GREATEST top/bottom deviation (Ramer-Douglas-Peucker), not
+    // the first deviating column -- the old first-deviation rule needed O(width)
+    // recursion levels for a curved edge and hit the depth<10 cap, emitting a
+    // wide degenerate trapezoid (see R_EmitIslandRuns). Width-1/2 islands are
+    // normally exact by construction, but a width-2 run whose TOP edge steps too
+    // steeply must ALSO be split (the +-12-row over-shoot fix).
     if (xb > xa + 1 || (xb > xa && R_PlaneTopStepSteep(top, xa, xb)))
     {
+	float	maxdev = 0.0f;
+	int	xmax   = -1;
+
 	for (x = xa; x <= xb; x++)
 	{
 	    float f  = ((float)x + 0.5f - (float)xa) / width;
@@ -1617,19 +1640,20 @@ R_CountIslandRuns
 	    float dB = ((float)bottom[x] + 1.0f) - lb;
 	    float aT = (dT < 0.0f) ? -dT : dT;
 	    float aB = (dB < 0.0f) ? -dB : dB;
+	    float a  = (aT > aB) ? aT : aB;
 
-	    if ((aT > PLANETESS_SPLIT_DEVY || aB > PLANETESS_SPLIT_DEVY)
-		&& depth < 10)
-	    {
-		// Split at the first deviating column; keep both halves
-		// non-empty so the recursion always shrinks (exactly the
-		// midpoint rule DL_EmitRunPiece uses).
-		int xm = (x >= xb) ? (xb - 1) : ((x > xa) ? x : xa);
-		return R_CountIslandRuns(top, bottom, xa, xm,
-					 islx_lo, islx_hi, depth + 1)
-		     + R_CountIslandRuns(top, bottom, xm + 1, xb,
-					 islx_lo, islx_hi, depth + 1);
-	    }
+	    if (a > maxdev) { maxdev = a; xmax = x; }
+	}
+
+	if (maxdev > PLANETESS_SPLIT_DEVY && depth < 10)
+	{
+	    // Split at the worst-error column; keep both halves non-empty so the
+	    // recursion always shrinks (matches R_EmitIslandRuns exactly).
+	    int xm = (xmax >= xb) ? (xb - 1) : ((xmax > xa) ? xmax : xa);
+	    return R_CountIslandRuns(top, bottom, xa, xm,
+				     islx_lo, islx_hi, depth + 1)
+		 + R_CountIslandRuns(top, bottom, xm + 1, xb,
+				     islx_lo, islx_hi, depth + 1);
 	}
     }
 
