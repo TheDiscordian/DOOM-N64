@@ -91,23 +91,33 @@ pull — fixed in `0951cb3`).
 - Both the RDP wall path and the RDP plane path land at **~parity** with the
   already-optimized software renderer at full fidelity (planes-only ≈ 19417 / 31456).
   Realistic goal: correctness + ~parity + shaving the tail, not 60.
-- The per-frame visplane→trapezoid tessellation is **NOT** a meaningful tail cost:
-  sub-timers measure it at ~2µs, and full-early-returning `R_DrawPlanes` leaves the
-  `planes` bracket at ~1644µs with **total frame time unchanged**. **Offline-baking
-  the tessellation (DOOM 64's leaf-fans) is a dead lever** — it saves ~2µs and adds
-  +57% triangles. The ~1644µs charged to `planes` is an **async RDP/RDRAM stall**
-  (the VR4300 blocking on the GPU) attributed to whichever bracket is open; the real
-  tail driver is **CPU↔RDP serialization**, not any single CPU phase. (Proven by the
-  `doom-three-levers` workflow, 2026-06-16.)
+- The per-frame visplane→trapezoid tessellation IS real, optimizable CPU work —
+  **build-verified** (arbitration, 2026-06-16): a no-op `R_DrawPlanes` (md5-confirmed
+  changed binary, RDP plane tris→0, `RDRAWPLANES NOOP` logged) collapses the `planes`
+  bracket 1646→6µs **and drops total frame avg 18725→16734 / p95 29920→24352**, and the
+  bracket scales with visplane count (~250µs/visplane: vp17→3343µs, vp28→7173µs; flat
+  ~6µs at all vp in the no-op). So **reducing per-visplane plane work is a genuine
+  ~1640µs-mean / ~4800µs-p95 lever** — the cost is the recursive `R_EmitIslandRuns`
+  run-fitter + the per-visplane `W_CacheLumpNum`/`Z_ChangeTag` in `R_DrawPlanes`'s loop.
+  NOT enough for 60fps alone (planes fully removed still left p95 24352µs — the software
+  `seg_rast` walls dominate). Attack it by caching the per-visplane lump lookup (flats
+  repeat across visplanes), a cheaper run-fitter, or an offline bake (DOOM 64's
+  leaf-fans; +57% tris but the tail is NOT RSP-volume-bound, so it may still win).
 
 ## Profiling caveat — `BPH_*` phase timers are WALL-CLOCK, not CPU counters
-The `BPH_*` brackets measure wall-clock between `PhaseSwitch` boundaries, so an
-**async RDP/RDRAM stall** (CPU blocked on the GPU) is charged to whichever bracket
-happens to be open — NOT to the work that caused it. **Before targeting any phase,
-prove it is real CPU work: sub-bracket it AND no-op its body — if the phase time
-survives the body no-op (frame time unchanged), it is a stall-attribution artifact,
-not optimizable work in that phase.** Two phases proven artifactual this way: `planes`
-(~1644µs survives a full `R_DrawPlanes` early-return) and `hud` (a derived
-`display_wall − Σphases` residual that absorbs cumulative `get_ticks()` slippage across
-the dozens of per-seg `PhaseSwitch` boundaries). The earlier "broad multi-phase CPU
-swell" tail read mislabels these — frame time is real, the per-phase attribution is not.
+The `BPH_*` brackets measure wall-clock between `PhaseSwitch` boundaries, so an async
+RDP/RDRAM stall (CPU blocked on the GPU) *would* be charged to whichever bracket is open,
+NOT to the work that caused it. **Before targeting OR dismissing any phase, prove what it
+is: sub-bracket it AND no-op its body in a BUILD-VERIFIED binary — the ROM md5 MUST differ
+and you MUST confirm the behaviour actually changed (e.g. the output visibly changes / a
+load-time debugf prints). If the phase time then collapses and total frame time drops, it
+is real CPU work; if it survives the no-op with frame time unchanged, it is a
+stall-attribution artifact.** WORKED CAUTION: an early agent wrongly called `planes` an
+async stall because a no-op left the bracket at ~1644µs with frame time unchanged — but
+that build had hit the `BENCH_FORCE_PLANES_ONLY`-without-`BENCH_FORCE_RDP` silent-
+all-software trap, so the no-op never took effect (always confirm md5 changed first). A
+verified no-op proved `planes` is real CPU work (above). Measured async RDP wait in the
+ship config is only ~9µs/frame (`RDPWAIT_PROBE`), buffer-flip spin = 0 iterations — there
+is **no meaningful CPU↔RDP stall to overlap**; the present seam is already fully
+overlapped, and the p95 tail is genuinely CPU-bound (`seg_rast` ~45% software walls, then
+audio / hud / bsp_walk / planes).
