@@ -1238,12 +1238,25 @@ static void DL_MarkInFlight(int texnum)
 // reload-survival lesson (DEFECTS.md Stage-3) applies: a slot whose raw the zone
 // reclaimed (NULLs the back-reference) re-copies on next touch, and DL_BeginFrame
 // resets the generation stamps so nothing crosses a P_SetupLevel wrongly.
-#define DL_FLAT_BYTES   4096    // 64x64 CI8
+// The source flat lump is 64x64 CI8 (4096 B). A 64-wide CI8 tile fits only
+// DL_TMEM_HALF/64 = 32 rows in the lower TMEM half (the master TLUT owns the
+// upper half), so the full 64-row flat does NOT load at once -- the old 32-row
+// V-window left the unloaded half sampling garbage on tall floor polys. We now
+// V-DECIMATE the flat to 64x32 (out[k] = in[2k]) so the WHOLE flat is 2 KB and
+// fully TMEM-resident; the floor draw halves its per-vertex V (period 32 == the
+// flat's 64-world period) so the decimated tile maps back exactly. Decimation
+// (not box-filter) because CI8 is palette indices -- averaging indices is wrong.
+#define DL_FLAT_SRC_W   64      // source lump width (CI8 texels per row)
+#define DL_FLAT_SRC_H   64      // source lump height (rows)
+#define DL_FLAT_SRC_BYTES (DL_FLAT_SRC_W * DL_FLAT_SRC_H)   // 4096
+#define DL_FLAT_W       64      // stored block width  (unchanged)
+#define DL_FLAT_H       32      // stored block height (V-decimated 64->32)
+#define DL_FLAT_BYTES   (DL_FLAT_W * DL_FLAT_H)             // 2048 -> fits TMEM
 
 typedef struct
 {
     void*    raw;       // Z_Malloc'd allocation (back-referenced by zone)
-    byte*    block;     // 8-byte-aligned 64x64 row-major CI8 view into raw
+    byte*    block;     // 8-byte-aligned 64x32 row-major CI8 view into raw
     uint32_t lastuse;   // present generation of the last DL_FlatMarkInFlight
     uint8_t  pinned;    // currently PU_STATIC for an in-flight window
 } dl_flat_t;
@@ -1263,13 +1276,15 @@ static void DL_InitFlatCache(void)
 }
 
 // Produce (or fetch) the row-major CI8 block for a flat index (lump-firstflat).
-// Copies the flat lump bytes once, caches PU_STATIC, returns the 8-byte-aligned
-// block (always 64x64). NULL on a bad index or alloc failure.
+// V-DECIMATES the 64x64 source lump to a 64x32 block once (out row k <- src row
+// 2k), caches PU_STATIC, returns the 8-byte-aligned block (always 64x32 = 2 KB,
+// fully TMEM-resident). NULL on a bad index or alloc failure.
 static byte* DL_FlatBlock(int flatidx)
 {
     dl_flat_t*  slot;
     byte*       block;
     const byte* src;
+    int         k;
 
     if (flatidx < 0 || flatidx >= numflats)
         return NULL;
@@ -1294,9 +1309,11 @@ static byte* DL_FlatBlock(int flatidx)
         return NULL;
     block = (byte*)(((uintptr_t)slot->raw + 7) & ~(uintptr_t)7);
 
-    // Copy the flat lump bytes (already row-major CI8). Cache PU_CACHE during
-    // the copy then writeback; the block stays PU_STATIC (slot->raw) so the
-    // copy source can be released immediately.
+    // V-decimate the 64x64 source lump (row-major CI8) into the 64x32 block:
+    // out row k <- src row 2k (DL_FLAT_SRC_W bytes each). Index DECIMATION, not
+    // box-filter -- CI8 bytes are palette indices, so averaging them is wrong.
+    // Cache the source PU_CACHE during the copy; the block stays PU_STATIC
+    // (slot->raw) so the copy source can be released immediately.
     src = (const byte*)W_CacheLumpNum(firstflat + flatidx, PU_CACHE);
     if (!src)
     {
@@ -1304,7 +1321,10 @@ static byte* DL_FlatBlock(int flatidx)
         slot->raw = NULL;
         return NULL;
     }
-    memcpy(block, src, DL_FLAT_BYTES);
+    for (k = 0; k < DL_FLAT_H; k++)
+        memcpy(block + k * DL_FLAT_W,
+               src   + (2 * k) * DL_FLAT_SRC_W,
+               DL_FLAT_W);
     data_cache_hit_writeback(block, DL_FLAT_BYTES);
 
     slot->block  = block;
@@ -2624,7 +2644,6 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     uint32_t prim;
     int   nx = sp->x2 - sp->x1 + 1;     // columns in the run
     float ua, ub, va, vb;               // texel U/V at the rect's left/right edge
-    int   vlo, vhi, rows;               // V window (texel rows) to upload
     int   ulo, uhi;                     // U extent (for the period bias only)
     int   vbias, ubias;                 // shared period biases (texels)
     float xl, xr, yt, yb;
@@ -2649,10 +2668,9 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     ub = (float)(sp->u0 + sp->ustep * nx) * (1.0f / 65536.0f);
     vb = (float)(sp->v0 + sp->vstep * nx) * (1.0f / 65536.0f);
 
-    // Period-bias V into a small window so the upload fits the 32-row cap. The
-    // tile wraps T with mask 6 (64 period), so subtracting a SHARED whole number
-    // of periods from both V endpoints is sampling-identical. After the bias the
-    // smaller endpoint lands in [0,64) and the window is [floor(vmin), ceil(vmax)].
+    // Period-bias V by a whole-64 multiple. The flat's WORLD V period is 64, so
+    // subtracting a SHARED whole number of 64-periods from both V endpoints is
+    // sampling-identical (keeps the fixed-point coords in range).
     {
         float vmin = (va < vb) ? va : vb;
         vbias = IFLOOR(vmin / 64.0f) * 64;
@@ -2660,45 +2678,13 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     }
     va -= (float)vbias;
     vb -= (float)vbias;
-    {
-        float vmin = (va < vb) ? va : vb;
-        float vmax = (va < vb) ? vb : va;
-        vlo = IFLOOR(vmin);
-        IFLOOR_CHK(vlo, vmin);
-        vhi = ICEIL(vmax);
-        ICEIL_CHK(vhi, vmax);
-    }
-    if (vlo < 0) vlo = 0;
-    // Window must fit the TMEM 32-row cap. A span whose V extent exceeds 32
-    // texel rows is a very near, steep floor (rare); clamp the window to 32 rows
-    // -- the over-extent texels wrap and re-sample within the loaded window, a
-    // bounded minification artifact on extreme near floors (accepted; the
-    // overflow class is documented). Most spans are << 32 rows (one band).
-    //
-    // UPLOAD-DEDUP WIDENING (the perf lever -- per-span LOAD_TILE is the plane
-    // path's DL_BUILD floor). Always load a FULL 32-row window (the TMEM cap),
-    // and ALIGN its base to a 16-row grid that still contains the span's exact
-    // [vlo,vhi] extent. Consecutive spans of a flat drift V slowly row-to-row,
-    // so an aligned 32-row window is reused across many spans -- the resident-
-    // window containment check below then skips the LOAD_TILE entirely. This
-    // collapses the dominant per-span upload to ~once per distance band.
-    {
-        int ext = vhi - vlo + 1;            // exact span V extent
-        if (ext > 32) ext = 32;             // near-floor clamp (as before)
-        // Align the 32-row window base to a 16-grid that still covers [vlo,vhi].
-        // Prefer the lowest 16-aligned base whose +32 window contains vhi.
-        int base = (vlo / 16) * 16;
-        if (base + 32 < vlo + ext)          // window too low to cover the span
-            base = ((vhi - 31) / 16) * 16;  // raise to cover the top
-        if (base < 0) base = 0;
-        if (base + 32 > 64) base = 64 - 32; // keep inside the 64 period
-        if (base < 0) base = 0;
-        vlo  = base;
-        rows = 32;
-        if (vlo + rows > 64) rows = 64 - vlo;
-        if (rows < 1) rows = 1;
-    }
-    vhi = vlo + rows - 1;
+    // 64x32 DECIMATED FLAT: the stored block is V-decimated 64->32 (out[k]=src[2k]),
+    // 2 KB and fully TMEM-resident, so there is no V window to compute -- the whole
+    // flat loads once. HALVE the (already period-biased) V endpoints: a v_world that
+    // mapped to texel v (period 64) now maps to v/2 (period 32), and the mask-5
+    // (period-32) T-wrap addresses across the resident tile.
+    va *= 0.5f;
+    vb *= 0.5f;
 
     // U period bias (keep S endpoints in a sane fixed-point range; the tile
     // wraps S with mask 6, so a shared period subtraction is sampling-identical).
@@ -2712,33 +2698,32 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
     ua -= (float)ubias;
     ub -= (float)ubias;
 
-    // Tile descriptor: full 64-period wrap on BOTH S and T (mask 6). Deduped --
-    // every flat span shares the same tile geometry (64-wide, mask 6), so this
-    // SET_TILE is issued once per flush, not per span.
+    // Tile descriptor: 64-period wrap on S (mask 6), 32-period on T (mask 5) --
+    // the decimated flat is 64 wide x 32 tall. Deduped -- every flat span shares
+    // the same tile geometry, so this SET_TILE is issued once per flush, not per
+    // span.
     if (dl_last_tile_lw != 64 || dl_last_tile_wrap != 2)
     {
         rdpq_tileparms_t tp;
         memset(&tp, 0, sizeof(tp));
         tp.s.mask = 6;          // 64-texel S period
-        tp.t.mask = 6;          // 64-texel T period
+        tp.t.mask = 5;          // 32-texel T period (decimated flat)
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
         dl_last_tile_lw   = 64;
         dl_last_tile_wrap = 2;   // sentinel != wall wrap values (0/1)
         dl_last_up_block  = NULL;
     }
 
-    // Load the (16-aligned, 32-row) V window across the full 64-texel width.
-    // Period-relative coords; the triangle T (period-relative too) addresses
-    // within [vlo, vlo+rows). Dedup: the window base/rows are 16-aligned and
-    // 32-wide, so a span whose exact V extent already lies inside the RESIDENT
-    // window reuses it -- skip the LOAD_TILE (and its autosync). This is the
-    // dominant DL_BUILD saving for the plane path.
-    if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
+    // Load the WHOLE 64x32 decimated flat in ONE call -- 2 KB, fully TMEM-resident,
+    // so no per-span V window. The triangle T (halved + period-relative) addresses
+    // within [0,32) and the mask-5 wrap handles the rest. Dedup on the source block
+    // only -> the LOAD_TILE (and its autosync) is skipped across a flat's spans.
+    if (block != dl_last_up_block)
     {
-        rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
+        rdpq_load_tile(TILE0, 0, 0, 64, 32);
         dl_last_up_block = block;
-        dl_last_up_lo    = vlo;
-        dl_last_up_rows  = rows;
+        dl_last_up_lo    = 0;
+        dl_last_up_rows  = 32;
         dl_last_up_c0    = 0;
     }
 
@@ -2781,7 +2766,6 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
 static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 {
     uint32_t prim;
-    int   vlo, rows, base, ext;
     float vmin, vmax, umin;
     float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
     int   vbias, ubias;
@@ -2844,51 +2828,40 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     v_bl -= (float)vbias; v_br -= (float)vbias;
     vmin -= (float)vbias; vmax -= (float)vbias;
 
-    // 16-aligned 32-row window covering [vmin,vmax] (clamped to the 64 period).
-    {
-        int lo = IFLOOR(vmin);
-        int hi = ICEIL(vmax);
-        IFLOOR_CHK(lo, vmin);
-        ICEIL_CHK(hi, vmax);
-        if (lo < 0) lo = 0;
-        ext = hi - lo + 1;
-        if (ext > 32) ext = 32;     // near-floor clamp (bounded minification)
-        base = (lo / 16) * 16;
-        if (base + 32 < lo + ext)
-            base = ((hi - 31) / 16) * 16;
-        if (base < 0) base = 0;
-        if (base + 32 > 64) base = 64 - 32;
-        if (base < 0) base = 0;
-        vlo  = base;
-        rows = 32;
-        if (vlo + rows > 64) rows = 64 - vlo;
-        if (rows < 1) rows = 1;
-    }
+    // 64x32 DECIMATED TILE: the stored flat is V-decimated 64->32 (out[k]=src[2k]),
+    // so the flat's 64-world-unit V period now lives in 32 texel rows. HALVE the
+    // per-vertex V: a v_world that mapped to texel v (period 64) now maps to v/2
+    // (period 32). The whole-64 vbias above is already period-relative, so halving
+    // the biased coords keeps the min corner in [0, 32+spread/2) and the mask-5
+    // (period-32) T-wrap addresses across the fully-resident tile. S/u unchanged.
+    v_tl *= 0.5f; v_tr *= 0.5f;
+    v_bl *= 0.5f; v_br *= 0.5f;
 
-    // Tile descriptor: full 64-period wrap on BOTH S and T (mask 6). Deduped --
-    // every flat poly shares this geometry, so SET_TILE issues once per flush.
+    // Tile descriptor: full 64-period wrap on S (mask 6), 32-period on T (mask 5)
+    // -- the decimated flat is 64 wide x 32 tall. Deduped -- every flat poly shares
+    // this geometry, so SET_TILE issues once per flush.
     if (dl_last_tile_lw != 64 || dl_last_tile_wrap != 2)
     {
         rdpq_tileparms_t tp;
         memset(&tp, 0, sizeof(tp));
         tp.s.mask = 6;          // 64-texel S period
-        tp.t.mask = 6;          // 64-texel T period
+        tp.t.mask = 5;          // 32-texel T period (decimated flat)
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
         dl_last_tile_lw   = 64;
         dl_last_tile_wrap = 2;
         dl_last_up_block  = NULL;
     }
 
-    // Load the (16-aligned, 32-row) V window across the full 64-texel width.
-    // Period-relative coords; the triangle T (period-relative too, via the bias
-    // above) addresses within [vlo, vlo+rows) and the mask-6 wrap handles the
-    // rest. Dedup against the resident window -> skip the LOAD_TILE + autosync.
-    if (block != dl_last_up_block || vlo != dl_last_up_lo || rows != dl_last_up_rows)
+    // Load the WHOLE 64x32 decimated flat in ONE call -- it is 2 KB, fully TMEM-
+    // resident, so no per-poly V window is needed. The triangle T (halved + period-
+    // relative) addresses within [0,32) and the mask-5 wrap handles the rest. Dedup
+    // on the source block only -> skip the LOAD_TILE + autosync across a flat's runs.
+    if (block != dl_last_up_block)
     {
-        rdpq_load_tile(TILE0, 0, vlo, 64, vlo + rows);
+        rdpq_load_tile(TILE0, 0, 0, 64, 32);
         dl_last_up_block = block;
-        dl_last_up_lo    = vlo;
-        dl_last_up_rows  = rows;
+        dl_last_up_lo    = 0;
+        dl_last_up_rows  = 32;
         dl_last_up_c0    = 0;
         dl_tile_loads++;
         dl_uploads++;
@@ -2967,7 +2940,7 @@ static void DL_FlushPlanePolys(void)
         DL_FlatMarkInFlight(flatidx);
 
         {
-            surface_t fs = surface_make_linear(block, FMT_CI8, 64, 64);
+            surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
             rdpq_set_texture_image(&fs);
             dl_last_up_block  = NULL;
             dl_last_tile_lw   = -1;
@@ -3021,11 +2994,12 @@ static void DL_FlushSpans(void)
 
         DL_FlatMarkInFlight(flatidx);
 
-        // Point the RDP at this flat's 64x64 row-major block once. The TILE0
-        // descriptor (64-wide, mask-6 wrap) is configured in DL_DrawSpan and
-        // deduped; invalidate the resident band when the source image changes.
+        // Point the RDP at this flat's 64x32 (V-decimated) row-major block once.
+        // The TILE0 descriptor (64-wide, mask-6 S / mask-5 T wrap) is configured in
+        // DL_DrawSpan and deduped; invalidate the resident band when the source
+        // image changes.
         {
-            surface_t fs = surface_make_linear(block, FMT_CI8, 64, 64);
+            surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
             rdpq_set_texture_image(&fs);
             dl_last_up_block  = NULL;
             dl_last_tile_lw   = -1;
