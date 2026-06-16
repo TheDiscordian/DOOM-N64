@@ -92,6 +92,17 @@ endif
 # debugf cost + log traffic skew the numbers); default off (compiled out).
 ifeq ($(PLANE_UV_TRACE),1)
 CFLAGS += -DPLANE_UV_TRACE=1
+# Optional frame selection for the FINAL-S/T (rdp_view.c DL_DrawPlanePoly) half of
+# the trace. These name a BENCH_MARK frame (128/256/384...): the rdp_view.c dump
+# pairs to BENCH_MARK frame=N. Set on the make line, e.g.
+#   PLANE_UV_TRACE=1 PLANE_UV_TRACE_FRAME=128 PLANE_UV_TRACE_FRAME2=384
+# Default 128 (garbage) + 384 (clean) in the source; FRAME2=0 dumps one frame.
+ifneq ($(PLANE_UV_TRACE_FRAME),)
+CFLAGS += -DPLANE_UV_TRACE_FRAME=$(PLANE_UV_TRACE_FRAME)
+endif
+ifneq ($(PLANE_UV_TRACE_FRAME2),)
+CFLAGS += -DPLANE_UV_TRACE_FRAME2=$(PLANE_UV_TRACE_FRAME2)
+endif
 endif
 # PLANE_GEOM_TRACE=1: one-off diagnostic builds only -- floor-poly COVERAGE/geometry
 # trace (PGT_* lines on the ISViewer log; r_plane.c PLANE_GEOM_TRACE). Dumps, for the

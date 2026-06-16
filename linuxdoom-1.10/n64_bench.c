@@ -209,6 +209,17 @@ int N64Bench_Active(void)
     return bench_started;
 }
 
+// Retained-frame counter, the SAME one BENCH_MARK frame=N keys off (the marker
+// fires in N64Bench_CommitFrame when (bench_frame_count & 127) == 0, i.e. at
+// 128, 256, 384...). Read DURING a render (before that frame's commit) it is the
+// count of frames already committed, so the render whose commit makes the count
+// reach N sees this == N-1. Diagnostics only (PLANE_UV_TRACE pairs its dump to a
+// marker frame via this); 0 before BENCH_RUNNING.
+unsigned long N64Bench_FrameNo(void)
+{
+    return bench_frame_count;
+}
+
 // Per-render-frame heartbeat: advance the deterministic virtual clock by one
 // "frame" worth of time. Called once per D_DoomLoop iteration AND once per inner
 // present (screen wipe), so any loop that spins waiting on I_GetTime() to

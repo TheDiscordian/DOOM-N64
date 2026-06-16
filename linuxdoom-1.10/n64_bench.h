@@ -124,5 +124,12 @@ void N64Bench_NoteInterp(int local_players);
 // holding the final numbers on screen indefinitely for screenshot capture.
 void N64Bench_DrawOverlay(void);
 
+// Retained-frame counter (the SAME counter the BENCH_MARK frame=N markers key
+// off: marker N fires when this count reaches N at commit). Read DURING a render
+// (e.g. plane diagnostics) it returns the frames COMMITTED SO FAR, so the render
+// whose commit produces marker N sees this == N-1. Diagnostics-only accessor;
+// 0 before the bench reaches BENCH_RUNNING / outside bench builds.
+unsigned long N64Bench_FrameNo(void);
+
 #endif // N64_BENCH
 #endif // N64_BENCH_H

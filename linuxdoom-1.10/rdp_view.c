@@ -104,6 +104,60 @@ static inline int dl_iceil (float x) { int t = (int)x; return t + (t < x); }
 extern int viewwindowy; // r_draw.c
 #endif
 
+// ---- PLANE_UV_TRACE: post-period-bias plane-poly S/T saturation self-trace ---
+// Diagnostic ONLY (no rendering change). When -DPLANE_UV_TRACE=1 (Makefile
+// PLANE_UV_TRACE=1; default 0 -> compiled out of normal/timing builds). This is
+// the SECOND half of the floor/ceiling diagnostic: r_plane.c's PLANE_UV_TRACE
+// dumps the EMITTED corner texels vs R_MapPlane EXPECTED; THIS one dumps, in
+// DL_DrawPlanePoly, the FINAL u,v handed to rdpq_triangle -- i.e. AFTER the
+// whole-64 period bias (ubias/vbias) and the V *0.5 decimation -- so the s10.5
+// S/T fixed point (texel * 32 -> int16, saturates at |u*32| >= 32767, i.e.
+// |u| >= ~1024 texels; see DL_Flush note) is computed on the EXACT values the
+// RDP sees. Per sample poly it prints PUVT2_POLY: the 4 corners' post-bias u,v,
+// each corner's u*32 / v*32 with a SAT flag, the texel SPREAD (umax-umin,
+// vmax-vmin), the screen extent (x1,x2 + ytop range), and FLOOR/CEILING (by the
+// poly's mean screen row vs centery). The hypothesis under test: glancing/deep
+// views give one plane poly a huge texel spread that overruns s10.5 -> garbage/
+// infinite-stretch; head-on frames have small spread -> clean. The dump is keyed
+// to a BENCH marker frame (N64Bench_FrameNo()) so "frame 128/384" here is the
+// SAME frame as BENCH_MARK frame=128/384. Two frames can be captured in one run
+// (PLANE_UV_TRACE_FRAME + PLANE_UV_TRACE_FRAME2). Uses debugf -> ISViewer.
+#ifndef PLANE_UV_TRACE
+#define PLANE_UV_TRACE 0
+#endif
+#if PLANE_UV_TRACE
+#include <math.h>               // floorf (trace float formatting)
+#include "n64_bench.h"          // N64Bench_FrameNo (marker-frame pairing)
+#include "r_main.h"             // centery (floor vs ceiling discriminator)
+// Which BENCH marker frame(s) to dump. The render whose COMMIT produces marker N
+// sees N64Bench_FrameNo() == N-1 (committed-so-far), so dump when the counter is
+// FRAME-1 to pair the lines with `BENCH_MARK frame=FRAME`. 0 disables a slot.
+#ifndef PLANE_UV_TRACE_FRAME
+#define PLANE_UV_TRACE_FRAME  128   // garbage frame (Ryan)
+#endif
+#ifndef PLANE_UV_TRACE_FRAME2
+#define PLANE_UV_TRACE_FRAME2 384   // clean frame (Ryan); 0 to dump one frame
+#endif
+#ifndef PLANE_UV_TRACE_POLYS
+#define PLANE_UV_TRACE_POLYS  6     // dump at most this many polys per frame
+#endif
+// Float -> int + signed milli-frac (debugf has no %f here). Match r_plane.c's.
+#ifndef IFLOORF
+#define IFLOORF(f)   ((int)floorf((float)(f)))
+#endif
+#ifndef MILLIFRAC
+#define MILLIFRAC(f) ((int)(( (float)(f) - floorf((float)(f)) ) * 1000.0f))
+#endif
+// s10.5 S/T saturation: rdpq_triangle scales the per-vertex S/T by 32 and casts
+// to int16; |S*32| >= 32767 saturates -> texture smears across the quad. Test on
+// the FINAL (post-bias, post-decimation) u,v -- exactly what rdpq_triangle gets.
+#define PUVT2_SAT_LIMIT 32767
+#define PUVT2_SAT(uv)   ( (((float)(uv)) * 32.0f >=  (float)PUVT2_SAT_LIMIT) || \
+                          (((float)(uv)) * 32.0f <= -(float)PUVT2_SAT_LIMIT) )
+static unsigned long puvt2_last_frame = (unsigned long)-1; // frame currently armed
+static int           puvt2_polys_left = -1;                // polys still to dump
+#endif // PLANE_UV_TRACE
+
 // Texture system globals (r_data.c).
 extern int          numtextures;
 extern int*         texturewidthmask;
@@ -2889,6 +2943,107 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
     // INV_W (persp ON). Tri-pair (tl,tr,bl),(tr,br,bl).
     xl = (float)p->x1;
     xr = (float)p->x2 + 1.0f;
+
+#if PLANE_UV_TRACE
+    // ---- FINAL S/T saturation self-trace (diagnostic, no render effect) -------
+    // u_tl..v_br here are the EXACT post-period-bias (+V-decimation) coords about
+    // to be handed to rdpq_triangle. Dump per sample poly on a selected BENCH
+    // marker frame: the 4 corners, each corner's u*32/v*32 + SAT flag, the texel
+    // SPREAD, the screen extent, and FLOOR/CEILING. Pairs with BENCH_MARK frame=N
+    // (this fires when N64Bench_FrameNo()==N-1). See the header note for the
+    // hypothesis (spread overruns s10.5 at glancing/deep views).
+    {
+        unsigned long fno = N64Bench_FrameNo();
+        // Which marker frame, if any, does THIS render commit into? The committing
+        // render sees fno == FRAME-1. Match either configured slot (FRAME2==0 off).
+        unsigned long want = 0;
+        if (fno + 1 == (unsigned long)PLANE_UV_TRACE_FRAME)       want = PLANE_UV_TRACE_FRAME;
+        else if (PLANE_UV_TRACE_FRAME2 &&
+                 fno + 1 == (unsigned long)PLANE_UV_TRACE_FRAME2) want = PLANE_UV_TRACE_FRAME2;
+
+        if (want)
+        {
+            if (puvt2_last_frame != fno)            // first poly of this frame: arm
+            {
+                puvt2_last_frame = fno;
+                puvt2_polys_left = PLANE_UV_TRACE_POLYS;
+                debugf("PUVT2_FRAME marker=%lu fno=%lu centery=%d\n",
+                       want, fno, centery);
+            }
+
+            if (puvt2_polys_left > 0)
+            {
+                // Post-bias texel extents (the SPREAD the s10.5 cast must hold).
+                float umn = u_tl, umx = u_tl, vmn = v_tl, vmx = v_tl;
+                if (u_tr < umn) umn = u_tr; if (u_tr > umx) umx = u_tr;
+                if (u_bl < umn) umn = u_bl; if (u_bl > umx) umx = u_bl;
+                if (u_br < umn) umn = u_br; if (u_br > umx) umx = u_br;
+                if (v_tr < vmn) vmn = v_tr; if (v_tr > vmx) vmx = v_tr;
+                if (v_bl < vmn) vmn = v_bl; if (v_bl > vmx) vmx = v_bl;
+                if (v_br < vmn) vmn = v_br; if (v_br > vmx) vmx = v_br;
+                {
+                    float u_spread = umx - umn;
+                    float v_spread = vmx - vmn;
+                    // FLOOR vs CEILING: a ceiling poly's rows sit ABOVE the horizon
+                    // (mean screen Y < centery); a floor's below. centery splits the
+                    // two regardless of planeheight sign carried per-poly.
+                    float ymean = 0.25f*(p->ytop_l + p->ytop_r + p->ybot_l + p->ybot_r);
+                    const char* kind = (ymean < (float)centery) ? "CEIL" : "FLOOR";
+                    // Per-corner s10.5 product + saturation flag.
+                    float cu[4] = { u_tl, u_tr, u_bl, u_br };
+                    float cv[4] = { v_tl, v_tr, v_bl, v_br };
+                    const char* nm[4] = { "TL", "TR", "BL", "BR" };
+                    int sat_any = 0;
+                    int i;
+
+                    debugf("PUVT2_POLY n=%d kind=%s x1=%d x2=%d "
+                           "ytop=%d.%03d..%d.%03d ybot=%d.%03d..%d.%03d "
+                           "u_spread=%d.%03d v_spread=%d.%03d\n",
+                           PLANE_UV_TRACE_POLYS - puvt2_polys_left, kind,
+                           p->x1, p->x2,
+                           IFLOORF(p->ytop_l), MILLIFRAC(p->ytop_l),
+                           IFLOORF(p->ytop_r), MILLIFRAC(p->ytop_r),
+                           IFLOORF(p->ybot_l), MILLIFRAC(p->ybot_l),
+                           IFLOORF(p->ybot_r), MILLIFRAC(p->ybot_r),
+                           IFLOORF(u_spread), MILLIFRAC(u_spread),
+                           IFLOORF(v_spread), MILLIFRAC(v_spread));
+
+                    for (i = 0; i < 4; i++)
+                    {
+                        // s10.5 product as an integer (round to nearest) + |.|>=lim.
+                        int   us32 = (int)floorf(cu[i] * 32.0f + 0.5f);
+                        int   vs32 = (int)floorf(cv[i] * 32.0f + 0.5f);
+                        int   us_sat = PUVT2_SAT(cu[i]) ? 1 : 0;
+                        int   vs_sat = PUVT2_SAT(cv[i]) ? 1 : 0;
+                        sat_any |= us_sat | vs_sat;
+                        debugf("PUVT2_C %s u=%d.%03d v=%d.%03d u32=%d v32=%d "
+                               "u_sat=%d v_sat=%d invw=%d.%03d\n",
+                               nm[i],
+                               IFLOORF(cu[i]), MILLIFRAC(cu[i]),
+                               IFLOORF(cv[i]), MILLIFRAC(cv[i]),
+                               us32, vs32, us_sat, vs_sat,
+                               IFLOORF((i==0)?p->invw_tl:(i==1)?p->invw_tr:
+                                       (i==2)?p->invw_bl:p->invw_br),
+                               MILLIFRAC((i==0)?p->invw_tl:(i==1)?p->invw_tr:
+                                         (i==2)?p->invw_bl:p->invw_br));
+                    }
+                    debugf("PUVT2_SUM n=%d kind=%s u_spread=%d v_spread=%d "
+                           "SAT=%d\n",
+                           PLANE_UV_TRACE_POLYS - puvt2_polys_left, kind,
+                           (int)floorf(u_spread), (int)floorf(v_spread), sat_any);
+
+                    puvt2_polys_left--;
+                }
+            }
+        }
+        else if (puvt2_polys_left >= 0)
+        {
+            puvt2_polys_left = -1;          // re-arm for a future matching frame
+            puvt2_last_frame = (unsigned long)-1;
+        }
+    }
+#endif // PLANE_UV_TRACE
+
     {
         float tl[5] = { xl, p->ytop_l, u_tl, v_tl, p->invw_tl };
         float tr[5] = { xr, p->ytop_r, u_tr, v_tr, p->invw_tr };
