@@ -63,17 +63,25 @@ print(best or '')")"
 echo "scan-marks: GEOM=[$GEOM]"
 [ -z "$GEOM" ] && echo "scan-marks: WARNING no ares window found (will grim full screen)" >&2
 
-end=$(( SECONDS + CAPSECS )); seen=""; n=0
+end=$(( SECONDS + CAPSECS )); seen=""; n=0; last_new=$SECONDS
+STALL="${STALL_SECS:-12}"
 while [ "$SECONDS" -lt "$end" ]; do
     # stop early if ares died on its own (ROM ended/crashed) -- no point looping
     kill -0 -- -"$APGID" 2>/dev/null || { echo "scan-marks: ares exited; stopping"; break; }
     fr="$(grep -oE 'BENCH_MARK frame=[0-9]+' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+$')"
     if [ -n "$fr" ] && [ "$fr" != "$seen" ]; then
-        seen="$fr"
+        seen="$fr"; last_new="$SECONDS"
         if [ -n "$GEOM" ]; then grim -g "$GEOM" "$OUT/frame-$fr.png" 2>/dev/null
         else grim "$OUT/frame-$fr.png" 2>/dev/null; fi
         n=$(( n + 1 )); echo "scan-marks: captured frame-$fr (n=$n)"
         [ "$n" -ge "$MAXF" ] && break
+    elif [ "$n" -gt 0 ] && [ $(( SECONDS - last_new )) -ge "$STALL" ]; then
+        # demo stopped producing new markers (ended/looped): the useful capture is
+        # done. Exit NOW so cleanup() reaps ares, instead of holding the frozen
+        # window open to the full CAPSECS cap -- THAT is what made finished captures
+        # look "stuck" long after they were done.
+        echo "scan-marks: no new frame for ${STALL}s after $n captured; demo done, stopping"
+        break
     fi
     sleep 0.3
 done
