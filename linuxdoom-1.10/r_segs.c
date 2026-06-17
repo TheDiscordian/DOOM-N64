@@ -39,6 +39,18 @@ rcsid[] = "$Id: r_segs.c,v 1.3 1997/01/29 20:10:19 b1 Exp $";
 #include "r_local.h"
 #include "r_sky.h"
 
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
+
+#ifdef N64
+#include "rdp_view.h"
+
+#if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
+#include <libdragon.h>      // debugf for the diagnostic seg-claim trace
+#endif
+#endif
+
 
 // OPTIMIZE: closed two sided lines as single sided
 
@@ -157,7 +169,11 @@ R_RenderMaskedSegRange
 			
     if (fixedcolormap)
 	dc_colormap = fixedcolormap;
-    
+
+    // texnum is constant across the column loop -- resolve its column tables
+    // once instead of paying R_GetColumn's per-tex work every column.
+    const texcol_t	tc_masked = R_GetColumnTex(texnum);
+
     // draw the columns
     for (dc_x = x1 ; dc_x <= x2 ; dc_x++)
     {
@@ -178,8 +194,8 @@ R_RenderMaskedSegRange
 	    dc_iscale = 0xffffffffu / (unsigned)spryscale;
 	    
 	    // draw the texture
-	    col = (column_t *)( 
-		(byte *)R_GetColumn(texnum,maskedtexturecol[dc_x]) -3);
+	    col = (column_t *)(
+		(byte *)R_GetColumnIn(&tc_masked,maskedtexturecol[dc_x]) -3);
 			
 	    R_DrawMaskedColumn (col);
 	    maskedtexturecol[dc_x] = MAXSHORT;
@@ -214,151 +230,365 @@ void R_RenderSegLoop (void)
     int			top;
     int			bottom;
 
-    for ( ; rw_x < rw_stopx ; rw_x++)
+    // Hoist loop invariants into locals. The wall tiers write visplane
+    // top[]/bottom[], which are byte arrays: a store through a char/byte
+    // pointer aliases every object under GCC's TBAA, forcing a reload of
+    // each cached global on every column. R_GetColumn/colfunc calls clobber
+    // globals likewise. Copy the read-only state to locals (whose address is
+    // never taken, so the byte stores and calls cannot touch them) and write
+    // back the few mutated accumulators after the loop.
+    const int		l_rw_stopx = rw_stopx;
+    const int		l_markceiling = markceiling;
+    const int		l_markfloor = markfloor;
+    const int		l_midtexture = midtexture;
+    const int		l_toptexture = toptexture;
+    const int		l_bottomtexture = bottomtexture;
+    // Each tier's texture is constant across the whole column loop, so resolve
+    // its column-lookup tables ONCE here (texturecolumnlump[tex] /
+    // texturecolumnofs[tex] / texturewidthmask[tex]) instead of paying
+    // R_GetColumn's per-tex work -- the call, the two scattered Z_Malloc array
+    // indexes, and the width-mask lookup -- on every column. Only active tiers
+    // are resolved (inactive tex is 0 and never sampled), matching the original
+    // R_GetColumn call guard exactly.
+    texcol_t		tc_mid, tc_top, tc_bot;
+    if (l_midtexture)	tc_mid = R_GetColumnTex(l_midtexture);
+    if (l_toptexture)	tc_top = R_GetColumnTex(l_toptexture);
+    if (l_bottomtexture) tc_bot = R_GetColumnTex(l_bottomtexture);
+    const int		l_maskedtexture = maskedtexture;
+    const int		l_segtextured = segtextured;
+    const int		l_viewheight = viewheight;
+    visplane_t* const	l_ceilingplane = ceilingplane;
+    visplane_t* const	l_floorplane = floorplane;
+    short* const	l_ceilingclip = ceilingclip;
+    short* const	l_floorclip = floorclip;
+    lighttable_t** const l_walllights = walllights;
+    short* const	l_maskedtexturecol = maskedtexturecol;
+    const angle_t	l_rw_centerangle = rw_centerangle;
+    const fixed_t	l_rw_offset = rw_offset;
+    const fixed_t	l_rw_distance = rw_distance;
+    const fixed_t	l_rw_midtexturemid = rw_midtexturemid;
+    const fixed_t	l_rw_toptexturemid = rw_toptexturemid;
+    const fixed_t	l_rw_bottomtexturemid = rw_bottomtexturemid;
+    const fixed_t	l_rw_scalestep = rw_scalestep;
+    const fixed_t	l_topstep = topstep;
+    const fixed_t	l_bottomstep = bottomstep;
+    const fixed_t	l_pixhighstep = pixhighstep;
+    const fixed_t	l_pixlowstep = pixlowstep;
+    // During wall rendering colfunc always holds basecolfunc (the base column
+    // drawer); the fuzz/translated variants are only swapped in for sprites.
+    // Cache it so each column's call doesn't reload the global.
+    void (* const l_colfunc)(void) = colfunc;
+
+    int			l_rw_x = rw_x;
+    fixed_t		l_rw_scale = rw_scale;
+    fixed_t		l_topfrac = topfrac;
+    fixed_t		l_bottomfrac = bottomfrac;
+    fixed_t		l_pixhigh = pixhigh;
+    fixed_t		l_pixlow = pixlow;
+
+#ifdef N64
+    // RDP renderer (Stage 3): route ALL solid wall tiers through the RDP wall
+    // path -- every single-sided (midtexture) seg AND the upper/lower textures
+    // of two-sided segs. For a routed tier the per-column colfunc pixel write is
+    // suppressed (those view columns keep the transparency-key index, and the
+    // RDP fill drawn at the present seam shows through), while ALL clip /
+    // visplane bookkeeping stays on the CPU exactly as the software path does.
+    // Per-column screen Y / scale / texturecolumn / light are captured per tier
+    // and turned into rdp_wall_t records (per light-level run) after the loop.
+    // Masked mid-textures stay CPU (Stage 5); sky is a visplane drawn by
+    // R_DrawPlanes (Stage 4), so the seg loop's wall tiers never carry sky.
+    int			rdp_route = 0;
+
+    // Kill-switch FIRST, inline, before any cross-TU call. With the flag OFF
+    // this short-circuits to the pre-RDP software seg loop with ZERO added
+    // function calls (DL_WallRouteOn is never reached), so the flag-OFF hot path
+    // is byte-identical to the Stage-1 baseline. (Gate criterion 2: flag-OFF
+    // byte-identical to baseline.) ALL routed capture state + the post-loop emit
+    // live in rdp_view.c so this hot translation unit's .text stays at the
+    // pre-RDP size when the flag is off (structural flag-OFF drift minimised).
+    if (n64_use_rdp_renderer && DL_WallRouteOn())
     {
+	rdp_route = 1;
+	DL_RouteBeginSeg();
+    }
+#if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
+    // Diagnostic builds only (DL_TRACE=1): log every seg-loop invocation with
+    // its tier textures, column range, and whether it routed.
+    if (n64_use_rdp_renderer)
+	debugf("DL_SEG mid=%d top=%d bot=%d x=%d..%d route=%d\n",
+	       l_midtexture, l_toptexture, l_bottomtexture,
+	       l_rw_x, l_rw_stopx - 1, rdp_route);
+#endif
+#endif
+
+#ifdef N64_BENCH
+    // SEG_RASTER attributes the per-column wall fill below (the rasterization
+    // the RDP renderer offloads) separately from the BSP walk/clip/scale math
+    // that surrounds it. Bracketed once per seg around the whole column loop
+    // (not per column) so the two CP0 reads stay negligible. The enclosing
+    // phase is BSP_WALK; switch to SEG_RASTER and back so it nests cleanly.
+    N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_SEG_RASTER);
+#endif
+
+    for ( ; l_rw_x < l_rw_stopx ; l_rw_x++)
+    {
+	int		cc = l_ceilingclip[l_rw_x];
+	int		fc = l_floorclip[l_rw_x];
+
 	// mark floor / ceiling areas
-	yl = (topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
+	yl = (l_topfrac+HEIGHTUNIT-1)>>HEIGHTBITS;
 
 	// no space above wall?
-	if (yl < ceilingclip[rw_x]+1)
-	    yl = ceilingclip[rw_x]+1;
-	
-	if (markceiling)
+	if (yl < cc+1)
+	    yl = cc+1;
+
+	if (l_markceiling)
 	{
-	    top = ceilingclip[rw_x]+1;
+	    top = cc+1;
 	    bottom = yl-1;
 
-	    if (bottom >= floorclip[rw_x])
-		bottom = floorclip[rw_x]-1;
+	    if (bottom >= fc)
+		bottom = fc-1;
 
 	    if (top <= bottom)
 	    {
-		ceilingplane->top[rw_x] = top;
-		ceilingplane->bottom[rw_x] = bottom;
+		l_ceilingplane->top[l_rw_x] = top;
+		l_ceilingplane->bottom[l_rw_x] = bottom;
 	    }
 	}
-		
-	yh = bottomfrac>>HEIGHTBITS;
 
-	if (yh >= floorclip[rw_x])
-	    yh = floorclip[rw_x]-1;
+	yh = l_bottomfrac>>HEIGHTBITS;
 
-	if (markfloor)
+	if (yh >= fc)
+	    yh = fc-1;
+
+	if (l_markfloor)
 	{
 	    top = yh+1;
-	    bottom = floorclip[rw_x]-1;
-	    if (top <= ceilingclip[rw_x])
-		top = ceilingclip[rw_x]+1;
+	    bottom = fc-1;
+	    if (top <= cc)
+		top = cc+1;
 	    if (top <= bottom)
 	    {
-		floorplane->top[rw_x] = top;
-		floorplane->bottom[rw_x] = bottom;
+		l_floorplane->top[l_rw_x] = top;
+		l_floorplane->bottom[l_rw_x] = bottom;
 	    }
 	}
-	
+
 	// texturecolumn and lighting are independent of wall tiers
-	if (segtextured)
+	if (l_segtextured)
 	{
 	    // calculate texture offset
-	    angle = (rw_centerangle + xtoviewangle[rw_x])>>ANGLETOFINESHIFT;
-	    texturecolumn = rw_offset-FixedMul(finetangent[angle],rw_distance);
+	    angle = (l_rw_centerangle + xtoviewangle[l_rw_x])>>ANGLETOFINESHIFT;
+	    texturecolumn = l_rw_offset-FixedMul(finetangent[angle],l_rw_distance);
 	    texturecolumn >>= FRACBITS;
+#ifdef N64
+	    // RDP-routed seg: every tier's colfunc is suppressed, so the
+	    // colfunc-only inputs are never read -- skip them, most notably
+	    // the dc_iscale division (~70 VR4300 cycles per column).
+	    // DL_RouteCapture derives the light level from the captured scale
+	    // itself; the masked path (R_RenderMaskedSegRange) computes its own
+	    // iscale/colormap later from maskedtexturecol. The zero-pixel
+	    // colfunc calls a routed mid tier can still make (yl > yh) return
+	    // at their count check before reading any of these.
+	    if (!rdp_route)
+#endif
+	    {
 	    // calculate lighting
-	    index = rw_scale>>LIGHTSCALESHIFT;
+	    index = l_rw_scale>>LIGHTSCALESHIFT;
 
 	    if (index >=  MAXLIGHTSCALE )
 		index = MAXLIGHTSCALE-1;
 
-	    dc_colormap = walllights[index];
-	    dc_x = rw_x;
-	    dc_iscale = 0xffffffffu / (unsigned)rw_scale;
+	    dc_colormap = l_walllights[index];
+	    dc_x = l_rw_x;
+	    dc_iscale = 0xffffffffu / (unsigned)l_rw_scale;
+	    }
 	}
-	
+
 	// draw the wall tiers
-	if (midtexture)
+	if (l_midtexture)
 	{
 	    // single sided line
 	    dc_yl = yl;
 	    dc_yh = yh;
-	    dc_texturemid = rw_midtexturemid;
-	    dc_source = R_GetColumn(midtexture,texturecolumn);
-	    colfunc ();
-	    ceilingclip[rw_x] = viewheight;
-	    floorclip[rw_x] = -1;
+	    dc_texturemid = l_rw_midtexturemid;
+#ifdef N64
+	    // RDP-routed mid tier: suppress the CPU pixel write ONLY for columns
+	    // the RDP will actually fill (yl <= yh). Those columns keep the key
+	    // index (the batched I_N64KeyClearView wrote it before any drawer
+	    // ran -- Stage-3 replacement for the per-column R_FillColumnKey)
+	    // and the RDP quad shows through via the full-view keyed box.
+	    // Columns with yl > yh fall through to the normal path: l_colfunc
+	    // draws zero pixels there (yl>yh), byte-identical to vanilla. KEEP
+	    // the ceiling/floor clip writes below as the CPU path does.
+	    if (rdp_route && yl <= yh)
+	    {
+		DL_RouteCapture(DL_TIER_MID, l_rw_x, yl, yh, l_rw_scale,
+				texturecolumn, (const void* const*)l_walllights);
+	    }
+	    else
+#endif
+	    {
+	    dc_source = R_GetColumnIn(&tc_mid,texturecolumn);
+	    l_colfunc ();
+	    }
+	    l_ceilingclip[l_rw_x] = l_viewheight;
+	    l_floorclip[l_rw_x] = -1;
 	}
 	else
 	{
 	    // two sided line
-	    if (toptexture)
+	    if (l_toptexture)
 	    {
 		// top wall
-		mid = pixhigh>>HEIGHTBITS;
-		pixhigh += pixhighstep;
+		mid = l_pixhigh>>HEIGHTBITS;
+		l_pixhigh += l_pixhighstep;
 
-		if (mid >= floorclip[rw_x])
-		    mid = floorclip[rw_x]-1;
+		if (mid >= fc)
+		    mid = fc-1;
 
 		if (mid >= yl)
 		{
 		    dc_yl = yl;
 		    dc_yh = mid;
-		    dc_texturemid = rw_toptexturemid;
-		    dc_source = R_GetColumn(toptexture,texturecolumn);
-		    colfunc ();
-		    ceilingclip[rw_x] = mid;
+		    dc_texturemid = l_rw_toptexturemid;
+#ifdef N64
+		    // RDP-routed top tier (two-sided upper texture). Suppress the
+		    // CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
+		    // mid>=yl); the span already holds the key from the batched
+		    // view clear (I_N64KeyClearView). KEEP the ceilingclip write
+		    // below.
+		    if (rdp_route)
+		    {
+			DL_RouteCapture(DL_TIER_TOP, l_rw_x, yl, mid, l_rw_scale,
+					texturecolumn,
+					(const void* const*)l_walllights);
+		    }
+		    else
+#endif
+		    {
+		    dc_source = R_GetColumnIn(&tc_top,texturecolumn);
+		    l_colfunc ();
+		    }
+		    l_ceilingclip[l_rw_x] = mid;
 		}
 		else
-		    ceilingclip[rw_x] = yl-1;
+		    l_ceilingclip[l_rw_x] = yl-1;
 	    }
 	    else
 	    {
 		// no top wall
-		if (markceiling)
-		    ceilingclip[rw_x] = yl-1;
+		if (l_markceiling)
+		    l_ceilingclip[l_rw_x] = yl-1;
 	    }
-			
-	    if (bottomtexture)
+
+	    if (l_bottomtexture)
 	    {
 		// bottom wall
-		mid = (pixlow+HEIGHTUNIT-1)>>HEIGHTBITS;
-		pixlow += pixlowstep;
+		mid = (l_pixlow+HEIGHTUNIT-1)>>HEIGHTBITS;
+		l_pixlow += l_pixlowstep;
 
-		// no space above wall?
-		if (mid <= ceilingclip[rw_x])
-		    mid = ceilingclip[rw_x]+1;
-		
+		// no space above wall? Re-read ceilingclip live: the top-wall
+		// branch above may have written ceilingclip[rw_x] this same
+		// iteration, and the original reads that updated value here.
+		{
+		    int cc_now = l_ceilingclip[l_rw_x];
+		    if (mid <= cc_now)
+			mid = cc_now+1;
+		}
+
 		if (mid <= yh)
 		{
 		    dc_yl = mid;
 		    dc_yh = yh;
-		    dc_texturemid = rw_bottomtexturemid;
-		    dc_source = R_GetColumn(bottomtexture,
+		    dc_texturemid = l_rw_bottomtexturemid;
+#ifdef N64
+		    // RDP-routed bottom tier (two-sided lower texture). Suppress
+		    // the CPU fill, capture the span (dc_yl<=dc_yh guaranteed by
+		    // mid<=yh); the span already holds the key from the batched
+		    // view clear (I_N64KeyClearView). KEEP the floorclip write
+		    // below.
+		    if (rdp_route)
+		    {
+			DL_RouteCapture(DL_TIER_BOT, l_rw_x, mid, yh, l_rw_scale,
+					texturecolumn,
+					(const void* const*)l_walllights);
+		    }
+		    else
+#endif
+		    {
+		    dc_source = R_GetColumnIn(&tc_bot,
 					    texturecolumn);
-		    colfunc ();
-		    floorclip[rw_x] = mid;
+		    l_colfunc ();
+		    }
+		    l_floorclip[l_rw_x] = mid;
 		}
 		else
-		    floorclip[rw_x] = yh+1;
+		    l_floorclip[l_rw_x] = yh+1;
 	    }
 	    else
 	    {
 		// no bottom wall
-		if (markfloor)
-		    floorclip[rw_x] = yh+1;
+		if (l_markfloor)
+		    l_floorclip[l_rw_x] = yh+1;
 	    }
-			
-	    if (maskedtexture)
+
+	    if (l_maskedtexture)
 	    {
 		// save texturecol
 		//  for backdrawing of masked mid texture
-		maskedtexturecol[rw_x] = texturecolumn;
+		l_maskedtexturecol[l_rw_x] = texturecolumn;
 	    }
 	}
-		
-	rw_scale += rw_scalestep;
-	topfrac += topstep;
-	bottomfrac += bottomstep;
+
+	l_rw_scale += l_rw_scalestep;
+	l_topfrac += l_topstep;
+	l_bottomfrac += l_bottomstep;
     }
+
+#ifdef N64_BENCH
+    // Close SEG_RASTER, reopen BSP_WALK for the rest of the walk.
+    N64Bench_PhaseSwitch(BPH_SEG_RASTER, BPH_BSP_WALK);
+#endif
+
+#ifdef N64
+    // RDP-routed seg: turn each tier's captured per-column spans into rdp_wall_t
+    // records (run-coalescing + the per-run quad math live in rdp_view.c so this
+    // hot TU stays at the pre-RDP baseline size when the flag is off). Each
+    // DL_RouteEmit is a no-op if that tier drew nothing this seg. A single-sided
+    // seg only fed the MID stream; a two-sided seg fed TOP and/or BOT. The tier
+    // texturemid + texture select which records map to which texture bucket.
+    if (rdp_route)
+    {
+#ifdef N64_BENCH
+	// ACCOUNTING ONLY (zero runtime effect): bracket the wall-emit
+	// (run-coalesce + DL_EmitRunPiece deviation scan + DL_EmitWallTier)
+	// into the otherwise-unused PLANE_EMIT slot, so the bench reports
+	// wall-emit cost SEPARATELY from BSP traversal instead of hiding it
+	// inside BSP_WALK. The diagnosis measured this hidden emit at
+	// ~1800-2046us; without this split a future round cannot see emit
+	// vs traversal. PLANE_EMIT is unused for walls (it was reserved for a
+	// future plane-to-RDP move that has not landed), so reusing it here
+	// is free and unambiguous.
+	N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_PLANE_EMIT);
+#endif
+	DL_RouteEmit(DL_TIER_MID, l_rw_midtexturemid,    l_midtexture,    centery);
+	DL_RouteEmit(DL_TIER_TOP, l_rw_toptexturemid,    l_toptexture,    centery);
+	DL_RouteEmit(DL_TIER_BOT, l_rw_bottomtexturemid, l_bottomtexture, centery);
+#ifdef N64_BENCH
+	N64Bench_PhaseSwitch(BPH_PLANE_EMIT, BPH_BSP_WALK);
+#endif
+    }
+#endif
+
+    // write back the accumulators the caller / next seg reads
+    rw_x = l_rw_x;
+    rw_scale = l_rw_scale;
+    topfrac = l_topfrac;
+    bottomfrac = l_bottomfrac;
+    pixhigh = l_pixhigh;
+    pixlow = l_pixlow;
 }
 
 
@@ -677,29 +907,36 @@ R_StoreWallRange
     // calculate incremental stepping values for texture edges
     worldtop >>= 4;
     worldbottom >>= 4;
-	
-    topstep = -FixedMul (rw_scalestep, worldtop);
-    topfrac = (centeryfrac>>4) - FixedMul (worldtop, rw_scale);
 
-    bottomstep = -FixedMul (rw_scalestep,worldbottom);
-    bottomfrac = (centeryfrac>>4) - FixedMul (worldbottom, rw_scale);
-	
+    // hoist shared subexpressions out of the four edge calcs below
+    {
+    const fixed_t	centery4 = centeryfrac>>4;
+    const fixed_t	scalestep = rw_scalestep;
+    const fixed_t	scale = rw_scale;
+
+    topstep = -FixedMul (scalestep, worldtop);
+    topfrac = centery4 - FixedMul (worldtop, scale);
+
+    bottomstep = -FixedMul (scalestep,worldbottom);
+    bottomfrac = centery4 - FixedMul (worldbottom, scale);
+
     if (backsector)
-    {	
+    {
 	worldhigh >>= 4;
 	worldlow >>= 4;
 
 	if (worldhigh < worldtop)
 	{
-	    pixhigh = (centeryfrac>>4) - FixedMul (worldhigh, rw_scale);
-	    pixhighstep = -FixedMul (rw_scalestep,worldhigh);
+	    pixhigh = centery4 - FixedMul (worldhigh, scale);
+	    pixhighstep = -FixedMul (scalestep,worldhigh);
 	}
-	
+
 	if (worldlow > worldbottom)
 	{
-	    pixlow = (centeryfrac>>4) - FixedMul (worldlow, rw_scale);
-	    pixlowstep = -FixedMul (rw_scalestep,worldlow);
+	    pixlow = centery4 - FixedMul (worldlow, scale);
+	    pixlowstep = -FixedMul (scalestep,worldlow);
 	}
+    }
     }
     
     // render it

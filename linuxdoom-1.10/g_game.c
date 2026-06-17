@@ -79,6 +79,10 @@ rcsid[] = "$Id: g_game.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
 
 #include "g_game.h"
 
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
+
 
 #define SAVEGAMESIZE	0x2c000
 #define SAVESTRINGSIZE	24
@@ -329,9 +333,11 @@ fixed_t		sidemove[2] = {0x18, 0x28};
 fixed_t		angleturn[3] = {640, 1280, 320};	// + slow turn
 int		alwaysRun = 0;		// default movement: 1 = run, 0 = walk
 int		controlScheme = 0;	// N64 controls: 0 = original, 1 = alt
-int		frame_interpolation = 1;	// 1 = uncapped/smooth, 0 = capped
+int		frame_interpolation = 0;	// 0 = capped (shipped); interpolation/SMOOTH option removed from the menu
 int		splitOrientation = 0;		// 2p split: 0 = horizontal, 1 = vertical
 int		widescreen = 0;		// aspect: 0 = 4:3, 1 = 16:9 (Hor+)
+int		n64_use_rdp_renderer = 0;	// renderer: 0 = software, 1 = RDP (kill-switch)
+int		n64_show_fps = 0;	// on-screen FPS counter: 0 = off, 1 = on (real-HW perf readout)
 
 #define SLOWTURNTICS	6 
  
@@ -609,12 +615,17 @@ void G_BuildTiccmd (ticcmd_t* cmd)
 	cmd->buttons = BT_SPECIAL | BTS_PAUSE; 
     } 
  
-    if (sendsave) 
-    { 
-	sendsave = false; 
-	cmd->buttons = BT_SPECIAL | BTS_SAVEGAME | (savegameslot<<BTS_SAVESHIFT); 
-    } 
-} 
+    if (sendsave)
+    {
+	sendsave = false;
+	cmd->buttons = BT_SPECIAL | BTS_SAVEGAME | (savegameslot<<BTS_SAVESHIFT);
+    }
+#ifdef N64_BENCH
+    // Bench: replace real input with the deterministic scripted sequence so the
+    // scenario is identical every run, independent of any host-side input.
+    N64Bench_FillTiccmd(cmd);
+#endif
+}
 
 #ifdef N64
 void G_BuildTiccmdN64Local(ticcmd_t* cmd, int playernum, const n64_local_input_t* input)
@@ -637,6 +648,18 @@ void G_BuildTiccmdN64Local(ticcmd_t* cmd, int playernum, const n64_local_input_t
     memcpy(cmd, base, sizeof(*cmd));
 
     cmd->consistancy = consistancy[playernum][maketic % BACKUPTICS];
+
+#if defined(N64_BENCH) && defined(N64_BENCH_MP)
+    // MP bench: scripted movement for every local player. Movement fields
+    // only, so the consistancy assignment above stays intact (the local-MP
+    // consistency check is currently compiled out; the ordering is
+    // defensive).
+    if (N64Bench_Active())
+    {
+        N64Bench_FillTiccmdMP(cmd, playernum);
+        return;
+    }
+#endif
 
     speed = (((input && input->speed) ? 1 : 0) ^ (alwaysRun & 1));
     joyx = input ? input->joy_x : 0;
@@ -1029,11 +1052,15 @@ void G_Ticker (void)
 	F_Ticker (); 
 	break; 
  
-      case GS_DEMOSCREEN: 
-	D_PageTicker (); 
-	break; 
-    }        
-} 
+      case GS_DEMOSCREEN:
+	D_PageTicker ();
+	break;
+    }
+#ifdef N64_BENCH
+    // Once per gametic: advance scenario timing (warm-up / collect / finish).
+    N64Bench_TicHook();
+#endif
+}
  
  
 //

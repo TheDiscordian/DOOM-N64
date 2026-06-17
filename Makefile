@@ -24,6 +24,7 @@ DOOM_SRC = linuxdoom-1.10
 N64_MKDFS_ROOT = filesystem
 
 DEBUG ?= 0
+BENCH ?= 0
 
 ifneq ($(wildcard $(N64_INST)/n64.mk),)
 include $(N64_INST)/n64.mk
@@ -37,6 +38,152 @@ N64_ROM_SAVETYPE = eeprom4k	# cart EEPROM for persisted settings (not the Contro
 CFLAGS += -I$(DOOM_SRC)
 CFLAGS += -IDOOM_N64_Port_Example/src
 CFLAGS += -DDEBUG=$(DEBUG)
+ifeq ($(BENCH),1)
+CFLAGS += -DN64_BENCH=1
+# PLANETESS_COUNT=1: count-only go/no-go instrumentation for the future
+# "visplanes as RDP polygons" feature. Every bench frame, R_CountPlanePolyTris
+# (r_plane.c) tessellates the live visplanes into trapezoid strips using the
+# wall split predicate (DL_SPLIT_DEVY) and reports the triangle count -- mean +
+# p95 on the BENCH_PLANETESS line. NO render / NO UV / NO RDP emit, so the
+# geometry fingerprint is unperturbed. Always on for bench builds (the visplanes
+# exist regardless of which wall/plane renderer is selected).
+CFLAGS += -DPLANETESS_COUNT=1
+# PVS_PROBE=1: one-off count-only go/no-go instrumentation for a PVS/occlusion
+# bake. Every bench frame, R_Subsector (r_bsp.c) indexes the existing REJECT
+# lump (view sector vs each VISITED subsector's sector) and counts how many the
+# REJECT matrix would have culled -- a free, conservative LOWER bound on what a
+# true subsector PVS could cull. Reports mean + p95-tail cull_pct on the
+# BENCH_PVS line. NO render / NO geometry change (the fingerprint is unperturbed),
+# so it is OFF by default -- pass PVS_PROBE=1 on the make line for the one probe run.
+ifeq ($(PVS_PROBE),1)
+CFLAGS += -DPVS_PROBE=1
+endif
+# BAKEFAN_PROBE=1: one-off count-only go/no-go for the future native offline-baked
+# RDP renderer (DOOM 64's model: per-subsector floor/ceiling LEAF FANS instead of
+# runtime visplane trapezoid tessellation). Every bench frame, R_Subsector
+# (r_bsp.c) counts the leaf-fan triangles a bake WOULD emit -- (numsegs - 2),
+# clamp >=1 -- for each subsector whose floor and/or ceiling is actually drawn
+# (floorplane/ceilingplane != NULL, the same visibility the runtime planes use),
+# floor + ceiling separately. Reports mean + EXACT p95 on the BENCH_BAKEFAN line,
+# directly A/B-able against BENCH_PLANETESS (the runtime trapezoid-run tris the
+# bake would replace). NO render / NO geometry change (fingerprint unperturbed),
+# so it is OFF by default -- pass BAKEFAN_PROBE=1 on the make line for the probe run.
+ifeq ($(BAKEFAN_PROBE),1)
+CFLAGS += -DBAKEFAN_PROBE=1
+endif
+# RDPWAIT_PROBE=1: one-off time/count-only instrumentation pinning WHERE the CPU
+# blocks on the RDP/RDRAM. Attributes the async RDP-completion interrupt
+# (I_N64BufferDone, fired via rdpq_detach_cb on DP SYNC_FULL) to whichever BPH_*
+# bracket is open at fire time (BENCH_ASYNC lines: which phase's "phantom" time is
+# really a CP0-completion interrupt, not CPU work), and splits the two present-seam
+# waits -- display_get() free-framebuffer acquire and the buffer-flip RDP-busy spin
+# -- out of PRESENT/RDP_BUSY (BENCH_ASYNC_HDR). NO render / NO bracket-boundary
+# change (fingerprint unperturbed), so it is OFF by default -- pass RDPWAIT_PROBE=1
+# on the make line for the probe run.
+ifeq ($(RDPWAIT_PROBE),1)
+CFLAGS += -DRDPWAIT_PROBE=1
+endif
+# DPLANES_PROBE=1: one-off time-only sub-bracket of the `planes` BPH bracket. Every
+# bench frame, R_DrawPlanes (r_plane.c) accumulates RAW CP0 ticks into three
+# counters -- the per-visplane W_CacheLumpNum/Z_ChangeTag flat-lump cache, the
+# recursive R_EmitIslandRuns run-fitter (MINUS the un-projection it calls), and the
+# R_PlaneCornerAttr float un-projections -- and N64Bench_SetDPlanes latches them.
+# Reports mean + EXACT p95 us per sub-part on the BENCH_DPLANES line, to split the
+# ~1646us `planes` cost across its constituents so the optimizer attacks the real
+# one. The emit body is timed in place but NOT changed (the geometry fingerprint is
+# unperturbed), so it is OFF by default -- pass DPLANES_PROBE=1 on the make line.
+ifeq ($(DPLANES_PROBE),1)
+CFLAGS += -DDPLANES_PROBE=1
+endif
+# BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
+ifneq ($(BENCH_MP),)
+CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)
+endif
+# BENCH_FORCE_RDP=1: the flag-ON A/B run. Pins n64_use_rdp_renderer=1 at startup
+# (d_main.c) so the RDP-renderer run is reproducible from committed source
+# instead of a throwaway harness patch. Default (unset) is the flag-OFF run.
+ifeq ($(BENCH_FORCE_RDP),1)
+CFLAGS += -DBENCH_FORCE_RDP=1
+# Stage-4 sub-path selectors (only meaningful with BENCH_FORCE_RDP=1). Pin the
+# wall/plane A/B toggles at startup so the isolation A/B runs are reproducible
+# from committed source.
+#   BENCH_FORCE_PLANES_ONLY=1 -> SW walls + RDP planes (the isolation experiment)
+#   BENCH_FORCE_WALLS_ONLY=1  -> RDP walls + SW planes (Stage-3 regression guard)
+ifeq ($(BENCH_FORCE_PLANES_ONLY),1)
+CFLAGS += -DBENCH_FORCE_PLANES_ONLY=1
+endif
+ifeq ($(BENCH_FORCE_WALLS_ONLY),1)
+CFLAGS += -DBENCH_FORCE_WALLS_ONLY=1
+endif
+endif
+# BENCH_FORCE_SHOW_FPS=1: pin the on-screen SHOW-FPS counter ON at startup
+# (d_main.c) so a BENCH_MARKS capture can grab the overlay for an A/B vs the
+# default-off build -- reproducible from committed source. Renderer-independent
+# (not nested under BENCH_FORCE_RDP). Visual-capture builds only -- never timing
+# builds; the overlay draw + sprintf would skew the numbers.
+ifeq ($(BENCH_FORCE_SHOW_FPS),1)
+CFLAGS += -DBENCH_FORCE_SHOW_FPS=1
+endif
+# BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
+# ISViewer every 256 retained frames) for exactly-paired cross-build
+# screenshot series. Visual-capture builds only -- never timing builds, the
+# debugf cost would skew the numbers.
+ifeq ($(BENCH_MARKS),1)
+CFLAGS += -DN64_BENCH_MARKS=1
+# BENCH_MARK_FLASH=1: extra off-grid markers on the death-flash detail frames
+# (3150/3160) so the red damage-flash band-fix A/B can pair them. Superset of the
+# canonical 128-grid (those still fire). Bench-only; no renderer effect.
+ifeq ($(BENCH_MARK_FLASH),1)
+CFLAGS += -DBENCH_MARK_FLASH=1
+endif
+endif
+endif
+# DL_TRACE=1: one-off diagnostic builds only -- per-present RDP flush/emit
+# trace lines (DL_TRACE ...) on the ISViewer log (rdp_view.c DL_DEBUG_TRACE).
+# Never for timing runs, never the default for capture runs (extra log
+# traffic skews both).
+ifeq ($(DL_TRACE),1)
+CFLAGS += -DDL_DEBUG_TRACE=1
+endif
+# PLANE_UV_TRACE=1: one-off diagnostic builds only -- floor-poly texel self-trace
+# (PUVT_* lines on the ISViewer log; r_plane.c PLANE_UV_TRACE). Dumps, for the
+# first few floor trapezoid polys of an early frame, the per-corner EMITTED u/v/
+# invw vs R_MapPlane's EXPECTED s/t AND the poly-center RDP-reconstructed texel
+# vs expected, to localise the garbage-floor bug. Never for timing runs (the
+# debugf cost + log traffic skew the numbers); default off (compiled out).
+ifeq ($(PLANE_UV_TRACE),1)
+CFLAGS += -DPLANE_UV_TRACE=1
+# Optional frame selection for the FINAL-S/T (rdp_view.c DL_DrawPlanePoly) half of
+# the trace. These name a BENCH_MARK frame (128/256/384...): the rdp_view.c dump
+# pairs to BENCH_MARK frame=N. Set on the make line, e.g.
+#   PLANE_UV_TRACE=1 PLANE_UV_TRACE_FRAME=128 PLANE_UV_TRACE_FRAME2=384
+# Default 128 (garbage) + 384 (clean) in the source; FRAME2=0 dumps one frame.
+ifneq ($(PLANE_UV_TRACE_FRAME),)
+CFLAGS += -DPLANE_UV_TRACE_FRAME=$(PLANE_UV_TRACE_FRAME)
+endif
+ifneq ($(PLANE_UV_TRACE_FRAME2),)
+CFLAGS += -DPLANE_UV_TRACE_FRAME2=$(PLANE_UV_TRACE_FRAME2)
+endif
+endif
+# PLANE_GEOM_TRACE=1: one-off diagnostic builds only -- floor-poly COVERAGE/geometry
+# trace (PGT_* lines on the ISViewer log; r_plane.c PLANE_GEOM_TRACE). Dumps, for the
+# first few floor trapezoid RUNS of an early frame, the emitted run's screen coverage
+# (x1/x2 + four corner ytop/ybot), the visplane's TRUE per-column extent (top[x]/
+# bottom[x] at x1/mid/x2 with the poly-vs-visplane row delta), and the adjacent-run
+# boundary (prev run right edge vs this run left edge -> overlap/gap/clean). Localises
+# the floor-bleed/clip-wrong COVERAGE bug (NOT the texel bug -- that is PLANE_UV_TRACE).
+# Never for timing runs (the debugf cost + log traffic skew the numbers); default off.
+ifeq ($(PLANE_GEOM_TRACE),1)
+CFLAGS += -DPLANE_GEOM_TRACE=1
+endif
+# Optional marker-frame overrides for the geom trace (default 3200/3328 in source):
+#   PLANE_GEOM_TRACE=1 PLANE_GEOM_TRACE_FRAME=3200 PLANE_GEOM_TRACE_FRAME2=3328
+ifneq ($(PLANE_GEOM_TRACE_FRAME),)
+CFLAGS += -DPLANE_GEOM_TRACE_FRAME=$(PLANE_GEOM_TRACE_FRAME)
+endif
+ifneq ($(PLANE_GEOM_TRACE_FRAME2),)
+CFLAGS += -DPLANE_GEOM_TRACE_FRAME2=$(PLANE_GEOM_TRACE_FRAME2)
+endif
 ifeq ($(strip $(wildcard $(REQUESTED_N64_INST)/mips64-elf/include/ktls.h) $(wildcard $(REQUESTED_N64_INST)/include/ktls.h)),)
 ifneq ($(wildcard $(CURDIR)/libdragon/include/ktls.h),)
 CFLAGS += -I$(CURDIR)/libdragon/include
@@ -113,16 +260,28 @@ DOOM_COMMON_SRCS = \
 	$(DOOM_SRC)/sounds.c \
 	$(DOOM_SRC)/lzfx.c
 
+ifeq ($(BENCH),1)
+DOOM_COMMON_SRCS += $(DOOM_SRC)/n64_bench.c
+endif
+
 DOOM_PLATFORM_SRCS = \
 	$(DOOM_SRC)/i_main_n64.c \
 	$(DOOM_SRC)/i_wad_browser_n64.c \
 	$(DOOM_SRC)/i_system_n64.c \
 	$(DOOM_SRC)/i_video_n64.c \
 	$(DOOM_SRC)/i_sound_n64.c \
-	$(DOOM_SRC)/i_net_n64.c
+	$(DOOM_SRC)/i_net_n64.c \
+	$(DOOM_SRC)/rdp_view.c
 
 DOOM_SRCS = $(DOOM_COMMON_SRCS) $(DOOM_PLATFORM_SRCS)
 OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)
+
+# Hot TUs at -O3 (appended after n64.mk's -O2; last -O wins).
+# Renderer (round 1), plus game logic, sound mixer, and MUS synth (round 2).
+$(BUILD_DIR)/$(DOOM_SRC)/r_%.o: CFLAGS += -O3
+$(BUILD_DIR)/$(DOOM_SRC)/p_%.o: CFLAGS += -O3
+$(BUILD_DIR)/$(DOOM_SRC)/i_sound_n64.o: CFLAGS += -O3
+$(BUILD_DIR)/$(DOOM_SRC)/s_sound.o: CFLAGS += -O3
 
 MUSIC_ASSETS_XM_LOWER = $(wildcard assets/music/*.xm)
 MUSIC_ASSETS_XM_UPPER = $(wildcard assets/music/*.XM)

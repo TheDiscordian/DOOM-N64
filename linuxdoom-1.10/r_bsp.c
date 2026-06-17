@@ -42,6 +42,25 @@ rcsid[] = "$Id: r_bsp.c,v 1.4 1997/02/03 22:45:12 b1 Exp $";
 
 //#include "r_local.h"
 
+#ifdef PVS_PROBE
+#include "p_local.h"        // rejectmatrix (the sector-visibility REJECT lump)
+#include "n64_bench.h"
+// Count-only PVS/occlusion-bake probe. pvs_view_sector + the per-frame
+// accumulators live in r_main.c (R_SetupFrame sets view_sector and resets the
+// counters; R_RenderPlayerView latches them via N64Bench_SetPvsCounts).
+extern int	pvs_view_sector;
+extern int	pvs_frame_visited;
+extern int	pvs_frame_cullable;
+#endif
+
+#ifdef BAKEFAN_PROBE
+// Count-only baked-leaf-fan probe accumulator (lives in r_main.c; R_SetupFrame
+// resets it, R_RenderPlayerView latches it via N64Bench_SetBakefanTris). For each
+// subsector whose floor and/or ceiling is drawn this frame, R_Subsector adds the
+// leaf-fan tris a bake WOULD emit -- (numsegs - 2) clamp >=1 -- per visible plane.
+extern int	bakefan_frame_tris;
+#endif
+
 
 
 seg_t*		curline;
@@ -513,6 +532,22 @@ void R_Subsector (int num)
     count = sub->numlines;
     line = &segs[sub->firstline];
 
+#ifdef PVS_PROBE
+    // Count-only PVS probe: this subsector was VISITED (survived the R_CheckBBox
+    // node prune + 1-D solidsegs occlusion). Would the existing sector-granular
+    // REJECT matrix have culled it from the view sector? Index REJECT exactly as
+    // P_CheckSight does (p_sight.c): pnum = s1*numsectors + s2, bit (pnum&7) of
+    // byte (pnum>>3). Pure measurement -- changes NO geometry, NO rendering.
+    pvs_frame_visited++;
+    if (pvs_view_sector >= 0)
+    {
+        int	s2 = (int)(frontsector - sectors);
+        int	pnum = pvs_view_sector * numsectors + s2;
+        if (rejectmatrix[pnum >> 3] & (1 << (pnum & 7)))
+            pvs_frame_cullable++;   // REJECT says "not visible" -> a PVS could cull
+    }
+#endif
+
     if (frontsector->floorheight < viewz)
     {
 	floorplane = R_FindPlane (frontsector->floorheight,
@@ -532,7 +567,24 @@ void R_Subsector (int num)
     else
 	ceilingplane = NULL;
 		
-    R_AddSprites (frontsector);	
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan go/no-go: a native offline bake (DOOM 64's model)
+    // would draw this subsector's floor/ceiling as a LEAF FAN of (numsegs - 2)
+    // triangles -- a convex subsector of N edge-segs fans to N-2 tris (clamp >=1
+    // for degenerate 1-2 seg subsectors). Count floor + ceiling SEPARATELY, gated
+    // on EXACTLY the runtime's plane visibility (floorplane/ceilingplane != NULL --
+    // the same NULL the span renderer keys off), so the A/B vs BENCH_PLANETESS
+    // (the trapezoid-run tris the bake replaces) is fair. COUNT-ONLY: no baking,
+    // no rendering -- reads the live subsector seg count and accumulates.
+    {
+	int fan = count - 2;		// count == sub->numlines (edge segs)
+	if (fan < 1) fan = 1;
+	if (floorplane)   bakefan_frame_tris += fan;
+	if (ceilingplane) bakefan_frame_tris += fan;
+    }
+#endif
+
+    R_AddSprites (frontsector);
 
     while (count--)
     {

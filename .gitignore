@@ -69,3 +69,12 @@ build
 *.z64
 *.log
 filesystem
+
+# Bench harness local save artifacts -- must never be tracked or seeded into a
+# run. A blank/stale save on disk could otherwise drift the deterministic A/B
+# scenario (and the per-run mktemp workdir means they leak nothing anyway).
+bench/bench-baseline.eeprom
+bench/bench-baseline.pak
+bench/last-overlay.png
+*.eeprom
+*.pak

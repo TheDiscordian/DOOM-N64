@@ -17,6 +17,9 @@
 #include "i_system.h"
 #include "n64_debug.h"
 #include "z_zone.h"
+#ifdef N64_BENCH
+#include "n64_bench.h"
+#endif
 
 int mb_used = 4;
 
@@ -94,6 +97,15 @@ int I_GetTime(void)
     static uint64_t basetime_ms;
     uint64_t now_ms;
 
+#ifdef N64_BENCH
+    // While the bench runs, the tic clock is a deterministic virtual clock
+    // (host-independent), so the scripted playthrough is byte-identical run to
+    // run and NetUpdate's newtics cannot burst on host jitter. The wall-clock
+    // base is bypassed entirely; the virtual clock starts at 0 by construction.
+    if (N64Bench_Active())
+        return (int)((N64Bench_VirtualTimeMs() * TICRATE) / 1000);
+#endif
+
     now_ms = get_ticks_ms();
     if (!basetime_ms)
         basetime_ms = now_ms;
@@ -114,9 +126,22 @@ uint64_t I_GetTimeUS(void)
 extern int alwaysRun, controlScheme, frame_interpolation, splitOrientation;
 extern int showMessages, detailLevel;
 extern int snd_SfxVolume, snd_MusicVolume, mouseSensitivity;
+extern int widescreen, n64_use_rdp_renderer, n64_show_fps;
 
 #define N64_SETTINGS_MAGIC   0x444E3631u	/* 'DN61' */
-#define N64_SETTINGS_VERSION 1
+// Bump to 2: Stage 0 repurposed the struct's last reserved byte into
+// use_rdp_renderer. A version-1 save was written WITHOUT that field, so loading
+// it under the new layout would read a stale reserved byte as the RDP-renderer
+// flag (silently enabling the RDP path from a pre-RDP save). The version gate
+// must invalidate any version-1 save so it falls back to compiled defaults --
+// correct shipping behaviour, not just bench hygiene. (Harmless today only
+// because no valid save has ever been written, but a real forward-compat trap.)
+//
+// Bump to 3: appended show_fps in the next reserved byte. Same reasoning as the
+// v1->v2 bump -- a v2 save was written WITHOUT this field, so the version gate
+// must invalidate it (fall back to compiled defaults: show_fps = 0, OFF) rather
+// than read a stale reserved byte as the toggle.
+#define N64_SETTINGS_VERSION 3
 
 typedef struct
 {
@@ -132,7 +157,8 @@ typedef struct
     int8_t	mouse_sens;
     int8_t	split_orient;	// added in reserved space; old saves read 0 (horizontal)
     int8_t	widescreen;	// added in reserved space; old saves read 0 (4:3)
-    uint8_t	reserved[1];
+    int8_t	use_rdp_renderer;	// added in reserved space; old saves read 0 (software)
+    int8_t	show_fps;	// added in reserved space; old saves read 0 (counter off)
 } n64_settings_t;
 
 void I_N64LoadSettings(void)
@@ -148,7 +174,10 @@ void I_N64LoadSettings(void)
 
     alwaysRun           = s.always_run;
     controlScheme       = s.control_scheme;
-    frame_interpolation = s.frame_interp;
+    // frame_interpolation intentionally NOT restored from EEPROM -- the SMOOTH/
+    // interpolation option was removed from the menu; the game always ships
+    // capped (compiled default 0). A stale save with frame_interp=1 must not
+    // silently re-enable interpolation.
     showMessages        = s.show_messages;
     detailLevel         = s.detail_level;
     snd_SfxVolume       = s.sfx_volume;
@@ -156,6 +185,8 @@ void I_N64LoadSettings(void)
     mouseSensitivity    = s.mouse_sens;
     splitOrientation    = s.split_orient;
     widescreen          = s.widescreen;
+    n64_use_rdp_renderer = s.use_rdp_renderer;
+    n64_show_fps         = s.show_fps;
 }
 
 void I_N64SaveSettings(void)
@@ -178,6 +209,8 @@ void I_N64SaveSettings(void)
     s.mouse_sens     = (int8_t)mouseSensitivity;
     s.split_orient   = (int8_t)splitOrientation;
     s.widescreen     = (int8_t)widescreen;
+    s.use_rdp_renderer = (int8_t)n64_use_rdp_renderer;
+    s.show_fps       = (int8_t)n64_show_fps;
 
     eeprom_write_bytes(&s, 0, sizeof(s));
 }

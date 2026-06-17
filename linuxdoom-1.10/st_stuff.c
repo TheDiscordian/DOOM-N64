@@ -1112,6 +1112,23 @@ void ST_Drawer (boolean fullscreen, boolean refresh)
     st_statusbaron = (!fullscreen) || automapactive;
     st_firsttime = st_firsttime || refresh;
 
+#ifdef N64
+    // screens[0] is ping-ponged each present, so a refresh (status-bar
+    // background + forced widget redraw) must land in both CI8 buffers before
+    // per-buffer diff drawing resumes.
+    {
+	static int st_n64_refresh_left;
+
+	if (st_firsttime)
+	    st_n64_refresh_left = 2;
+	if (st_n64_refresh_left)
+	{
+	    st_firsttime = true;
+	    st_n64_refresh_left--;
+	}
+    }
+#endif
+
     // Do red-/gold-shifts from damage/items
     ST_doPaletteStuff();
 

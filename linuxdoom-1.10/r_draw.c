@@ -28,6 +28,8 @@ static const char
 rcsid[] = "$Id: r_draw.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
 
 
+#include <stdint.h>
+
 #include "doomdef.h"
 
 #include "i_system.h"
@@ -124,28 +126,36 @@ void R_DrawColumn (void)
 
     // Framebuffer destination address.
     // Use ylookup LUT to avoid multiply with ScreenWidth.
-    // Use columnofs LUT for subwindows? 
-    dest = ylookup[dc_yl] + columnofs[dc_x];  
+    // Use columnofs LUT for subwindows?
+    dest = ylookup[dc_yl] + columnofs[dc_x];
 
     // Determine scaling,
     //  which is the only mapping to be done.
-    fracstep = dc_iscale; 
-    frac = dc_texturemid + (dc_yl-centery)*fracstep; 
+    fracstep = dc_iscale;
+    frac = dc_texturemid + (dc_yl-centery)*fracstep;
 
-    // Inner loop that does the actual texture mapping,
-    //  e.g. a DDA-lile scaling.
-    // This is as fast as it gets.
-    do 
+    // Cache globals in locals so the per-pixel store (through a byte pointer,
+    //  which aliases everything) cannot force a reload of these each iteration.
     {
-	// Re-map color indices from wall texture column
-	//  using a lighting/special effects LUT.
-	*dest = dc_colormap[dc_source[(frac>>FRACBITS)&127]];
-	
-	dest += SCREENWIDTH; 
-	frac += fracstep;
-	
-    } while (count--); 
-} 
+	register byte*			source = dc_source;
+	register lighttable_t*		colormap = dc_colormap;
+
+	// Inner loop that does the actual texture mapping,
+	//  e.g. a DDA-lile scaling.
+	// This is as fast as it gets.
+	do
+	{
+	    // Re-map color indices from wall texture column
+	    //  using a lighting/special effects LUT.
+	    *dest = colormap[source[(frac>>FRACBITS)&127]];
+
+	    dest += SCREENWIDTH;
+	    frac += fracstep;
+
+	} while (count--);
+    }
+}
+
 
 
 
@@ -237,19 +247,39 @@ void R_DrawColumnLow (void)
     
     dest = ylookup[dc_yl] + columnofs[dc_x];
     dest2 = ylookup[dc_yl] + columnofs[dc_x+1];
-    
-    fracstep = dc_iscale; 
-    frac = dc_texturemid + (dc_yl-centery)*fracstep;
-    
-    do 
-    {
-	// Hack. Does not work corretly.
-	*dest2 = *dest = dc_colormap[dc_source[(frac>>FRACBITS)&127]];
-	dest += SCREENWIDTH;
-	dest2 += SCREENWIDTH;
-	frac += fracstep; 
 
-    } while (count--);
+    fracstep = dc_iscale;
+    frac = dc_texturemid + (dc_yl-centery)*fracstep;
+
+    {
+	register byte*			source = dc_source;
+	register lighttable_t*		colormap = dc_colormap;
+
+	// dest2 == dest+1 (adjacent framebuffer columns). When the pair is
+	// 2-byte aligned, write both with one halfword store; otherwise an
+	// unaligned `sh` would address-error, so fall back to two byte stores.
+	if (!(((uintptr_t)dest) & 1))
+	{
+	    do
+	    {
+		register byte texel = colormap[source[(frac>>FRACBITS)&127]];
+		*(uint16_t*)dest = (texel << 8) | texel;
+		dest += SCREENWIDTH;
+		frac += fracstep;
+	    } while (count--);
+	}
+	else
+	{
+	    do
+	    {
+		// Hack. Does not work corretly.
+		*dest2 = *dest = colormap[source[(frac>>FRACBITS)&127]];
+		dest += SCREENWIDTH;
+		dest2 += SCREENWIDTH;
+		frac += fracstep;
+	    } while (count--);
+	}
+    }
 }
 
 
@@ -349,23 +379,30 @@ void R_DrawFuzzColumn (void)
     // Looks like an attempt at dithering,
     //  using the colormap #6 (of 0-31, a bit
     //  brighter than average).
-    do 
     {
-	// Lookup framebuffer, and retrieve
-	//  a pixel that is either one column
-	//  left or right of the current one.
-	// Add index from colormap to index.
-	*dest = colormaps[6*256+dest[fuzzoffset[fuzzpos]]]; 
+	register lighttable_t*	fuzzmap = colormaps + 6*256;
+	register int		pos = fuzzpos;
 
-	// Clamp table lookup index.
-	if (++fuzzpos == FUZZTABLE) 
-	    fuzzpos = 0;
-	
-	dest += SCREENWIDTH;
+	do
+	{
+	    // Lookup framebuffer, and retrieve
+	    //  a pixel that is either one column
+	    //  left or right of the current one.
+	    // Add index from colormap to index.
+	    *dest = fuzzmap[dest[fuzzoffset[pos]]];
 
-	frac += fracstep; 
-    } while (count--); 
-} 
+	    // Clamp table lookup index.
+	    if (++pos == FUZZTABLE)
+		pos = 0;
+
+	    dest += SCREENWIDTH;
+
+	    frac += fracstep;
+	} while (count--);
+
+	fuzzpos = pos;
+    }
+}
 
 void R_DrawFuzzColumnLow (void)
 {
@@ -406,20 +443,27 @@ void R_DrawFuzzColumnLow (void)
     fracstep = dc_iscale;
     frac = dc_texturemid + (dc_yl-centery)*fracstep;
 
-    do
     {
-	fuzzed = colormaps[6*256+dest[fuzzoffset[fuzzpos]]];
-	*dest = fuzzed;
-	*dest2 = fuzzed;
+	register lighttable_t*	fuzzmap = colormaps + 6*256;
+	register int		pos = fuzzpos;
 
-	if (++fuzzpos == FUZZTABLE)
-	    fuzzpos = 0;
+	do
+	{
+	    fuzzed = fuzzmap[dest[fuzzoffset[pos]]];
+	    *dest = fuzzed;
+	    *dest2 = fuzzed;
 
-	dest += SCREENWIDTH;
-	dest2 += SCREENWIDTH;
+	    if (++pos == FUZZTABLE)
+		pos = 0;
 
-	frac += fracstep;
-    } while (count--);
+	    dest += SCREENWIDTH;
+	    dest2 += SCREENWIDTH;
+
+	    frac += fracstep;
+	} while (count--);
+
+	fuzzpos = pos;
+    }
 }
  
   
@@ -487,19 +531,25 @@ void R_DrawTranslatedColumn (void)
     frac = dc_texturemid + (dc_yl-centery)*fracstep; 
 
     // Here we do an additional index re-mapping.
-    do 
     {
-	// Translation tables are used
-	//  to map certain colorramps to other ones,
-	//  used with PLAY sprites.
-	// Thus the "green" ramp of the player 0 sprite
-	//  is mapped to gray, red, black/indigo. 
-	*dest = dc_colormap[dc_translation[dc_source[frac>>FRACBITS]]];
-	dest += SCREENWIDTH;
-	
-	frac += fracstep; 
-    } while (count--); 
-} 
+	register byte*			source = dc_source;
+	register byte*			translation = dc_translation;
+	register lighttable_t*		colormap = dc_colormap;
+
+	do
+	{
+	    // Translation tables are used
+	    //  to map certain colorramps to other ones,
+	    //  used with PLAY sprites.
+	    // Thus the "green" ramp of the player 0 sprite
+	    //  is mapped to gray, red, black/indigo.
+	    *dest = colormap[translation[source[frac>>FRACBITS]]];
+	    dest += SCREENWIDTH;
+
+	    frac += fracstep;
+	} while (count--);
+    }
+}
 
 void R_DrawTranslatedColumnLow (void)
 {
@@ -533,17 +583,38 @@ void R_DrawTranslatedColumnLow (void)
     fracstep = dc_iscale;
     frac = dc_texturemid + (dc_yl-centery)*fracstep;
 
-    do
     {
-	translated = dc_colormap[dc_translation[dc_source[frac>>FRACBITS]]];
-	*dest = translated;
-	*dest2 = translated;
+	register byte*			source = dc_source;
+	register byte*			translation = dc_translation;
+	register lighttable_t*		colormap = dc_colormap;
 
-	dest += SCREENWIDTH;
-	dest2 += SCREENWIDTH;
+	// dest2 == dest+1: collapse the pair into one halfword store when the
+	// destination is 2-byte aligned, else keep two byte stores.
+	if (!(((uintptr_t)dest) & 1))
+	{
+	    do
+	    {
+		translated = colormap[translation[source[frac>>FRACBITS]]];
+		*(uint16_t*)dest = (translated << 8) | translated;
+		dest += SCREENWIDTH;
+		frac += fracstep;
+	    } while (count--);
+	}
+	else
+	{
+	    do
+	    {
+		translated = colormap[translation[source[frac>>FRACBITS]]];
+		*dest = translated;
+		*dest2 = translated;
 
-	frac += fracstep;
-    } while (count--);
+		dest += SCREENWIDTH;
+		dest2 += SCREENWIDTH;
+
+		frac += fracstep;
+	    } while (count--);
+	}
+    }
 }
 
 
@@ -617,15 +688,14 @@ int			dscount;
 
 //
 // Draws the actual span.
-void R_DrawSpan (void) 
-{ 
+void R_DrawSpan (void)
+{
     fixed_t		xfrac;
-    fixed_t		yfrac; 
-    byte*		dest; 
+    fixed_t		yfrac;
+    byte*		dest;
     int			count;
-    int			spot; 
-	 
-#ifdef RANGECHECK 
+
+#ifdef RANGECHECK
     if (ds_x2 < ds_x1
 	|| ds_x1<0
 	|| ds_x2>=SCREENWIDTH  
@@ -638,29 +708,82 @@ void R_DrawSpan (void)
 #endif 
 
     
-    xfrac = ds_xfrac; 
-    yfrac = ds_yfrac; 
-	 
+    xfrac = ds_xfrac;
+    yfrac = ds_yfrac;
+
     dest = ylookup[ds_y] + columnofs[ds_x1];
 
     // We do not check for zero spans here?
-    count = ds_x2 - ds_x1; 
+    count = ds_x2 - ds_x1;
 
-    do 
     {
-	// Current texture index in u,v.
-	spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	// Cache loop-invariant globals; the byte stores below would otherwise
+	// force a reload of each on every pixel (char aliases everything).
+	register byte*			source = ds_source;
+	register lighttable_t*		colormap = ds_colormap;
+	register fixed_t		xstep = ds_xstep;
+	register fixed_t		ystep = ds_ystep;
+	register int			n = count + 1;
+	register int			spot;
 
-	// Lookup pixel from flat texture tile,
-	//  re-index using light/colormap.
-	*dest++ = ds_colormap[ds_source[spot]];
+	// screens[0] is uncached RDRAM: one aligned 64-bit store is a single
+	// transaction for 8 pixels vs 8 separate byte transactions. Head singles
+	// bring dest to 8-byte alignment, then write packed octets, then tail.
+	while (n > 0 && (((uintptr_t)dest) & 7))
+	{
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    *dest++ = colormap[source[spot]];
+	    xfrac += xstep;
+	    yfrac += ystep;
+	    n--;
+	}
 
-	// Next step in u,v.
-	xfrac += ds_xstep; 
-	yfrac += ds_ystep;
-	
-    } while (count--); 
-} 
+	while (n >= 8)
+	{
+	    register uint64_t packed;
+
+	    // Pixel at the lowest address is the most significant byte
+	    //  (big-endian target), so pack p0..p7 from bit 56 down to 0.
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed = (uint64_t)colormap[source[spot]] << 56;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 48;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 40;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 32;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 24;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 16;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]] << 8;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    packed |= (uint64_t)colormap[source[spot]];
+	    xfrac += xstep; yfrac += ystep;
+
+	    *(uint64_t*)dest = packed;
+	    dest += 8;
+	    n -= 8;
+	}
+
+	while (n > 0)
+	{
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    *dest++ = colormap[source[spot]];
+	    xfrac += xstep;
+	    yfrac += ystep;
+	    n--;
+	}
+    }
+}
 
 
 
@@ -740,15 +863,14 @@ void R_DrawSpan (void)
 //
 // Again..
 //
-void R_DrawSpanLow (void) 
-{ 
+void R_DrawSpanLow (void)
+{
     fixed_t		xfrac;
-    fixed_t		yfrac; 
-    byte*		dest; 
+    fixed_t		yfrac;
+    byte*		dest;
     int			count;
-    int			spot; 
-	 
-#ifdef RANGECHECK 
+
+#ifdef RANGECHECK
     if (ds_x2 < ds_x1
 	|| ds_x1<0
 	|| ds_x2>=SCREENWIDTH  
@@ -773,18 +895,68 @@ void R_DrawSpanLow (void)
     ds_x1 <<= 1;
     dest = ylookup[ds_y] + columnofs[ds_x1];
 
-    do 
-    { 
-	spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
-	// Lowres/blocky mode does it twice,
-	//  while scale is adjusted appropriately.
-	*dest++ = ds_colormap[ds_source[spot]]; 
-	*dest++ = ds_colormap[ds_source[spot]];
-	
-	xfrac += ds_xstep; 
-	yfrac += ds_ystep; 
+    {
+	register byte*			source = ds_source;
+	register lighttable_t*		colormap = ds_colormap;
+	register fixed_t		xstep = ds_xstep;
+	register fixed_t		ystep = ds_ystep;
+	register int			n = count + 1;
+	register int			spot;
+	register byte			texel;
 
-    } while (count--); 
+	// Each logical pixel writes two adjacent framebuffer bytes of the same
+	// value. Head singles bring dest to 8-byte alignment, then pack 4 logical
+	// pixels (8 bytes) into one 64-bit store, then tail singles.
+	while (n > 0 && (((uintptr_t)dest) & 7))
+	{
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    *dest++ = texel;
+	    *dest++ = texel;
+	    xfrac += xstep;
+	    yfrac += ystep;
+	    n--;
+	}
+
+	while (n >= 4)
+	{
+	    register uint64_t packed;
+
+	    // Lowest address = most significant byte (big-endian). Each logical
+	    //  pixel occupies two adjacent bytes of the same value.
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    packed = (uint64_t)texel << 56 | (uint64_t)texel << 48;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    packed |= (uint64_t)texel << 40 | (uint64_t)texel << 32;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    packed |= (uint64_t)texel << 24 | (uint64_t)texel << 16;
+	    xfrac += xstep; yfrac += ystep;
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    packed |= (uint64_t)texel << 8 | (uint64_t)texel;
+	    xfrac += xstep; yfrac += ystep;
+
+	    *(uint64_t*)dest = packed;
+	    dest += 8;
+	    n -= 4;
+	}
+
+	while (n > 0)
+	{
+	    spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+	    texel = colormap[source[spot]];
+	    *dest++ = texel;
+	    *dest++ = texel;
+	    xfrac += xstep;
+	    yfrac += ystep;
+	    n--;
+	}
+    }
 }
 
 //
@@ -852,8 +1024,20 @@ R_SetViewWindow
     for (i=0 ; i<viewheight ; i++)
 	ylookup[i] = screens[0] + (i+viewwindowy)*SCREENWIDTH;
 }
- 
- 
+
+#ifdef N64
+// The N64 layer ping-pongs screens[0] each present; ylookup caches that base,
+// so rebase it to the active draw buffer using the current view geometry.
+void R_N64RebaseScreen(void)
+{
+    int i;
+
+    for (i=0 ; i<viewheight ; i++)
+	ylookup[i] = screens[0] + (i+viewwindowy)*SCREENWIDTH;
+}
+#endif
+
+
 
 
 //

@@ -85,6 +85,10 @@ static const char rcsid[] = "$Id: d_main.c,v 1.8 1997/02/03 22:45:09 b1 Exp $";
 #include "i_wad_browser_n64.h"
 #include "i_main_n64.h"
 #include "n64_debug.h"
+#include "rdp_view.h"
+#endif
+#ifdef N64_BENCH
+#include "n64_bench.h"
 #endif
 
 //
@@ -224,7 +228,11 @@ typedef struct d_n64_split_rect_s
 #define N64_SPLIT_HUD_PAD_X 2
 #define N64_SPLIT_HUD_TEXT_Y_OFFSET 10
 #define N64_SPLIT_HUD_KEY_ROW_H 9
-#if DEBUG
+#ifdef N64
+// On-screen FPS counter. Always compiled into N64 builds (the source used to be
+// gated behind #if DEBUG, so it never shipped); the update + draw are now driven
+// at the call sites by the n64_show_fps Options toggle, which is OFF by default --
+// so the release build pays zero cost and shows nothing unless the user enables it.
 #define N64_SPLIT_FPS_PAD_X 2
 #define N64_SPLIT_FPS_PAD_Y 2
 
@@ -626,7 +634,16 @@ void D_Display (void)
 	if (!gametic)
 	    break;
 	if (automapactive)
+	{
 	    AM_Drawer ();
+	    // Split mode has no status bar covering the bottom 32 rows that
+	    // AM_clearFB leaves undrawn; clear them (palette 0 = the automap
+	    // background) so the ping-pong buffers don't flicker stale pane
+	    // pixels there.
+	    if (splitplayers > 1)
+		memset (screens[0] + (SCREENHEIGHT-32)*SCREENWIDTH, 0,
+			32*SCREENWIDTH);
+	}
 	if (wipe || (viewheight != 200 && fullscreen) )
 	    redrawsbar = true;
 	if (inhelpscreensstate && !inhelpscreens)
@@ -662,9 +679,22 @@ void D_Display (void)
     if (gamestate == GS_LEVEL && !automapactive && gametic)
 	{
 #ifdef N64
-#if DEBUG
-	    D_N64UpdateDebugFps();
-#endif
+	    // RDP renderer: reset the per-frame emit arena + per-texture buckets
+	    // ONCE before the player render(s). The world pass is drained later
+	    // by DL_Flush at the present seam (i_video_n64.c). DL_BeginFrame also
+	    // derives this frame's free-W constant k and bakes the PRIM LUT.
+	    //
+	    // GATED on the kill-switch: with the flag OFF the seg loop never
+	    // routes (DL_WallRouteOn() is false), so the arena/buckets/k/LUT are
+	    // never read this frame -- calling DL_BeginFrame anyway would leak a
+	    // per-frame float divide + arena reset (+ a one-time LUT bake) into the
+	    // software path that the Stage-1 baseline did not have, drifting the
+	    // flag-OFF bench off byte-identical. Skipping it when the flag is off
+	    // keeps the kill-switch path bit-for-bit the pre-RDP software path.
+	    if (n64_use_rdp_renderer)
+		DL_BeginFrame();
+	    if (n64_show_fps)
+		D_N64UpdateDebugFps();
 	    if (splitplayers > 1)
 	    {
 		restoredisplayplayer = displayplayer;
@@ -705,13 +735,14 @@ void D_Display (void)
 		    I_N64SplitScreenEndFrame();
 		else
 		    R_RenderPlayerView (&players[restoredisplayplayer]);
-	    #if DEBUG
-		splitrect.x = 0;
-		splitrect.y = 0;
-		splitrect.w = SCREENWIDTH;
-		splitrect.h = SCREENHEIGHT;
-		D_N64DrawDebugFps(&splitrect);
-	    #endif
+		if (n64_show_fps)
+		{
+		    splitrect.x = 0;
+		    splitrect.y = 0;
+		    splitrect.w = SCREENWIDTH;
+		    splitrect.h = SCREENHEIGHT;
+		    D_N64DrawDebugFps(&splitrect);
+		}
 		displayplayer = restoredisplayplayer;
 	    }
 	    else
@@ -719,21 +750,27 @@ void D_Display (void)
 	    {
 		R_RenderPlayerView (&players[displayplayer]);
 	#ifdef N64
-	#if DEBUG
-		viewrect.x = viewwindowx;
-		viewrect.y = viewwindowy;
-		viewrect.w = scaledviewwidth;
-		viewrect.h = viewheight;
-		D_N64DrawDebugFps(&viewrect);
-	#endif
+		if (n64_show_fps)
+		{
+		    viewrect.x = viewwindowx;
+		    viewrect.y = viewwindowy;
+		    viewrect.w = scaledviewwidth;
+		    viewrect.h = viewheight;
+		    D_N64DrawDebugFps(&viewrect);
+		}
 	#endif
 	    }
 	}
 
 
+    // (The DL_BUILD bench bracket lives in I_FinishUpdate around DL_Flush --
+    // the flush runs inside the present seam, not here. A stale zero-length
+    // placeholder bracket here was removed with the Stage-3 phase-attribution
+    // fix.)
+
     if (gamestate == GS_LEVEL && gametic && splitplayers < 2)
 	HU_Drawer ();
-    
+
     // clean up border stuff
     if (gamestate != oldgamestate && gamestate != GS_LEVEL)
 	I_SetPalette (W_CacheLumpName ("PLAYPAL",PU_CACHE));
@@ -785,11 +822,20 @@ void D_Display (void)
     M_Drawer ();          // menu is drawn even on top of everything
     NetUpdate ();         // send out any new accumulation
 
+#ifdef N64_BENCH
+    N64Bench_DrawOverlay();   // frozen result numbers, drawn over everything
+#endif
 
     // normal update
     if (!wipe)
     {
+#ifdef N64_BENCH
+	N64Bench_PhaseBegin(BPH_PRESENT);
 	I_FinishUpdate ();              // page flip or blit buffer
+	N64Bench_PhaseEnd(BPH_PRESENT);
+#else
+	I_FinishUpdate ();              // page flip or blit buffer
+#endif
 	return;
     }
     
@@ -802,6 +848,12 @@ void D_Display (void)
     {
 	do
 	{
+#ifdef N64_BENCH
+	    // The bench tic clock is a virtual frame counter, not the host wall
+	    // clock; advance it each spin so this melt loop (which busy-waits on
+	    // I_GetTime advancing) always makes progress instead of deadlocking.
+	    N64Bench_VirtualTick();
+#endif
 	    nowtime = I_GetTime ();
 	    tics = nowtime - wipestart;
 	} while (!tics);
@@ -841,11 +893,40 @@ void D_DoomLoop (void)
 	
     I_InitGraphics ();
 
+#ifdef N64
+    // RDP renderer (Stage 1+): reserve the transparency-key palette index by
+    // scanning the UI/status-bar/font/menu patch lumps. The WAD is fully loaded
+    // by now (W_InitMultipleFiles ran in D_DoomMain), so the scan sees every
+    // UI graphic. Run once, before the first present packs the TLUT.
+    I_N64ScanTransparencyKey ();
+#endif
+
     while (1)
     {
 	// frame syncronous IO operations
-	I_StartFrame ();                
-	
+	I_StartFrame ();
+
+#ifdef N64_BENCH
+	N64Bench_VirtualTick(); // advance the deterministic virtual tic clock
+	                        // (read by I_GetTime) BEFORE the tic-production
+	                        // pass, so newtics has a fixed host-independent
+	                        // cadence and the scripted playthrough never forks.
+	N64Bench_LoopBegin();   // brackets the whole iteration (sim+audio+display)
+	// (ACCOUNTING HONESTY) The old empty BPH_RDP_BUSY Begin/End pair here
+	// measured NOTHING -- it bracketed zero work at frame top and reported a
+	// spurious ~4-5us. RDP_BUSY is ALREADY measured where it actually occurs:
+	// the buffer-flip busy-spin in I_FinishUpdate (i_video_n64.c, around the
+	// `while (doom_screen8_rdp_busy[next_idx]) ;` loop), which is the only
+	// point the CPU can wait on a too-slow async RDP. The overlap diagnosis
+	// confirmed that spin is ~0 (spin_hits=0): the RDP drains inside the CPU
+	// residual, so a near-zero RDP_BUSY is the CORRECT reading, not a missing
+	// one. The empty frame-top pair is removed so the phase reflects only the
+	// real spin. (A serializing post-flush RDP-done read would inflate the
+	// very overlap it measures and break determinism, so it is deliberately
+	// NOT added to the shipping bench path -- that read lives only in the
+	// throwaway DL_DIAG diagnostic build.)
+#endif
+
 	// process one or more tics
 	if (singletics)
 	{
@@ -887,8 +968,10 @@ void D_DoomLoop (void)
 	    // sub-tic lerp) is the separate, optional smoothing on top.
 	    // render_uncapped also covers local 2-4p so the doubled-frame skip
 	    // is fixed there too; only true network games are excluded. The
-	    // sub-tic interpolation stays single-player for now (split-screen
-	    // needs per-viewport handling), so it is gated off for local MP.
+	    // sub-tic interpolation works per pane in split-screen as well:
+	    // each R_RenderPlayerView lerps from its own player's snapshots
+	    // (P_PlayerThink snapshots every playeringame player), all panes
+	    // sharing one fractionaltic.
 	    boolean render_uncapped =
 		   !singletics
 		&& !demoplayback
@@ -897,13 +980,33 @@ void D_DoomLoop (void)
 		&& !menuactive
 		&& gamestate == GS_LEVEL
 		&& (!netgame || D_LocalMultiplayerEnabled());
-	    boolean interpolate =
-		render_uncapped && frame_interpolation && !D_LocalMultiplayerEnabled();
+	    boolean interpolate = render_uncapped && frame_interpolation;
+#ifdef N64_BENCH
+	    // Bench measures the SHIPPING uncapped+interpolated path; force
+	    // interpolation on regardless of persisted EEPROM settings (which the
+	    // emulator may not carry). singletics/demoplayback are never set here.
+	    if (N64Bench_Active())
+	    {
+		interpolate = render_uncapped;
+		if (interpolate)
+		    N64Bench_NoteInterp(D_GetLocalPlayerCount());
+	    }
+#endif
 
 	    r_interpolate = interpolate;
 	    tryruntics_nonblocking = render_uncapped;
 
+#ifdef N64_BENCH
+	    {
+		int bench_pre_gametic = gametic;
+		N64Bench_PhaseBegin(BPH_GAMETIC);
+		TryRunTics (); // non-blocking when uncapped; runs a tic only when due
+		N64Bench_PhaseEnd(BPH_GAMETIC);
+		N64Bench_SetTicsRan(gametic - bench_pre_gametic);
+	    }
+#else
 	    TryRunTics (); // non-blocking when uncapped; runs a tic only when due
+#endif
 
 	    if (interpolate)
 	    {
@@ -942,19 +1045,52 @@ void D_DoomLoop (void)
 	    }
 	}
 
-	S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
+	// move positional sounds and expire finished channels: vanilla ran
+	// this once per tic (frames were tic-locked); under the uncapped
+	// renderer it would otherwise run every vsync. gametic advances every
+	// tic even while paused/in menu (TryRunTics blocks there), so gating
+	// on gametic preserves vanilla pause channel-expiry behaviour.
+	{
+	    static int s_sounds_lasttic = -1;
+	    if (gametic != s_sounds_lasttic)
+	    {
+		s_sounds_lasttic = gametic;
+#ifdef N64_BENCH
+		N64Bench_PhaseBegin(BPH_AUDIO);
+		S_UpdateSounds (players[consoleplayer].mo);
+		N64Bench_PhaseEnd(BPH_AUDIO);   // accumulates with post-display audio
+#else
+		S_UpdateSounds (players[consoleplayer].mo);
+#endif
+	    }
+	}
 
 	// Update display, next frame, with current state.
+#ifdef N64_BENCH
+	N64Bench_DisplayBegin();
+	N64Bench_FrameBegin();
+#endif
 	D_Display ();
+#ifdef N64_BENCH
+	N64Bench_FrameEnd();
+	N64Bench_DisplayEnd();
+#endif
 
+#ifdef N64_BENCH
+	N64Bench_PhaseBegin(BPH_AUDIO);
+#endif
 #ifndef SNDSERV
 	// Sound mixing for the buffer is snychronous.
 	I_UpdateSound();
-#endif	
+#endif
 	// Synchronous sound output is explicitly called.
 #ifndef SNDINTR
 	// Update sound output.
 	I_SubmitSound();
+#endif
+#ifdef N64_BENCH
+	N64Bench_PhaseEnd(BPH_AUDIO);
+	N64Bench_LoopEnd();
 #endif
     }
 }
@@ -2013,13 +2149,82 @@ void D_DoomMain (void)
     }
 	
 
+#ifdef N64_BENCH
+    // Bench mode: auto-start E1M1 on medium skill, no monsters disabled (a
+    // representative scenario), and arm the harness. Bypasses the title loop.
+    startskill = sk_medium;
+    startepisode = 1;
+    startmap = 1;
+    autostart = true;
+
+    // Pin every scenario-defining setting to a canonical value, AFTER
+    // I_N64LoadSettings, so the bench scene is identical regardless of any EEPROM
+    // save state (compiled out of shipping builds). Today the load already no-ops
+    // on a blank/old-version EEPROM, but this makes the guarantee structural: a
+    // future seeded save can never silently widen the FOV, flip the renderer, or
+    // change the view size out from under the A/B comparison.
+    widescreen           = 0;   // 4:3 -- wider FOV would change drawseg counts
+    frame_interpolation  = 1;   // uncapped+interpolated shipping path (bench also forces this)
+    detailLevel          = 0;   // high detail
+    screenblocks         = 10;  // full 4:3 view, status bar visible (shipping default)
+    setblocks            = 10;
+    setsizeneeded        = true;
+    n64_show_fps         = 0;   // FPS overlay off -- the update+draw must not perturb timing
+    // FPS overlay capture pin: force the SHOW-FPS counter ON at build time so a
+    // BENCH_MARKS run can grab the on-screen counter for an A/B vs the (default-
+    // off) build -- reproducible from committed source, same discipline as
+    // BENCH_FORCE_RDP. Never define it for a TIMING run (the overlay draw + the
+    // sprintf perturb the numbers, and the off-default bench fingerprint).
+#ifdef BENCH_FORCE_SHOW_FPS
+    n64_show_fps = 1;
+    debugf("BENCH: BENCH_FORCE_SHOW_FPS -> n64_show_fps=1\n");
+#endif
+    // RDP toggle: OFF by default (flag-off A run). The flag-ON run is selected at
+    // BUILD time with -DBENCH_FORCE_RDP, so the on-run is reproducible from
+    // committed source instead of a throwaway harness patch (the old stage1-on
+    // log printed "BENCH_FORCE_RDP" but no such symbol existed in the tree).
+#ifdef BENCH_FORCE_RDP
+    n64_use_rdp_renderer = 1;
+    debugf("BENCH: BENCH_FORCE_RDP -> n64_use_rdp_renderer=1\n");
+    // Stage-4 sub-path selectors (compile-time, so the A/B runs are byte-
+    // reproducible from committed source -- the same discipline as
+    // BENCH_FORCE_RDP itself). Default (neither defined) is FULL RDP: both
+    // wall and plane A/B toggles keep their startup default of 1.
+    //   BENCH_FORCE_PLANES_ONLY -> SW walls + RDP planes (the ISOLATION A/B).
+    //   BENCH_FORCE_WALLS_ONLY  -> RDP walls + SW planes (the Stage-3 regress-
+    //                              guard config; pixel-matches Stage-3 accept).
+#ifdef BENCH_FORCE_PLANES_ONLY
+    n64_rdp_wall_ab  = 0;
+    n64_rdp_plane_ab = 1;
+    debugf("BENCH: BENCH_FORCE_PLANES_ONLY -> walls CPU, planes RDP\n");
+#endif
+#ifdef BENCH_FORCE_WALLS_ONLY
+    n64_rdp_wall_ab  = 1;
+    n64_rdp_plane_ab = 0;
+    debugf("BENCH: BENCH_FORCE_WALLS_ONLY -> walls RDP, planes CPU\n");
+#endif
+#else
+    n64_use_rdp_renderer = 0;
+#endif
+#ifdef N64_BENCH_MP
+    // MP bench: scripted local split-screen with N64_BENCH_MP players.
+    D_SetLocalPlayerCount(N64_BENCH_MP);
+#endif
+    N64Bench_Init();
+#endif
+
     if ( gameaction != ga_loadgame )
     {
+#if defined(N64_BENCH) && defined(N64_BENCH_MP)
+	// MP bench starts deferred so G_DoNewGame runs the local-multiplayer
+	// expansion (netgame, playeringame[], doomcom nodes).
+	G_DeferedInitNew (startskill, startepisode, startmap);
+#else
 	if (autostart || netgame)
 	    G_InitNew (startskill, startepisode, startmap);
 	else
 	    D_StartTitle ();                // start up intro loop
-
+#endif
     }
 
     D_DoomLoop ();  // never returns

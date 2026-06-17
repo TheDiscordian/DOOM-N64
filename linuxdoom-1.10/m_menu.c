@@ -201,6 +201,8 @@ void M_ChangeMovement(int choice);
 void M_ChangeControls(int choice);
 void M_ChangeFramerate(int choice);
 void M_ChangeAspect(int choice);
+void M_ChangeRenderer(int choice);
+void M_ChangeShowFps(int choice);
 void M_SizeDisplay(int choice);
 void M_StartGame(int choice);
 void M_Sound(int choice);
@@ -229,7 +231,6 @@ void M_DrawEmptyCell(menu_t *menu,int item);
 void M_DrawSelCell(menu_t *menu,int item);
 void M_WriteText(int x, int y, char *string);
 void M_WriteTextScaled(int x, int y, char *string, int num, int den);
-void M_WriteTextScaledDim(int x, int y, char *string, int num, int den);
 extern boolean D_LocalMultiplayerEnabled(void);
 extern int D_GetLocalPlayerCount(void);
 int  M_StringWidth(char *string);
@@ -363,6 +364,8 @@ enum
     movement,
     controls,
     aspect,
+    renderer,
+    show_fps,
     framerate,
     scrnsize,
     option_empty1,
@@ -382,6 +385,8 @@ menuitem_t OptionsMenu[]=
     {1,"",	M_ChangeMovement,'r'},
     {1,"",	M_ChangeControls,'c'},
     {1,"",	M_ChangeAspect,'a'},
+    {1,"",	M_ChangeRenderer,'p'},
+    {1,"",	M_ChangeShowFps,'h'},
     {1,"",	M_ChangeFramerate,'f'},
     {2,"",	M_SizeDisplay,'s'},
     {-1,"",0},
@@ -398,7 +403,7 @@ menu_t  OptionsDef =
     M_DrawOptions,
     60,23,
     0,
-    12			// compact line height so all 12 rows clear the status bar
+    10			// compact line height so all 14 rows clear the status bar
 };
 
 //
@@ -1017,28 +1022,24 @@ void M_DrawOptions(void)
     M_WriteTextScaled(lx, OptionsDef.y+lh*aspect, "ASPECT", OPT_SNUM, OPT_SDEN);
     M_WriteTextScaled(vx, OptionsDef.y+lh*aspect, widescreen ? "16:9" : "4:3", OPT_SNUM, OPT_SDEN);
 
-    // Context-sensitive row: FRAMERATE in 1p, SPLIT in 2p, greyed in 3-4p.
-    {
-	int yrow = OptionsDef.y + lh*framerate;
-	int players = D_GetLocalPlayerCount();
+    M_WriteTextScaled(lx, OptionsDef.y+lh*renderer, "RENDERER", OPT_SNUM, OPT_SDEN);
+    M_WriteTextScaled(vx, OptionsDef.y+lh*renderer, n64_use_rdp_renderer ? "RDP" : "SOFT", OPT_SNUM, OPT_SDEN);
 
-	if (players >= 3)
+    M_WriteTextScaled(lx, OptionsDef.y+lh*show_fps, "SHOW FPS", OPT_SNUM, OPT_SDEN);
+    M_WriteTextScaled(vx, OptionsDef.y+lh*show_fps, n64_show_fps ? "ON" : "OFF", OPT_SNUM, OPT_SDEN);
+
+    // SPLIT-orientation row -- 2-player only. The framerate/interpolation
+    // selector was removed (the game ships capped); this row now hosts only the
+    // 2p split orientation. In 1p/3-4p it is empty and the cursor skips it
+    // (status forced to -1 below, which M_Responder's nav loop skips).
+    {
+	int players = D_GetLocalPlayerCount();
+	OptionsMenu[framerate].status = (players == 2) ? 1 : -1;
+	if (players == 2)
 	{
-	    // 3-4p: interpolation N/A and the layout is fixed; greyed out.
-	    M_WriteTextScaledDim(lx, yrow, "FRAMERATE", OPT_SNUM, OPT_SDEN);
-	    M_WriteTextScaledDim(vx, yrow, "CAPPED", OPT_SNUM, OPT_SDEN);
-	}
-	else if (players == 2)
-	{
-	    // 2p: choose the split orientation.
+	    int yrow = OptionsDef.y + lh*framerate;
 	    M_WriteTextScaled(lx, yrow, "SPLIT", OPT_SNUM, OPT_SDEN);
 	    M_WriteTextScaled(vx, yrow, splitOrientation ? "VERT" : "HOR", OPT_SNUM, OPT_SDEN);
-	}
-	else
-	{
-	    // 1p: choose the framerate mode.
-	    M_WriteTextScaled(lx, yrow, "FRAMERATE", OPT_SNUM, OPT_SDEN);
-	    M_WriteTextScaled(vx, yrow, frame_interpolation ? "SMOOTH" : "CAPPED", OPT_SNUM, OPT_SDEN);
 	}
     }
 
@@ -1099,17 +1100,15 @@ void M_ChangeControls(int choice)
 //
 //      Toggle uncapped (interpolated) vs capped framerate
 //
+// Now the 2-player SPLIT-orientation toggle only. The framerate/interpolation
+// selector was removed -- the game ships capped (frame_interpolation = 0). In
+// 1p/3-4p this row is non-selectable (status -1, set in M_DrawOptions), so this
+// only fires in 2p.
 void M_ChangeFramerate(int choice)
 {
-    int players = D_GetLocalPlayerCount();
-
     choice = 0;
-    if (players >= 3)
-	return;				// 3-4p: nothing to toggle here
-    else if (players == 2)
-	splitOrientation = 1 - splitOrientation;	// 2p: split orientation
-    else
-	frame_interpolation = 1 - frame_interpolation;	// 1p: framerate mode
+    if (D_GetLocalPlayerCount() == 2)
+	splitOrientation = 1 - splitOrientation;
 }
 
 void M_ChangeAspect(int choice)
@@ -1117,6 +1116,35 @@ void M_ChangeAspect(int choice)
     choice = 0;
     widescreen = 1 - widescreen;
     R_SetViewSize (screenblocks, detailLevel);	// rebuild projection tables
+}
+
+
+//
+//	Toggle the renderer between software and RDP (kill-switch). The RDP
+//	path is built up stage by stage; until it is wired the toggle has no
+//	visible effect, but the choice persists to EEPROM on menu close.
+//
+void M_ChangeRenderer(int choice)
+{
+    choice = 0;
+    n64_use_rdp_renderer = 1 - n64_use_rdp_renderer;
+    // The flag changes the transparency-key index's TLUT alpha bit, so the
+    // present must re-upload the palette with the new key alpha (and the
+    // present blit switches between COPY-transparency on/off).
+    I_N64MarkPaletteDirty();
+}
+
+
+//
+//	Toggle the on-screen FPS counter (real-hardware perf readout). OFF by
+//	default; persists to EEPROM on menu close. Driven at the d_main.c render
+//	call sites by n64_show_fps -- when OFF the counter is never updated or
+//	drawn, so it costs nothing and is invisible in normal play.
+//
+void M_ChangeShowFps(int choice)
+{
+    choice = 0;
+    n64_show_fps = 1 - n64_show_fps;
 }
 
 
@@ -1242,6 +1270,14 @@ void M_QuitDOOM(int choice)
 
 void M_ChangeSensitivity(int choice)
 {
+    if (D_GetLocalPlayerCount() == 2)
+    {
+	// 2p: this row hosts the FRAMERATE toggle (see M_DrawOptions); either
+	// direction flips it.
+	frame_interpolation = 1 - frame_interpolation;
+	return;
+    }
+
     switch(choice)
     {
       case 0:
@@ -1515,12 +1551,6 @@ M_WriteTextScaledTrans
 void M_WriteTextScaled (int x, int y, char* string, int num, int den)
 {
     M_WriteTextScaledTrans(x, y, string, num, den, NULL);
-}
-
-// Greyed/disabled variant: remap through a darker colormap level.
-void M_WriteTextScaledDim (int x, int y, char* string, int num, int den)
-{
-    M_WriteTextScaledTrans(x, y, string, num, den, colormaps + 18*256);
 }
 
 

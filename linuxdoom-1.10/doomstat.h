@@ -141,6 +141,8 @@ extern  int	controlScheme;	// N64 controls: 0 = original, 1 = alt
 extern  int	frame_interpolation;	// 1 = uncapped/smooth, 0 = capped
 extern  int	splitOrientation;	// 2p split: 0 = horizontal, 1 = vertical
 extern  int	widescreen;	// aspect: 0 = 4:3, 1 = 16:9 (Hor+)
+extern  int	n64_use_rdp_renderer;	// renderer: 0 = software, 1 = RDP (kill-switch)
+extern  int	n64_show_fps;	// on-screen FPS counter: 0 = off, 1 = on (real-HW perf readout)
 extern  boolean	tryruntics_nonblocking;	// uncapped render: TryRunTics won't wait
 extern  boolean	paused;		// Game Pause?
 

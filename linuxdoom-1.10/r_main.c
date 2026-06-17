@@ -41,7 +41,42 @@ static const char rcsid[] = "$Id: r_main.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
 #include "r_sky.h"
 
 #include "doomstat.h"
+#ifdef N64
+#include "i_video.h"
+#include "rdp_view.h"   // DL_AnyRouteOn (key-clear arming gate)
+#endif
 
+#ifdef N64_BENCH
+#include "n64_bench.h"
+// visplane pool pointers are file-static in r_plane.c; pull them in for the
+// per-frame visplane count (realloc-grown pool: count = lastvisplane-visplanes).
+extern visplane_t*	visplanes;
+extern visplane_t*	lastvisplane;
+#endif
+
+#ifdef PVS_PROBE
+// View sector index for this frame (count-only PVS probe). Computed once in
+// R_SetupFrame; r_bsp.c R_Subsector indexes the REJECT matrix against it per
+// visited subsector. -1 = not yet computed / invalid.
+int		pvs_view_sector = -1;
+// Per-frame accumulators: subsectors VISITED (= sscount) and how many of those
+// the REJECT matrix would cull from pvs_view_sector. Reset in R_SetupFrame,
+// read at the SetCounts call site below.
+int		pvs_frame_visited = 0;
+int		pvs_frame_cullable = 0;
+#endif
+
+#ifdef BAKEFAN_PROBE
+// Per-frame leaf-fan triangle accumulator (count-only go/no-go for the native
+// offline-baked RDP renderer: per-subsector floor/ceiling LEAF FANS instead of
+// runtime visplane trapezoid tessellation). r_bsp.c R_Subsector adds, for each
+// subsector whose floor and/or ceiling is drawn this frame (floorplane/
+// ceilingplane != NULL -- the SAME visibility the runtime planes use), the fan
+// tris a bake WOULD emit = (numsegs - 2), clamp >=1, floor + ceiling separately.
+// Reset in R_SetupFrame, latched at the SetCounts call site below. COUNT-ONLY --
+// reads live subsector geometry, emits nothing, perturbs no fingerprint.
+int		bakefan_frame_tris = 0;
+#endif
 
 
 
@@ -950,8 +985,23 @@ void R_SetupFrame (player_t* player)
 
     viewsin = finesine[viewangle>>ANGLETOFINESHIFT];
     viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
-	
+
     sscount = 0;
+
+#ifdef PVS_PROBE
+    // Count-only PVS probe: resolve the view sector once (viewx/viewy are now
+    // settled for both the interpolated and snapped paths) so R_Subsector can
+    // index the REJECT matrix against it. Reset the per-frame accumulators here.
+    pvs_view_sector = (int)(R_PointInSubsector(viewx, viewy)->sector - sectors);
+    pvs_frame_visited = 0;
+    pvs_frame_cullable = 0;
+#endif
+
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan probe: reset the per-frame fan-tri accumulator
+    // before the BSP walk re-fills it in R_Subsector. Pure measurement.
+    bakefan_frame_tris = 0;
+#endif
 	
     if (player->fixedcolormap)
     {
@@ -977,8 +1027,45 @@ void R_SetupFrame (player_t* player)
 // R_RenderView
 //
 void R_RenderPlayerView (player_t* player)
-{	
+{
     R_SetupFrame (player);
+
+    // RDP renderer dispatch (kill-switch). n64_use_rdp_renderer selects the
+    // RDP-rasterized path over the software colfunc/spanfunc fill.
+    //
+    // Erase-to-key is the BATCHED VIEW CLEAR again (Stage-3 seg_rast
+    // collapse). Stage 2's event-driven per-column erase (R_FillColumnKey at
+    // every suppressed span) was sized for ONE routed seg; with all wall
+    // tiers routed it wrote ~1 uncached byte per wall pixel per frame -- the
+    // same store count as the colfunc it replaced (~3.5-4 ms of the 5.2 ms
+    // flag-ON seg_rast wall). I_N64KeyClearView fills the view window with
+    // the key in 64-bit batches (~6.7k stores) before any drawer runs; CPU
+    // planes/sprites/psprite/HU overwrite their pixels, routed wall spans
+    // stay key for the RDP fill. The Stage-2 sparkle that retired the
+    // original full-view clear (key pixels OUTSIDE the dynamic keyed box
+    // blitted opaque as the key colour, trace DL_KEYSCAN p=1659) is closed
+    // structurally this time: the clear arms a FULL-VIEW keyed box in
+    // I_FinishUpdate, so every view-window key pixel is alpha-compare-
+    // revealed, never opaque-blitted; vanilla coverage gaps reveal
+    // 3-presents-old fb content (the same stale-content artifact class as
+    // vanilla's own unwritten pixels).
+#ifdef N64
+    // Arm the key-clear whenever ANY RDP world pass routes (walls OR planes).
+    // Stage 4: a planes-only config (SW walls + RDP planes, the isolation A/B)
+    // still needs the full-view key-clear so the suppressed plane regions hold
+    // the key for the present's keyed COPY blit -- gating on walls alone would
+    // leave the clear unarmed and the RDP flats covered by stale CI8.
+    if (DL_AnyRouteOn())
+    {
+#ifdef N64_BENCH
+	N64Bench_PhaseBegin(BPH_KEY_CLEAR);
+#endif
+	I_N64KeyClearView();
+#ifdef N64_BENCH
+	N64Bench_PhaseEnd(BPH_KEY_CLEAR);
+#endif
+    }
+#endif
 
     // Clear buffers.
     R_ClearClipSegs ();
@@ -989,19 +1076,74 @@ void R_RenderPlayerView (player_t* player)
     // check for new console commands.
     NetUpdate ();
 
-    // The head node is the last node output.
+    // The head node is the last node output. The phase open across the BSP
+    // walk is BSP_WALK; R_RenderSegLoop switches to SEG_RASTER around its
+    // per-column fill and back, so the wall raster cost is attributed
+    // separately (the RDP renderer offloads SEG_RASTER, keeps BSP_WALK).
+#ifdef N64_BENCH
+    N64Bench_PhaseBegin(BPH_BSP_WALK);
     R_RenderBSPNode (numnodes-1);
-    
-    // Check for new console commands.
-    NetUpdate ();
-    
+#else
+    R_RenderBSPNode (numnodes-1);
+#endif
+
+    // Mid-render NetUpdate keeps the net serviced during a long frame. In
+    // 1p there is no net to service, so it only burns I_GetTime + joypad
+    // polling; gate on netgame (true for local split-screen MP too).
+    if (netgame)
+	NetUpdate ();
+
+#ifdef N64_BENCH
+    N64Bench_PhaseSwitch(BPH_BSP_WALK, BPH_PLANES);   // one read closes bsp walk, opens planes
     R_DrawPlanes ();
-    
-    // Check for new console commands.
-    NetUpdate ();
-    
+    // PLANE_EMIT brackets the RDP renderer's plane-span emit, which will live
+    // inside R_DrawPlanes once planes move to the RDP. ~0 in this stage.
+    N64Bench_PhaseBegin(BPH_PLANE_EMIT);
+    N64Bench_PhaseEnd(BPH_PLANE_EMIT);
+#else
+    R_DrawPlanes ();
+#endif
+
+    if (netgame)
+	NetUpdate ();
+
+#ifdef N64_BENCH
+    N64Bench_PhaseSwitch(BPH_PLANES, BPH_MASKED);
     R_DrawMasked ();
+    N64Bench_PhaseEnd(BPH_MASKED);
+    // MASKED_EMIT brackets the RDP renderer's sprite/masked emit, which will
+    // live inside R_DrawMasked once sprites move to the RDP. ~0 in this stage.
+    N64Bench_PhaseBegin(BPH_MASKED_EMIT);
+    N64Bench_PhaseEnd(BPH_MASKED_EMIT);
+    // Latch per-frame work counts while the pools are still full (before the
+    // next frame's R_Clear* resets them). vissprites/drawsegs are end-pointer
+    // minus base; visplanes is the realloc-grown pool's used span.
+    N64Bench_SetCounts((int)(vissprite_p - vissprites),
+		       (int)(ds_p - drawsegs),
+		       (int)(lastvisplane - visplanes));
+#ifdef PLANETESS_COUNT
+    // Count-only go/no-go for "visplanes as RDP polygons": the visplane pool is
+    // still full here (R_DrawPlanes does not clear it; next frame's R_ClearPlanes
+    // does), so tessellate-count it now. Pure measurement -- reads top[]/bottom[],
+    // emits nothing, does not perturb the geometry fingerprint.
+    N64Bench_SetPlanePolyTris(R_CountPlanePolyTris());
+#endif
+#ifdef PVS_PROBE
+    // Count-only PVS/occlusion-bake go/no-go: latch the per-frame subsectors
+    // VISITED and REJECT-cullable totals accumulated during this frame's BSP
+    // walk (r_bsp.c R_Subsector). Pure measurement -- perturbs no geometry.
+    N64Bench_SetPvsCounts(pvs_frame_visited, pvs_frame_cullable);
+#endif
+#ifdef BAKEFAN_PROBE
+    // Count-only baked-leaf-fan go/no-go: latch the per-frame fan-tri total
+    // accumulated during this frame's BSP walk (r_bsp.c R_Subsector). Directly
+    // A/B-able against BENCH_PLANETESS. Pure measurement -- perturbs no geometry.
+    N64Bench_SetBakefanTris(bakefan_frame_tris);
+#endif
+#else
+    R_DrawMasked ();
+#endif
 
     // Check for new console commands.
-    NetUpdate ();				
+    NetUpdate ();
 }

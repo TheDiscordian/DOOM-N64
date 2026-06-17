@@ -53,7 +53,12 @@ int main(void)
         (void)setjmp(n64_browser_return);
         n64_browser_return_armed = 1;
 
+#ifdef N64_BENCH
+        // Skip the WAD browser; auto-load the shareware IWAD for the bench.
+        I_N64ForceSelectedWad("rom:/DOOM1.WAD");
+#else
         I_N64RunWadBrowser();
+#endif
 
         myargc = 1;
         myargv = n64_argv;
