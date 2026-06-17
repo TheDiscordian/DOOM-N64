@@ -1465,64 +1465,44 @@ static void DL_BuildPrimLUT(void)
     dl_prim_inited = 1;
 }
 
-// --- PRIM/SHADE damage-flash re-tint (plane palette-flash correctness) -------
-// dl_prim_lut is the per-level depth-light RGB that the RDP PLANE pass feeds as
-// SHADE (DL_PlaneCornerShade). It is baked ONCE from the BASE PLAYPAL at the
-// fixed reference index DL_PRIM_REF -- so it never tracked the master-TLUT
-// palette flashes (damage red / pickup gold / radsuit green). CI8 sprites/HUD
-// flash via the master TLUT; CI4 walls re-tint their sub-palettes (DL_RetintSlot)
-// -> but the RDP planes kept their un-flashed depth colours, so on a damage flash
-// software washed the WHOLE screen uniform red while the RDP floors/ceilings
-// stayed normal (the patches Ryan saw were the flashed CI8 things drawn over an
-// un-flashed RDP floor).
+// --- PRIM/SHADE damage-flash: SHADE stays UN-flashed (plane palette-flash fix) -
+// dl_prim_lut is the per-level depth-light RGB the RDP PLANE pass feeds as SHADE
+// (DL_PlaneCornerShade), combined as TEX0*SHADE. TEX0 is the flat CI8 texel
+// sampled through the RESIDENT master TLUT, and that TLUT is the FLASHED palette:
+// I_FinishUpdate uploads doom_tlut_master right before DL_Flush (i_video_n64.c),
+// and I_SetPalette writes the damage/pickup/radsuit colours into it. So under a
+// flash TEX0 *already* carries the wash -- the flash reaches the floor through
+// the texture side, exactly once.
 //
-// FIX (mirror of the CI4 wall re-tint): on a real palette-gen change, re-derive
-// each level's PRIM RGB from the CURRENT master TLUT at the SAME mapped index the
-// base bake used (colormaps[level*256 + DL_PRIM_REF]). The master TLUT is the
-// flashed palette (I_SetPalette), so under a REDS flash that mapped entry is the
-// red-washed colour at this light level -- exactly the per-level tint software's
-// uniform palette swap applies. The index SELECTION is unchanged (light falloff
-// curve identical); only the COLOURS track the flash, like the CI8 world. The
-// gouraud-interpolation across the quad is preserved (SHADE still smooth, no
-// banding regression). Off-flash (gen 0) the master TLUT == base PLAYPAL through
-// gammatable[usegamma], so this reproduces the base bake (the CI8 world the floors
-// must match goes through that SAME gamma'd TLUT, so deriving from it is the
-// correct off-flash colour, not a drift). Lazy + gen-gated: zero cost on
-// un-flashed frames, one O(NUMCOLORMAPS) re-pack per flash transition.
-extern uint32_t I_N64PaletteGen(void);
-extern const uint16_t* I_N64MasterTLUT(void);
-
-static uint32_t dl_prim_gen = 0xFFFFFFFFu;   // palette gen dl_prim_lut tracks
-
+// The earlier DL_RetintPrimLUT (26886ce) ALSO red-shifted SHADE from that same
+// flashed master TLUT, so the combiner produced red(TEX0) * red(SHADE) -- the
+// flash applied TWICE. Two sub-1.0 multiplies darken the result and, because a
+// multiply preserves the texel's channel ratios instead of remapping the index
+// like software's single palette swap, the flat's base green/brown hue bleeds
+// through (Ryan's "RDP floor keeps its texture hue where software is a fuller,
+// uniform red", frame 2048). Software's flashed floor is ONE remap:
+// master_tlut[ colormap[level][texel] ] -- the wash applied a single time to the
+// already-light-darkened index.
+//
+// FIX: SHADE must carry only the UN-flashed per-level darkening ramp (the base
+// PLAYPAL bake from DL_BuildPrimLUT), so the single flash lives entirely in TEX0.
+// That reproduces the validated off-flash structure (TEX0=base texel,
+// SHADE=base darkening) with the flash riding the texture, matching software's
+// single application. No per-flash work at all -- the base bake already holds the
+// right SHADE for every palette -- so this is strictly perf-neutral (no LUT
+// re-pack on flash transitions) and the gouraud de-banding (b4ac15b) and the
+// non-flash case are untouched (dl_prim_lut never changes after the startup bake).
+// The CI4 walls (DL_RetintSlot) still re-tint because their sub-palettes are NOT
+// the master TLUT; the planes don't need to because their texture IS the master.
+// (I_N64PaletteGen / I_N64MasterTLUT are still declared once near the top of the
+// file for the wall re-tint path; this routine no longer needs them.)
 static void DL_RetintPrimLUT(void)
 {
-    const uint16_t* master;
-    uint32_t        gen;
-    int             level;
-
-    if (!dl_prim_inited || !colormaps)
-        return;
-    gen = I_N64PaletteGen();
-    if (dl_prim_gen == gen)
-        return;                              // colours already track this flash
-
-    master = I_N64MasterTLUT();
-    for (level = 0; level < NUMCOLORMAPS; level++)
-    {
-        int      mapped = colormaps[level * 256 + DL_PRIM_REF];
-        uint16_t t      = master[mapped];
-        // Master TLUT is RGBA5551 (rrrrr.rggg.ggbb.bbba). Expand each 5-bit
-        // channel back to 8-bit (replicate the high 3 bits into the low 3) so the
-        // SHADE RGB matches the colour the CI8 world shows for the same index.
-        int r5 = (t >> 11) & 0x1F;
-        int g5 = (t >>  6) & 0x1F;
-        int b5 = (t >>  1) & 0x1F;
-        int r  = (r5 << 3) | (r5 >> 2);
-        int g  = (g5 << 3) | (g5 >> 2);
-        int b  = (b5 << 3) | (b5 >> 2);
-        dl_prim_lut[level] = (uint32_t)((r << 24) | (g << 16) | (b << 8) | 0xFF);
-    }
-    dl_prim_gen = gen;
+    // Intentional no-op: see the block comment above. SHADE stays the un-flashed
+    // base darkening ramp baked once in DL_BuildPrimLUT; the flash is carried by
+    // TEX0 (the flat sampled through the flashed resident master TLUT) exactly
+    // once, matching software's single palette remap. Kept as a named call site so
+    // the plane-flash reasoning is documented where DL_FlushPlanePolys invokes it.
 }
 
 // --- public API ------------------------------------------------------------
