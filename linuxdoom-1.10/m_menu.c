@@ -202,6 +202,7 @@ void M_ChangeControls(int choice);
 void M_ChangeFramerate(int choice);
 void M_ChangeAspect(int choice);
 void M_ChangeRenderer(int choice);
+void M_ChangeShowFps(int choice);
 void M_SizeDisplay(int choice);
 void M_StartGame(int choice);
 void M_Sound(int choice);
@@ -364,6 +365,7 @@ enum
     controls,
     aspect,
     renderer,
+    show_fps,
     framerate,
     scrnsize,
     option_empty1,
@@ -384,6 +386,7 @@ menuitem_t OptionsMenu[]=
     {1,"",	M_ChangeControls,'c'},
     {1,"",	M_ChangeAspect,'a'},
     {1,"",	M_ChangeRenderer,'p'},
+    {1,"",	M_ChangeShowFps,'h'},
     {1,"",	M_ChangeFramerate,'f'},
     {2,"",	M_SizeDisplay,'s'},
     {-1,"",0},
@@ -400,7 +403,7 @@ menu_t  OptionsDef =
     M_DrawOptions,
     60,23,
     0,
-    11			// compact line height so all 13 rows clear the status bar
+    10			// compact line height so all 14 rows clear the status bar
 };
 
 //
@@ -1022,6 +1025,9 @@ void M_DrawOptions(void)
     M_WriteTextScaled(lx, OptionsDef.y+lh*renderer, "RENDERER", OPT_SNUM, OPT_SDEN);
     M_WriteTextScaled(vx, OptionsDef.y+lh*renderer, n64_use_rdp_renderer ? "RDP" : "SOFT", OPT_SNUM, OPT_SDEN);
 
+    M_WriteTextScaled(lx, OptionsDef.y+lh*show_fps, "SHOW FPS", OPT_SNUM, OPT_SDEN);
+    M_WriteTextScaled(vx, OptionsDef.y+lh*show_fps, n64_show_fps ? "ON" : "OFF", OPT_SNUM, OPT_SDEN);
+
     // Context-sensitive row: FRAMERATE in 1p/3-4p, SPLIT in 2p (FRAMERATE
     // then lives on the mouse-sens row below).
     {
@@ -1141,6 +1147,19 @@ void M_ChangeRenderer(int choice)
     // present must re-upload the palette with the new key alpha (and the
     // present blit switches between COPY-transparency on/off).
     I_N64MarkPaletteDirty();
+}
+
+
+//
+//	Toggle the on-screen FPS counter (real-hardware perf readout). OFF by
+//	default; persists to EEPROM on menu close. Driven at the d_main.c render
+//	call sites by n64_show_fps -- when OFF the counter is never updated or
+//	drawn, so it costs nothing and is invisible in normal play.
+//
+void M_ChangeShowFps(int choice)
+{
+    choice = 0;
+    n64_show_fps = 1 - n64_show_fps;
 }
 
 

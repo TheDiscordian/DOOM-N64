@@ -337,6 +337,7 @@ int		frame_interpolation = 1;	// 1 = uncapped/smooth, 0 = capped
 int		splitOrientation = 0;		// 2p split: 0 = horizontal, 1 = vertical
 int		widescreen = 0;		// aspect: 0 = 4:3, 1 = 16:9 (Hor+)
 int		n64_use_rdp_renderer = 0;	// renderer: 0 = software, 1 = RDP (kill-switch)
+int		n64_show_fps = 0;	// on-screen FPS counter: 0 = off, 1 = on (real-HW perf readout)
 
 #define SLOWTURNTICS	6 
  

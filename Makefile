@@ -116,6 +116,14 @@ ifeq ($(BENCH_FORCE_WALLS_ONLY),1)
 CFLAGS += -DBENCH_FORCE_WALLS_ONLY=1
 endif
 endif
+# BENCH_FORCE_SHOW_FPS=1: pin the on-screen SHOW-FPS counter ON at startup
+# (d_main.c) so a BENCH_MARKS capture can grab the overlay for an A/B vs the
+# default-off build -- reproducible from committed source. Renderer-independent
+# (not nested under BENCH_FORCE_RDP). Visual-capture builds only -- never timing
+# builds; the overlay draw + sprintf would skew the numbers.
+ifeq ($(BENCH_FORCE_SHOW_FPS),1)
+CFLAGS += -DBENCH_FORCE_SHOW_FPS=1
+endif
 # BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
 # ISViewer every 256 retained frames) for exactly-paired cross-build
 # screenshot series. Visual-capture builds only -- never timing builds, the

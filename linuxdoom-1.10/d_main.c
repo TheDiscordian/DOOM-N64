@@ -228,7 +228,11 @@ typedef struct d_n64_split_rect_s
 #define N64_SPLIT_HUD_PAD_X 2
 #define N64_SPLIT_HUD_TEXT_Y_OFFSET 10
 #define N64_SPLIT_HUD_KEY_ROW_H 9
-#if DEBUG
+#ifdef N64
+// On-screen FPS counter. Always compiled into N64 builds (the source used to be
+// gated behind #if DEBUG, so it never shipped); the update + draw are now driven
+// at the call sites by the n64_show_fps Options toggle, which is OFF by default --
+// so the release build pays zero cost and shows nothing unless the user enables it.
 #define N64_SPLIT_FPS_PAD_X 2
 #define N64_SPLIT_FPS_PAD_Y 2
 
@@ -689,9 +693,8 @@ void D_Display (void)
 	    // keeps the kill-switch path bit-for-bit the pre-RDP software path.
 	    if (n64_use_rdp_renderer)
 		DL_BeginFrame();
-#if DEBUG
-	    D_N64UpdateDebugFps();
-#endif
+	    if (n64_show_fps)
+		D_N64UpdateDebugFps();
 	    if (splitplayers > 1)
 	    {
 		restoredisplayplayer = displayplayer;
@@ -732,13 +735,14 @@ void D_Display (void)
 		    I_N64SplitScreenEndFrame();
 		else
 		    R_RenderPlayerView (&players[restoredisplayplayer]);
-	    #if DEBUG
-		splitrect.x = 0;
-		splitrect.y = 0;
-		splitrect.w = SCREENWIDTH;
-		splitrect.h = SCREENHEIGHT;
-		D_N64DrawDebugFps(&splitrect);
-	    #endif
+		if (n64_show_fps)
+		{
+		    splitrect.x = 0;
+		    splitrect.y = 0;
+		    splitrect.w = SCREENWIDTH;
+		    splitrect.h = SCREENHEIGHT;
+		    D_N64DrawDebugFps(&splitrect);
+		}
 		displayplayer = restoredisplayplayer;
 	    }
 	    else
@@ -746,13 +750,14 @@ void D_Display (void)
 	    {
 		R_RenderPlayerView (&players[displayplayer]);
 	#ifdef N64
-	#if DEBUG
-		viewrect.x = viewwindowx;
-		viewrect.y = viewwindowy;
-		viewrect.w = scaledviewwidth;
-		viewrect.h = viewheight;
-		D_N64DrawDebugFps(&viewrect);
-	#endif
+		if (n64_show_fps)
+		{
+		    viewrect.x = viewwindowx;
+		    viewrect.y = viewwindowy;
+		    viewrect.w = scaledviewwidth;
+		    viewrect.h = viewheight;
+		    D_N64DrawDebugFps(&viewrect);
+		}
 	#endif
 	    }
 	}
@@ -2164,6 +2169,16 @@ void D_DoomMain (void)
     screenblocks         = 10;  // full 4:3 view, status bar visible (shipping default)
     setblocks            = 10;
     setsizeneeded        = true;
+    n64_show_fps         = 0;   // FPS overlay off -- the update+draw must not perturb timing
+    // FPS overlay capture pin: force the SHOW-FPS counter ON at build time so a
+    // BENCH_MARKS run can grab the on-screen counter for an A/B vs the (default-
+    // off) build -- reproducible from committed source, same discipline as
+    // BENCH_FORCE_RDP. Never define it for a TIMING run (the overlay draw + the
+    // sprintf perturb the numbers, and the off-default bench fingerprint).
+#ifdef BENCH_FORCE_SHOW_FPS
+    n64_show_fps = 1;
+    debugf("BENCH: BENCH_FORCE_SHOW_FPS -> n64_show_fps=1\n");
+#endif
     // RDP toggle: OFF by default (flag-off A run). The flag-ON run is selected at
     // BUILD time with -DBENCH_FORCE_RDP, so the on-run is reproducible from
     // committed source instead of a throwaway harness patch (the old stage1-on

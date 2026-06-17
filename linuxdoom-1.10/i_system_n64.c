@@ -126,7 +126,7 @@ uint64_t I_GetTimeUS(void)
 extern int alwaysRun, controlScheme, frame_interpolation, splitOrientation;
 extern int showMessages, detailLevel;
 extern int snd_SfxVolume, snd_MusicVolume, mouseSensitivity;
-extern int widescreen, n64_use_rdp_renderer;
+extern int widescreen, n64_use_rdp_renderer, n64_show_fps;
 
 #define N64_SETTINGS_MAGIC   0x444E3631u	/* 'DN61' */
 // Bump to 2: Stage 0 repurposed the struct's last reserved byte into
@@ -136,7 +136,12 @@ extern int widescreen, n64_use_rdp_renderer;
 // must invalidate any version-1 save so it falls back to compiled defaults --
 // correct shipping behaviour, not just bench hygiene. (Harmless today only
 // because no valid save has ever been written, but a real forward-compat trap.)
-#define N64_SETTINGS_VERSION 2
+//
+// Bump to 3: appended show_fps in the next reserved byte. Same reasoning as the
+// v1->v2 bump -- a v2 save was written WITHOUT this field, so the version gate
+// must invalidate it (fall back to compiled defaults: show_fps = 0, OFF) rather
+// than read a stale reserved byte as the toggle.
+#define N64_SETTINGS_VERSION 3
 
 typedef struct
 {
@@ -153,6 +158,7 @@ typedef struct
     int8_t	split_orient;	// added in reserved space; old saves read 0 (horizontal)
     int8_t	widescreen;	// added in reserved space; old saves read 0 (4:3)
     int8_t	use_rdp_renderer;	// added in reserved space; old saves read 0 (software)
+    int8_t	show_fps;	// added in reserved space; old saves read 0 (counter off)
 } n64_settings_t;
 
 void I_N64LoadSettings(void)
@@ -177,6 +183,7 @@ void I_N64LoadSettings(void)
     splitOrientation    = s.split_orient;
     widescreen          = s.widescreen;
     n64_use_rdp_renderer = s.use_rdp_renderer;
+    n64_show_fps         = s.show_fps;
 }
 
 void I_N64SaveSettings(void)
@@ -200,6 +207,7 @@ void I_N64SaveSettings(void)
     s.split_orient   = (int8_t)splitOrientation;
     s.widescreen     = (int8_t)widescreen;
     s.use_rdp_renderer = (int8_t)n64_use_rdp_renderer;
+    s.show_fps       = (int8_t)n64_show_fps;
 
     eeprom_write_bytes(&s, 0, sizeof(s));
 }
