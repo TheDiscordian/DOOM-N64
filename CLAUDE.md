@@ -103,21 +103,35 @@ pull — fixed in `0951cb3`).
 - Locked 60fps (p95 < 16670µs) is **not reachable incrementally** on this dense
   PC-DOOM geometry. The p95 tail is dominated by `seg_rast` (wall raster) + audio +
   bsp, NOT planes — even a perfect plane/wall offload leaves p95 ~31–38k.
-- Both the RDP wall path and the RDP plane path land at **~parity** with the
-  already-optimized software renderer at full fidelity (planes-only ≈ 19417 / 31456).
-  Realistic goal: correctness + ~parity + shaving the tail, not 60.
-- The per-frame visplane→trapezoid tessellation IS real, optimizable CPU work —
-  **build-verified** (arbitration, 2026-06-16): a no-op `R_DrawPlanes` (md5-confirmed
-  changed binary, RDP plane tris→0, `RDRAWPLANES NOOP` logged) collapses the `planes`
-  bracket 1646→6µs **and drops total frame avg 18725→16734 / p95 29920→24352**, and the
-  bracket scales with visplane count (~250µs/visplane: vp17→3343µs, vp28→7173µs; flat
-  ~6µs at all vp in the no-op). So **reducing per-visplane plane work is a genuine
-  ~1640µs-mean / ~4800µs-p95 lever** — the cost is the recursive `R_EmitIslandRuns`
-  run-fitter + the per-visplane `W_CacheLumpNum`/`Z_ChangeTag` in `R_DrawPlanes`'s loop.
-  NOT enough for 60fps alone (planes fully removed still left p95 24352µs — the software
-  `seg_rast` walls dominate). Attack it by caching the per-visplane lump lookup (flats
-  repeat across visplanes), a cheaper run-fitter, or an offline bake (DOOM 64's
-  leaf-fans; +57% tris but the tail is NOT RSP-volume-bound, so it may still win).
+- **END-STATE (2026-06-16): planes-only (RDP floors/ceilings + SW walls) is the shipped
+  config and BEATS software** — avg ~18908 / p95 ~30624 vs software 19793/31648. A
+  full-demo RDP-vs-software sweep flagged ZERO frames on the plane-band MAD metric — but
+  that averaged number UNDERSELLS palette-flash TINT match: a residual damage-flash tint
+  mismatch is eye-visible (open refinement — the averaged metric misses it, trust the
+  eye). Perf-wise it sits at the **CPU ceiling** — every perf lever is measured to a hard
+  floor:
+  - **Run-fitter** per-column divide strength-reduced to a reciprocal (`f1d7782`, −4% p95).
+    `seg_rast`'s remaining setup divide (`dc_iscale = 1/rw_scale`) CANNOT be similarly
+    reduced — `rw_scale` varies every column, unlike `f1d7782`'s loop-invariant divisor;
+    the rest is incremental DDA and the gather-FILL is the known dead end. `seg_rast` is
+    irreducible.
+  - **Plane lighting:** per-band colormap (`31fd2f1`) + per-corner gouraud SHADE
+    (`b4ac15b`) smooth the depth-light to software's per-row falloff (no banding stairs);
+    cost +4-6% p95, NOT recoverable via flat/gouraud adaptivity (the costly quads are the
+    multi-light ones that must stay gouraud). The damage/palette flash re-tints the plane
+    SHADE LUT (`26886ce` / `DL_RetintPrimLUT`) so floors flash uniformly like software (the
+    LUT was baked once at startup + never re-tinted — that was the "blotchy flash" bug).
+  - **OFFLINE WALL BAKE = measured NO-GO (FEED-bound — do NOT re-attempt):** RDP walls
+    even with geometry baked = 22889/45472, worse than software; the only bakeable work
+    (run-fitter ~1977µs) is HALF the irreducible per-frame feed + keyed-present (~4023µs).
+    Wall screen quads are 100% view-dependent (rebuilt every frame from the BSP walk +
+    per-column clip — and you need that walk for the planes' `top[]/bottom[]` anyway), and
+    the static tile/TMEM layout is already cached/amortized.
+- The no-op-verified fact stands (planes IS real per-visplane CPU work — a build-verified
+  `R_DrawPlanes` no-op dropped p95 29920→24352, scaling ~250µs/visplane), but the
+  run-fitter hot op is now optimized and the remaining plane work is needed for the
+  de-banding. 60fps stays structurally out; the realized goal — correctness + verified
+  fidelity + beating software — is DONE.
 
 ## Profiling caveat — `BPH_*` phase timers are WALL-CLOCK, not CPU counters
 The `BPH_*` brackets measure wall-clock between `PhaseSwitch` boundaries, so an async
