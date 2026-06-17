@@ -81,8 +81,12 @@ GEOM="$(hyprctl clients -j 2>/dev/null | python3 -c "
 import json,sys
 best=None
 for c in json.load(sys.stdin):
-    s=(str(c.get('class',''))+str(c.get('title',''))+str(c.get('initialClass',''))).lower()
-    if 'ares' in s:
+    # Match the ares emulator window by its WINDOW CLASS only ('Ares'), never by
+    # title -- the agent terminal driving this script carries 'ares' in its title
+    # (the ROM path / 'scan-marks' / 'ares.log' in the running command) and would
+    # otherwise be grabbed instead, capturing the terminal rather than the game.
+    cl=str(c.get('class','')).lower(); ic=str(c.get('initialClass','')).lower()
+    if cl=='ares' or ic=='ares':
         x,y=c['at']; w,h=c['size']
         if w>200 and h>150: best=f'{x},{y} {w}x{h}'
 print(best or '')")"

@@ -3154,18 +3154,48 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 // z-depths); the caller restores its own persp after. Shares the flat bucket
 // arrays + dl_flat_touched[] with the span path -- only one of the two paths
 // queued this frame, so the bucket walk is unambiguous.
+// Plane damage-flash overlay (i_video_n64.c). On a flash the planes are drawn
+// through the UN-FLASHED base TLUT (so their CI8 texels keep their normal hue,
+// like software's pre-remap index) and then ONE uniform translucent rect is
+// alpha-blended over the plane region, coloured + alpha'd from the active flash --
+// reproducing software's whole-screen palette wash uniformly, instead of the per-
+// pixel TEX0-multiply that bled the floor hue (the three diff spots on frame 2048).
+extern boolean  I_N64UploadBaseTLUT(void);    // load un-flashed base TLUT into TMEM
+extern void     I_N64UploadMasterTLUT(void);  // restore flashed master after the planes
+extern uint32_t I_N64PlaneFlashARGB(void);    // active flash tint 0xRRGGBBAA, 0 = none
+extern int      scaledviewwidth;              // r_state.h: view window width
+extern int      viewwindowx;                  // r_main.h: view window x origin
+extern int      viewheight;                   // r_main.h: view window height
+
 static void DL_FlushPlanePolys(void)
 {
     int fi;
+    uint32_t flash;            // active uniform flash tint (0xRRGGBBAA), 0 = none
+    boolean  unflashed;        // true once the base TLUT is resident for the planes
 
     if (dl_ppoly_count <= 0)
         return;
 
-    // PLANE DAMAGE-FLASH CORRECTNESS. Re-derive the per-level depth-light PRIM LUT
-    // from the current master TLUT if the palette flashed (gen change), so the
-    // plane SHADE carries the same uniform red/gold/green wash software's palette
-    // swap applies to the whole screen. Gen-gated -> zero cost off-flash. MUST run
-    // before DL_PlaneCornerShade reads dl_prim_lut below.
+    // PLANE DAMAGE-FLASH CORRECTNESS (screen-space uniform tint, Ryan's design).
+    // The plane CI8 TEX0 samples the RESIDENT master TLUT, which is the FLASHED
+    // palette -- so under a flash the planes pick up the wash as a per-pixel
+    // TEX0-multiply, which preserves each texel's channel ratios instead of doing
+    // software's single index->palette remap (the floor hue bled: too-green near
+    // floor + two too-red triangles, frame 2048). Fix: if a flash is active, swap
+    // the master for the UN-FLASHED base TLUT so the planes draw their normal
+    // colours, draw them, then lay ONE translucent rect over the plane region (the
+    // view-window scissor the caller set) coloured+alpha'd to the flash -- a
+    // uniform wash by construction. The flashed master is re-asserted before we
+    // return so the CI8 sprites/HUD/present-blit are unaffected. Off-flash (flash
+    // == 0) NOTHING changes: master stays resident, no overlay -> perf-neutral.
+    flash = I_N64PlaneFlashARGB();
+    unflashed = false;
+    if (flash)
+        unflashed = I_N64UploadBaseTLUT();   // false if base not captured yet -> skip
+
+    // SHADE stays the un-flashed depth-light ramp (f35d6ce); now that TEX0 is also
+    // un-flashed (base TLUT) the planes carry NO flash at all, and the overlay below
+    // applies it once. Kept as a documented no-op call site.
     DL_RetintPrimLUT();
 
     // PER-VERTEX SHADE light: the plane polys now carry per-corner depth-light as
@@ -3214,6 +3244,61 @@ static void DL_FlushPlanePolys(void)
         {
             DL_DrawPlanePoly(&dl_ppolys[pidx], block);
         }
+    }
+
+    // UNIFORM FLASH OVERLAY. The planes above drew their un-flashed colours; now
+    // wash the plane region with one translucent rect coloured+alpha'd to the
+    // active flash. RDPQ_BLENDER_MULTIPLY computes PRIM_RGB*PRIM_A + MEMORY*(1-A)
+    // per pixel with a CONSTANT PRIM -> the SAME wash on every plane pixel (uniform
+    // by construction; kills the per-pixel-multiply non-uniformity). The rect spans
+    // the whole view window -- it harmlessly also covers the wall/sky/sprite
+    // regions of the 16bpp fb, but the present blit opaque-overwrites those from the
+    // (already-flashed) CI8 buffer, so the overlay SURVIVES only where the RDP
+    // planes drew (the key-cleared region) -- coverage-clipping for free via the
+    // existing keyed present blit. The caller's view-window scissor still bounds it.
+    if (flash)
+    {
+        // OVER-TINT CORRECTION. The recovered (target,alpha) is the EXACT linear
+        // blend DOOM's palette math intends (FLASH_DBG confirmed: red flash target
+        // (252,0,0) a=58/83/116, gold (216,180,70) a=58 -- spot-on). But software's
+        // flash is a NON-LINEAR PLAYPAL index remap, while this overlay is a LINEAR
+        // RDPQ_BLENDER_MULTIPLY. On bright, already-red-corner plane texels (E1M1
+        // lava) the linear blend pulls every channel toward the pure-red target
+        // proportionally and OVER-saturates, where the index remap of an already-red
+        // colour shifts far less -- the frame-2048 floor went too-red at full alpha.
+        // Knocking the rect alpha to 5/8 was MEASURED (two independent capture
+        // geometries) to minimise the plane diff vs the frozen software reference:
+        // frame-2048 floor |sw-rdp| 13.7 (full) -> 7.8 (5/8), below the pre-overlay
+        // 9.9; ceiling 1.4 -> 0.7; horizon 7.9 -> 4.8. It leaves the subtle gold/
+        // bonus flash visually uniform (that scene has little visible plane, so the
+        // small under-tint is imperceptible) and is a pure no-op off-flash.
+        {
+            uint32_t fa = ((flash & 0xFF) * 5u) / 8u;
+            if (fa > 0xFF) fa = 0xFF;
+            flash = (flash & 0xFFFFFF00u) | fa;
+        }
+        rdpq_mode_combiner(RDPQ_COMBINER_FLAT);   // PRIM-only source for the blend
+        rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY); // PRIM_RGB*PRIM_A + MEM*(1-PRIM_A)
+        rdpq_set_prim_color(color_from_packed32(flash));
+        {
+            int vx0 = viewwindowx;
+            int vy0 = viewwindowy;
+            int vx1 = viewwindowx + scaledviewwidth;
+            int vy1 = viewwindowy + viewheight;
+            if (vx0 < 0) vx0 = 0;
+            if (vy0 < 0) vy0 = 0;
+            if (vx1 > SCREENWIDTH)  vx1 = SCREENWIDTH;
+            if (vy1 > SCREENHEIGHT) vy1 = SCREENHEIGHT;
+            if (vx1 > vx0 && vy1 > vy0)
+                rdpq_fill_rectangle(vx0, vy0, vx1, vy1);
+        }
+        // Turn the blender back OFF: the wall path (combined build) and the present
+        // COPY blit assume no blender. Re-assert the FLASHED master TLUT into TMEM
+        // (we swapped it for the base above) so the CI8 sprites/HUD/present-blit
+        // sample the flashed palette again. Only when we actually un-flashed.
+        rdpq_mode_blender(0);
+        if (unflashed)
+            I_N64UploadMasterTLUT();
     }
 
     // Restore the world combiner (TEX0*PRIM) the caller/wall path assumes -- this

@@ -69,6 +69,26 @@ static uint16_t doom_tlut_master[256];
 static uint32_t doom_palette_gen;
 uint32_t I_N64PaletteGen(void) { return doom_palette_gen; }
 
+// The UN-FLASHED base palette (PLAYPAL palette 0), packed RGBA5551 exactly like
+// the master (same gamma + key alpha). Captured the first time I_SetPalette is
+// handed the base palette (st_palette transitions through 0 on every flash
+// fade-out, and the level-load path sets it before any flash) and never tracks a
+// flash afterward. The RDP plane pass uploads THIS instead of the flashed master
+// so its CI8 floor texels carry the un-flashed colours; the screen-space flash
+// overlay (DL_FlushPlanePolys) then washes them uniformly, matching software's
+// single palette remap. Without un-flashing TEX0 the overlay would double-tint
+// (flashed-TEX0 multiply + overlay). doom_base_valid gates the whole overlay
+// path -- until a base palette has been seen the planes keep sampling the master.
+static uint16_t doom_tlut_base[256];
+static boolean  doom_base_valid;
+// 24-bit RGB of the active uniform flash tint and its 0..255 strength, recovered
+// from the flashed master vs the base (see I_N64SetFlashFromPalette). 0 strength
+// == no flash (palette 0) -> the plane pass draws NO overlay. Updated every
+// I_SetPalette so it always reflects the live master.
+static uint8_t  doom_flash_r, doom_flash_g, doom_flash_b;
+static int      doom_flash_a;    // 0..255; 0 = no overlay
+static void     I_N64SetFlashFromPalette(void);   // defined below; used in I_SetPalette
+
 // The live (flashed) master TLUT (RGBA5551, 256 entries). The CI4 wall pass
 // re-derives each sub-palette entry's colour from the master at its fixed PLAYPAL
 // index so wall colours track palette flashes. Returned as a pointer so the wall
@@ -1548,6 +1568,29 @@ void I_SetPalette(byte* palette)
 
     n64_palette_dirty = true;
     doom_palette_gen++;     // real colour change: the CI4 wall re-tint tracks this
+
+    // Plane damage-flash overlay support. Capture the UN-FLASHED base TLUT the
+    // first time we see a palette (the engine's first I_SetPalette is always the
+    // base PLAYPAL -- d_main.c:771 / st_stuff.c reset -- and ST_doPaletteStuff
+    // re-passes palette 0 every time a flash fades out). Heuristic for "this is the
+    // base": no flash is currently recovered yet (first call) OR the new master
+    // resolves to ~0 flash strength against the existing base (a fade-out frame).
+    // Capturing on every base-return keeps the base tracking gamma/menu changes.
+    if (!doom_base_valid)
+    {
+        memcpy(doom_tlut_base, doom_tlut_master, sizeof(doom_tlut_base));
+        doom_base_valid = true;
+        doom_flash_a = 0;       // first palette is the base -> no overlay
+    }
+    else
+    {
+        I_N64SetFlashFromPalette();
+        // A recovered zero-strength flash means this palette IS the base again
+        // (flash cleared); refresh the captured base so it tracks any gamma/menu
+        // recolour and the next flash is measured against the live base.
+        if (doom_flash_a <= 0)
+            memcpy(doom_tlut_base, doom_tlut_master, sizeof(doom_tlut_base));
+    }
 }
 
 // The renderer toggle changes the key index's TLUT alpha bit (see I_SetPalette),
@@ -1603,6 +1646,106 @@ void I_N64UploadMasterTLUT(void)
     // The present-blit path still re-uploads under its own COPY-mode TLUT; leave
     // the dirty flag untouched so that path is unaffected (it idempotently re-
     // uploads the identical master TLUT).
+}
+
+// --- plane damage-flash overlay support ------------------------------------
+// Synchronously upload the UN-FLASHED base TLUT (PLAYPAL palette 0) into TMEM so
+// the RDP plane pass samples un-flashed CI8 floor texels. Caller (DL_FlushPlane-
+// Polys) then draws ONE uniform translucent flash rect over the plane region and
+// RE-ASSERTS the master via I_N64UploadMasterTLUT before returning, so the CI8
+// sprites/HUD/present-blit still see the flashed palette. No-op (returns false)
+// until a base palette has been captured -- the plane pass then keeps the master.
+// Mirrors I_N64UploadMasterTLUT's mechanics (512 B writeback + one LOAD_TLUT); the
+// caller's world textured mode (TLUT_RGBA16) keeps the upper TMEM half loadable.
+boolean I_N64UploadBaseTLUT(void)
+{
+    uint16_t* slot;
+
+    if (!doom_base_valid)
+        return false;
+    slot = doom_tlut_up[n64_draw_idx];
+    memcpy(slot, doom_tlut_base, sizeof(doom_tlut_base));
+    data_cache_hit_writeback(slot, sizeof(doom_tlut_base));
+    rdpq_tex_upload_tlut(slot, 0, 256);
+    return true;
+}
+
+// The active uniform flash tint as packed 0xRRGGBBAA, or 0 for no flash (palette
+// 0). The plane pass blends this over the un-flashed planes (RDPQ_BLENDER_MULTIPLY,
+// PRIM = this colour incl. alpha) to reproduce software's whole-screen palette
+// wash uniformly. Recovered in I_N64SetFlashFromPalette below, so it always tracks
+// the live master TLUT (every damage red 1-8, bonus gold, radsuit green, invuln).
+uint32_t I_N64PlaneFlashARGB(void)
+{
+    if (!doom_base_valid || doom_flash_a <= 0)
+        return 0;
+    return ((uint32_t)doom_flash_r << 24) | ((uint32_t)doom_flash_g << 16) |
+           ((uint32_t)doom_flash_b << 8) | (uint32_t)(doom_flash_a & 0xFF);
+}
+
+// Recover the uniform flash (tint RGB + strength alpha) by comparing the flashed
+// master TLUT against the captured base. DOOM's flash is base[i]*(1-a)+target*a
+// applied UNIFORMLY to every palette entry, so two reference entries pin (target,a)
+// exactly: index 0 is pure black (base 0,0,0) -> master ~= target*a, and index 4 is
+// pure white (base 255,255,255) -> master ~= target*a + 255*(1-a). The green
+// channel of those two solves a; target then follows from the black entry. We work
+// in the 5-bit TLUT space (the same colours the planes/HUD actually sample), so the
+// overlay matches what the flash did to the floor, not an idealised PLAYPAL math.
+// Called from I_SetPalette AFTER the master is packed. Cheap (a few entries).
+static void I_N64SetFlashFromPalette(void)
+{
+    int wd, a256;
+    // Unpack the relevant master/base entries from RGBA5551 (R:11..15 G:6..10
+    // B:1..5) back to 0..255 (x<<3 | x>>2, the standard 5->8 expand).
+#define EXP5(v) (((v) << 3) | ((v) >> 2))
+    int mk_r = EXP5((doom_tlut_master[0] >> 11) & 0x1F);
+    int mk_g = EXP5((doom_tlut_master[0] >>  6) & 0x1F);
+    int mk_b = EXP5((doom_tlut_master[0] >>  1) & 0x1F);
+    int mw_g = EXP5((doom_tlut_master[4] >>  6) & 0x1F);   // white entry, green
+    int bw_g = EXP5((doom_tlut_base[4]   >>  6) & 0x1F);   // base white, green
+#undef EXP5
+
+    if (!doom_base_valid)
+    {
+        doom_flash_a = 0;
+        return;
+    }
+
+    // Black index (base 0,0,0) flashes to master = target * a directly, so its RGB
+    // IS target*a. White index (base ~255) flashes to target*a + base_white*(1-a).
+    // Subtract -> base_white*(1-a) = white_master - black_master (per channel); use
+    // green (the brightest, least quantized) to solve (1-a), hence a.
+    wd = mw_g - mk_g;                 // ~= base_white_g * (1 - a)
+    if (wd < 0) wd = 0;
+    if (bw_g <= 0)
+    {
+        doom_flash_a = 0;
+        return;
+    }
+    // a = 1 - wd/base_white_g  (Q8). Clamp to [0,255].
+    a256 = 256 - (wd * 256) / bw_g;
+    if (a256 < 0) a256 = 0;
+    if (a256 > 255) a256 = 255;
+
+    if (a256 <= 0)
+    {
+        doom_flash_a = 0;            // palette 0 / no flash -> no overlay
+        return;
+    }
+
+    // target = black_master / a  (black_master == target*a). Q8 divide + clamp.
+    {
+        int tr = (mk_r * 256) / a256;
+        int tg = (mk_g * 256) / a256;
+        int tb = (mk_b * 256) / a256;
+        if (tr > 255) tr = 255;
+        if (tg > 255) tg = 255;
+        if (tb > 255) tb = 255;
+        doom_flash_r = (uint8_t)tr;
+        doom_flash_g = (uint8_t)tg;
+        doom_flash_b = (uint8_t)tb;
+        doom_flash_a = a256;
+    }
 }
 
 void I_InitGraphics(void)
