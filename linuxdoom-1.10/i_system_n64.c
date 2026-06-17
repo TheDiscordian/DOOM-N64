@@ -174,7 +174,10 @@ void I_N64LoadSettings(void)
 
     alwaysRun           = s.always_run;
     controlScheme       = s.control_scheme;
-    frame_interpolation = s.frame_interp;
+    // frame_interpolation intentionally NOT restored from EEPROM -- the SMOOTH/
+    // interpolation option was removed from the menu; the game always ships
+    // capped (compiled default 0). A stale save with frame_interp=1 must not
+    // silently re-enable interpolation.
     showMessages        = s.show_messages;
     detailLevel         = s.detail_level;
     snd_SfxVolume       = s.sfx_volume;

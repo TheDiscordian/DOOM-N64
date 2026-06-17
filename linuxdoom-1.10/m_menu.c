@@ -1028,41 +1028,26 @@ void M_DrawOptions(void)
     M_WriteTextScaled(lx, OptionsDef.y+lh*show_fps, "SHOW FPS", OPT_SNUM, OPT_SDEN);
     M_WriteTextScaled(vx, OptionsDef.y+lh*show_fps, n64_show_fps ? "ON" : "OFF", OPT_SNUM, OPT_SDEN);
 
-    // Context-sensitive row: FRAMERATE in 1p/3-4p, SPLIT in 2p (FRAMERATE
-    // then lives on the mouse-sens row below).
+    // SPLIT-orientation row -- 2-player only. The framerate/interpolation
+    // selector was removed (the game ships capped); this row now hosts only the
+    // 2p split orientation. In 1p/3-4p it is empty and the cursor skips it
+    // (status forced to -1 below, which M_Responder's nav loop skips).
     {
-	int yrow = OptionsDef.y + lh*framerate;
 	int players = D_GetLocalPlayerCount();
-
+	OptionsMenu[framerate].status = (players == 2) ? 1 : -1;
 	if (players == 2)
 	{
-	    // 2p: choose the split orientation.
+	    int yrow = OptionsDef.y + lh*framerate;
 	    M_WriteTextScaled(lx, yrow, "SPLIT", OPT_SNUM, OPT_SDEN);
 	    M_WriteTextScaled(vx, yrow, splitOrientation ? "VERT" : "HOR", OPT_SNUM, OPT_SDEN);
-	}
-	else
-	{
-	    // 1p/3-4p: choose the framerate mode.
-	    M_WriteTextScaled(lx, yrow, "FRAMERATE", OPT_SNUM, OPT_SDEN);
-	    M_WriteTextScaled(vx, yrow, frame_interpolation ? "SMOOTH" : "CAPPED", OPT_SNUM, OPT_SDEN);
 	}
     }
 
     M_WriteTextScaled(lx, OptionsDef.y+lh*scrnsize, "SCREEN SIZE", OPT_SNUM, OPT_SDEN);
     M_DrawThermo(lx, OptionsDef.y+lh*(scrnsize+1), 9, screenSize);
 
-    if (D_GetLocalPlayerCount() == 2)
-    {
-	// 2p: SPLIT takes the framerate row, so FRAMERATE moves here. The
-	// mouse-sens row is free on N64 -- nothing posts ev_mouse.
-	M_WriteTextScaled(lx, OptionsDef.y+lh*mousesens, "FRAMERATE", OPT_SNUM, OPT_SDEN);
-	M_WriteTextScaled(vx, OptionsDef.y+lh*mousesens, frame_interpolation ? "SMOOTH" : "CAPPED", OPT_SNUM, OPT_SDEN);
-    }
-    else
-    {
-	M_WriteTextScaled(lx, OptionsDef.y+lh*mousesens, "MOUSE SENS", OPT_SNUM, OPT_SDEN);
-	M_DrawThermo(lx, OptionsDef.y+lh*(mousesens+1), 10, mouseSensitivity);
-    }
+    M_WriteTextScaled(lx, OptionsDef.y+lh*mousesens, "MOUSE SENS", OPT_SNUM, OPT_SDEN);
+    M_DrawThermo(lx, OptionsDef.y+lh*(mousesens+1), 10, mouseSensitivity);
 
     M_WriteTextScaled(lx, OptionsDef.y+lh*soundvol, "SOUND VOLUME", OPT_SNUM, OPT_SDEN);
 }
@@ -1115,15 +1100,15 @@ void M_ChangeControls(int choice)
 //
 //      Toggle uncapped (interpolated) vs capped framerate
 //
+// Now the 2-player SPLIT-orientation toggle only. The framerate/interpolation
+// selector was removed -- the game ships capped (frame_interpolation = 0). In
+// 1p/3-4p this row is non-selectable (status -1, set in M_DrawOptions), so this
+// only fires in 2p.
 void M_ChangeFramerate(int choice)
 {
-    int players = D_GetLocalPlayerCount();
-
     choice = 0;
-    if (players == 2)
-	splitOrientation = 1 - splitOrientation;	// 2p: split orientation
-    else
-	frame_interpolation = 1 - frame_interpolation;	// 1p/3-4p: framerate mode
+    if (D_GetLocalPlayerCount() == 2)
+	splitOrientation = 1 - splitOrientation;
 }
 
 void M_ChangeAspect(int choice)
