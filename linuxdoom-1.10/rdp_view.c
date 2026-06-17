@@ -2830,21 +2830,35 @@ static void DL_DrawSpan(const rdp_span_t* sp, byte* block)
 // The tile descriptor (64-wide, mask 6) and resident V window are deduped across
 // a flat's runs (consecutive runs at a similar depth share a window -> skip the
 // LOAD_TILE), the dominant DL_BUILD saving.
+// Per-corner SHADE (R,G,B,A in 0..1) for one plane corner's colormap level. The
+// level keys dl_prim_lut[] (the same colormap-darkening RGB the flat-PRIM path
+// used); dividing by 255 puts it in rdpq_triangle's required 0..1 shade range. The
+// RDP gouraud-interpolates these four corner shades across the quad -> a continuous
+// depth-light gradient (smooth like software's per-row falloff), where the old
+// flat PRIM gave one brightness step per quad (the visible bands under the flash).
+static inline void DL_PlaneCornerShade(uint8_t level, float out[4])
+{
+    uint32_t c = (level < NUMCOLORMAPS) ? dl_prim_lut[level] : dl_unlit_prim;
+    out[0] = (float)((c >> 24) & 0xFF) * (1.0f / 255.0f);   // R
+    out[1] = (float)((c >> 16) & 0xFF) * (1.0f / 255.0f);   // G
+    out[2] = (float)((c >>  8) & 0xFF) * (1.0f / 255.0f);   // B
+    out[3] = 1.0f;                                          // A (opaque)
+}
+
 static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 {
-    uint32_t prim;
     float vmin, vmax, umin;
     float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
     int   vbias, ubias;
     float xl, xr;
-
-    // PRIM = colormap-level brightness (Q8), shared LUT with the walls. Deduped.
-    prim = (p->light < NUMCOLORMAPS) ? dl_prim_lut[p->light] : dl_unlit_prim;
-    if (prim != dl_last_prim)
-    {
-        rdpq_set_prim_color(color_from_packed32(prim));
-        dl_last_prim = prim;
-    }
+    // Four corner SHADE colours (depth-light); the combiner is TEX0*SHADE (set by
+    // DL_FlushPlanePolys), so light now interpolates corner->corner instead of one
+    // flat PRIM per quad. No rdpq_set_prim_color here -- SHADE carries the light.
+    float sh_tl[4], sh_tr[4], sh_bl[4], sh_br[4];
+    DL_PlaneCornerShade(p->light_tl, sh_tl);
+    DL_PlaneCornerShade(p->light_tr, sh_tr);
+    DL_PlaneCornerShade(p->light_bl, sh_bl);
+    DL_PlaneCornerShade(p->light_br, sh_br);
 
     // Per-corner texel U/V (texel units from the emit). PERSPECTIVE-SAFE PERIOD
     // BIAS: the raw flat texel coords can be huge (a far/steep run's u,v run to
@@ -3075,12 +3089,20 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 #endif // PLANE_UV_TRACE
 
     {
-        float tl[5] = { xl, p->ytop_l, u_tl, v_tl, p->invw_tl };
-        float tr[5] = { xr, p->ytop_r, u_tr, v_tr, p->invw_tr };
-        float bl[5] = { xl, p->ybot_l, u_bl, v_bl, p->invw_bl };
-        float br[5] = { xr, p->ybot_r, u_br, v_br, p->invw_br };
-        rdpq_triangle(&TRIFMT_TEX, tl, tr, bl);
-        rdpq_triangle(&TRIFMT_TEX, tr, br, bl);
+        // TRIFMT_SHADE_TEX vertex: {X, Y, R, G, B, A, S, T, INV_W} (9 floats). The
+        // RGBA is this corner's depth-light SHADE; the RDP gouraud-interpolates it
+        // across the quad and the TEX0*SHADE combiner multiplies it onto the flat
+        // texel -- a smooth depth gradient replacing the old flat-per-quad PRIM.
+        float tl[9] = { xl, p->ytop_l, sh_tl[0], sh_tl[1], sh_tl[2], sh_tl[3],
+                        u_tl, v_tl, p->invw_tl };
+        float tr[9] = { xr, p->ytop_r, sh_tr[0], sh_tr[1], sh_tr[2], sh_tr[3],
+                        u_tr, v_tr, p->invw_tr };
+        float bl[9] = { xl, p->ybot_l, sh_bl[0], sh_bl[1], sh_bl[2], sh_bl[3],
+                        u_bl, v_bl, p->invw_bl };
+        float br[9] = { xr, p->ybot_r, sh_br[0], sh_br[1], sh_br[2], sh_br[3],
+                        u_br, v_br, p->invw_br };
+        rdpq_triangle(&TRIFMT_SHADE_TEX, tl, tr, bl);
+        rdpq_triangle(&TRIFMT_SHADE_TEX, tr, br, bl);
     }
     dl_tris += 2;
 }
@@ -3098,6 +3120,14 @@ static void DL_FlushPlanePolys(void)
 
     if (dl_ppoly_count <= 0)
         return;
+
+    // PER-VERTEX SHADE light: the plane polys now carry per-corner depth-light as
+    // SHADE (RGBA), so switch the combiner from TEX0*PRIM (TEX_FLAT, the caller's
+    // world mode) to TEX0*SHADE (TEX_SHADE). The RDP gouraud-interpolates SHADE
+    // corner->corner -> a smooth depth gradient instead of one flat PRIM step per
+    // quad (the visible bands). Restored to TEX_FLAT at the end so the wall path
+    // (combined build) and the present-blit keep their assumed combiner.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
 
     // Floors span many z-depths -> perspective ON so S/T are perspective-correct
     // (affine would warp a tall floor poly). The walls left persp ON too.
@@ -3138,6 +3168,10 @@ static void DL_FlushPlanePolys(void)
             DL_DrawPlanePoly(&dl_ppolys[pidx], block);
         }
     }
+
+    // Restore the world combiner (TEX0*PRIM) the caller/wall path assumes -- this
+    // is the only place that switched to TEX_SHADE.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
 }
 
 // Drain the frame's plane spans into the attached display fb (Stage 4). A

@@ -942,21 +942,24 @@ R_PlaneRunBands
     return N;
 }
 
-// Resolve the light table at a depth-BAND's own representative row, mirroring
-// R_MapPlane's exact per-distance light chain. Software shades floors per ROW
-// (planezlight[distance>>LIGHTZSHIFT] each scanline); a single emitted run picks
-// ONE light at its mid row (R_PlaneRunColormap), so a deep run that the INV_W
-// band split slices into several quads inherits one flat light across all bands
-// -- the floor reads a touch bright/flat where software darkens into the
-// distance. This re-resolves the colormap PER BAND at the band's mid screen row
-// (the vertical centre of its four corners; INV_W is linear in screen Y, so the
-// band's mid row IS its representative depth), so each band tracks software's
-// depth falloff. Adds NO triangles -- one extra yslope/planezlight lookup per
-// band, the PRIM light register only. fixedcolormap (invuln/light-amp) overrides
-// per-distance light exactly as R_MapPlane does, so a band under it is unchanged.
+// Resolve the light COLORMAP LEVEL at a single CORNER's own screen row, mirroring
+// R_MapPlane's exact per-distance light chain (distance = planeheight*yslope[row];
+// index = distance>>LIGHTZSHIFT; cm = planezlight[index]). Software shades floors
+// per ROW; the RDP plane path picked ONE flat colormap per quad (R_PlaneRunColormap,
+// or per-band in 31fd2f1) and applied it across the whole quad as a single PRIM, so
+// a deep run rendered hard horizontal brightness STAIRS where software is a smooth
+// gradient -- glaring under the red death-flash (the band step over-darkens the far
+// corner toward black). Resolving the level at EACH of the quad's four corners lets
+// the plane flush feed dl_prim_lut[level] as a per-vertex SHADE, which the RDP
+// GOURAUD-interpolates corner->corner -- a continuous depth gradient that converges
+// to software's brightness at the corners (keeps 31fd2f1's deep-floor win) with NO
+// per-band step. fixedcolormap (invuln/light-amp) overrides per-distance light
+// exactly as R_MapPlane does, so a corner under it gets that flat level. Must run at
+// EMIT time -- planeheight/planezlight/fixedcolormap are this visplane's live state
+// then. Returns the colormap pointer; DL_PlaneLightLevel reduces it to the level.
 static const void*
-R_PlaneBandColormap
-( float		band_mid_row )
+R_PlaneCornerColormap
+( float		corner_row )
 {
     int		yrow;
     fixed_t	distance;
@@ -965,7 +968,7 @@ R_PlaneBandColormap
     if (fixedcolormap)
 	return fixedcolormap;
 
-    yrow = (int)(band_mid_row + 0.5f);
+    yrow = (int)(corner_row + 0.5f);
     if (yrow < 0) yrow = 0;
     if (yrow >= viewheight) yrow = viewheight - 1;
 
@@ -974,6 +977,25 @@ R_PlaneBandColormap
     if (index >= MAXLIGHTZ)
 	index = MAXLIGHTZ - 1;
     return planezlight[index];
+}
+
+// Fill a poly's 4 per-corner light levels from its 4 corner screen rows, via the
+// exact R_MapPlane distance->planezlight chain (or fixedcolormap). The plane flush
+// reads these as per-vertex SHADE. ytl/ytr are the top corners (left/right edge),
+// ybl/ybr the bottom corners. Levels are reduced through DL_PlaneLightLevel so they
+// key the SAME dl_prim_lut[] the walls and the legacy flat-PRIM path use.
+static void
+R_FillPlaneCornerLights
+( rdp_ppoly_t*	q,
+  float		ytl,
+  float		ytr,
+  float		ybl,
+  float		ybr )
+{
+    q->light_tl = DL_PlaneLightLevel(R_PlaneCornerColormap(ytl));
+    q->light_tr = DL_PlaneLightLevel(R_PlaneCornerColormap(ytr));
+    q->light_bl = DL_PlaneLightLevel(R_PlaneCornerColormap(ybl));
+    q->light_br = DL_PlaneLightLevel(R_PlaneCornerColormap(ybr));
 }
 
 // Emit ONE depth band as a quad: four corner U/V/INV_W at screen (xl|xr, yt*|yb*)
@@ -1008,7 +1030,12 @@ R_EmitPlaneBand
     DPP_ACC(dpp_unproj_tk); }
 #endif
     q.flatlump = flatlump;
-    q.light    = 0;     // overwritten by DL_EmitPlanePoly from cm
+    q.light    = 0;     // overwritten by DL_EmitPlanePoly from cm (legacy run PRIM)
+    // PER-CORNER light for the GOURAUD-interpolated SHADE: resolve each corner's
+    // own depth-row level (R_MapPlane chain) so this band's light interpolates
+    // smoothly within itself AND continues into the adjacent band (shared corner
+    // rows => matching levels => seamless gradient across the whole run).
+    R_FillPlaneCornerLights(&q, ytl, ytr, ybl, ybr);
     DL_EmitPlanePoly(&q, cm);
 }
 
@@ -1080,6 +1107,9 @@ R_EmitRunPoly
 
 	if (N <= 1)
 	{
+	    // Single quad: 4 corner light levels at the run's own corner rows for
+	    // the GOURAUD SHADE (smooth depth gradient across the quad).
+	    R_FillPlaneCornerLights(&p, ytl, ytr, ybl, ybr);
 	    DL_EmitPlanePoly(&p, cm);
 	}
 	else
@@ -1106,7 +1136,6 @@ R_EmitRunPoly
 	    {
 		float		bk1 = (k + 1 == N) ? wbot : (bk * f);
 		float		t0, t1, btl, btr, bbl, bbr;
-		const void*	bcm;
 
 		if (f > 1.0f) { if (bk1 > wbot) bk1 = wbot; }
 		else          { if (bk1 < wbot) bk1 = wbot; }
@@ -1116,15 +1145,14 @@ R_EmitRunPoly
 		btl = ytl + t0 * (ybl - ytl);  btr = ytr + t0 * (ybr - ytr);
 		bbl = ytl + t1 * (ybl - ytl);  bbr = ytr + t1 * (ybr - ytr);
 
-		// PER-BAND light: re-resolve the colormap at THIS band's mid screen
-		// row (vertical centre of its four corners) instead of inheriting the
-		// run's single mid-distance light, so a deep multi-band run graduates
-		// its light across bands and tracks software's per-row depth falloff.
-		// Adds no triangles -- the PRIM light register only.
-		bcm = R_PlaneBandColormap(0.25f * (btl + btr + bbl + bbr));
-
+		// LIGHT is now PER-CORNER (R_EmitPlaneBand fills the band's four corner
+		// levels from their own depth rows) and the RDP GOURAUD-interpolates it
+		// as SHADE -- so a deep multi-band run is a CONTINUOUS depth gradient,
+		// not flat-per-band steps. The band split here is purely the INV_W
+		// perspective-precision slice; it no longer carries a flat band light.
+		// cm stays the run's representative colormap (legacy run PRIM/fallback).
 		R_EmitPlaneBand(p.x1, p.x2, xl, xr, btl, btr, bbl, bbr,
-				p.flatlump, bcm);
+				p.flatlump, cm);
 		bk = bk1;
 	    }
 	}

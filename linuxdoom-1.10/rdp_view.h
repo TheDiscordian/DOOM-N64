@@ -144,7 +144,15 @@ typedef struct
     float    invw_tr, invw_br;  // per-corner 1/W (right edge top/bottom)
     int32_t  bucket_next;       // next poly idx in this flat's bucket (-1 end)
     uint16_t flatlump;          // flat lump number (firstflat+flattranslation)
-    uint8_t  light;             // colormap level 0..NUMCOLORMAPS-1 (PRIM index)
+    uint8_t  light;             // run colormap level 0..NUMCOLORMAPS-1 (legacy PRIM)
+    // PER-CORNER colormap levels (0..NUMCOLORMAPS-1) resolved at EMIT time at each
+    // corner's own screen row -- the same distance>>LIGHTZSHIFT chain software runs
+    // per row. The plane flush feeds dl_prim_lut[level] as a per-vertex SHADE so the
+    // RDP GOURAUD-interpolates depth-light corner->corner (smooth, like software's
+    // per-row falloff) instead of one flat PRIM step per quad. Computed at emit, not
+    // flush, because planeheight/planezlight/fixedcolormap are this visplane's live
+    // state then -- by flush time they hold the LAST visplane's values.
+    uint8_t  light_tl, light_tr, light_bl, light_br;
 } rdp_ppoly_t;
 
 // Emit one plane-polygon trapezoid run (Stage-4b). Called from r_plane.c's island

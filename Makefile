@@ -122,6 +122,12 @@ endif
 # debugf cost would skew the numbers.
 ifeq ($(BENCH_MARKS),1)
 CFLAGS += -DN64_BENCH_MARKS=1
+# BENCH_MARK_FLASH=1: extra off-grid markers on the death-flash detail frames
+# (3150/3160) so the red damage-flash band-fix A/B can pair them. Superset of the
+# canonical 128-grid (those still fire). Bench-only; no renderer effect.
+ifeq ($(BENCH_MARK_FLASH),1)
+CFLAGS += -DBENCH_MARK_FLASH=1
+endif
 endif
 endif
 # DL_TRACE=1: one-off diagnostic builds only -- per-present RDP flush/emit

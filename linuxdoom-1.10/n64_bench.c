@@ -699,7 +699,18 @@ void N64Bench_LoopEnd(void)
     // enabled in timing builds -- the debugf cost would skew the numbers.
     // Every 128 retained frames (32 points/run): Ryan observed texture
     // artifacting falling between the original 256-frame samples.
-    if ((bench_frame_count & 127) == 0)
+    //
+    // BENCH_MARK_FLASH: opt-in EXTRA markers on the off-grid death-flash detail
+    // frames (3150/3160) so the red damage-flash band-fix A/B can pair them. Does
+    // not alter the canonical 128-grid (those still fire), so a flash-marks ROM is
+    // a strict superset of the canonical capture. Bench-only; no renderer effect.
+    {
+        int marker_hit = ((bench_frame_count & 127) == 0);
+#if defined(BENCH_MARK_FLASH) && BENCH_MARK_FLASH
+        if (bench_frame_count == 3150UL || bench_frame_count == 3160UL)
+            marker_hit = 1;
+#endif
+    if (marker_hit)
     {
         debugf("BENCH_MARK frame=%lu\n", bench_frame_count);
 
@@ -722,6 +733,7 @@ void N64Bench_LoopEnd(void)
             while (get_ticks() < hold_until)
                 ;   // spin: no VirtualTick, no present, state frozen
         }
+    }
     }
 #endif
 }
