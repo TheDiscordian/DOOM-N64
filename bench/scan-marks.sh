@@ -27,6 +27,19 @@ mkdir -p "$OUT"; rm -f "$OUT"/frame-*.png "$LOG"
 [ -f "$ROM" ] || { echo "scan-marks: no ROM at $ROM" >&2; exit 2; }
 ARES="$(command -v ares)" || { echo "scan-marks: ares not found" >&2; exit 2; }
 
+# Scrub any stale per-ROM save state before launch. ares (AutoSaveMemory) writes the
+# cart EEPROM next to the ROM; a flaked launch can poison it so EVERY subsequent
+# launch boots straight back into the WAD-selector menu (the "over and over" stall).
+# run-bench.sh scrubs for exactly this reason; scan-marks must too.
+ROM_BASE="${ROM%.z64}"
+rm -f "${ROM_BASE}".eeprom "${ROM_BASE}".sav "${ROM_BASE}".srm "${ROM_BASE}".flash 2>/dev/null
+SAVES="$(awk '/^  Saves$/{getline; if($1=="Path"){sub(/^  Path /,"");print}}' \
+        "$HOME/.local/share/ares/settings.bml" 2>/dev/null | head -1)"
+if [ -n "$SAVES" ] && [ -d "$SAVES" ]; then
+    _b="$(basename "$ROM_BASE")"
+    rm -f "${SAVES%/}/${_b}".eeprom "${SAVES%/}/${_b}".sav "${SAVES%/}/${_b}".srm "${SAVES%/}/${_b}".flash 2>/dev/null
+fi
+
 # Launch ares in its own session under a SIGKILL-proof timeout, and capture its
 # REAL process-group id from the session leader's own $$ (written to a file) --
 # never from $!, which is wrong when the caller has job control on. cap+30 so the
