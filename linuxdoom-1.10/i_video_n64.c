@@ -791,6 +791,26 @@ static void I_N64BufferDone(void* arg)
 #endif
 }
 
+// Read a lump's bytes for the transparency-key scan WITHOUT disturbing an
+// already-resident copy's purge tag. W_CacheLumpNum(lump, PU_CACHE) calls
+// Z_ChangeTag on a cached lump (w_wad.c), so scanning a font that ST_Init/
+// HU_Init/M_Init already pinned PU_STATIC -- the status-bar STTNUM* and the
+// menu STCFN*/M_* patches -- would DOWNGRADE it to purgeable. The zone then
+// reuses the block and the font draws from garbage: STlib_drawNum reads a bogus
+// patch width and V_CopyRect I_Errors when a new game starts, and the menu font
+// goes garbage so the Options page renders blank. The scan only READS pixels,
+// so it must never alter a lump's lifetime -- return a resident lump's pointer
+// as-is, and only PU_CACHE-load lumps not yet present (transient by design).
+extern void** lumpcache;            // w_wad.c
+static const void* I_N64ScanReadLump(int lumpnum)
+{
+    if (lumpnum < 0 || lumpnum >= numlumps)
+        return NULL;
+    if (lumpcache[lumpnum])
+        return lumpcache[lumpnum];          // resident -- do NOT retag it
+    return W_CacheLumpNum(lumpnum, PU_CACHE);   // absent -- transient scan cache
+}
+
 // Mark every palette index a single patch lump touches. The lump is decoded as
 // a patch (column posts); a malformed lump (bogus width/height/offset) is
 // skipped rather than trusted, so a non-patch lump that happens to match a UI
@@ -806,7 +826,7 @@ static void I_N64MarkPatchIndices(int lumpnum, boolean used[256])
     if (lumplen < 8)
         return;
 
-    patch = (patch_t*)W_CacheLumpNum(lumpnum, PU_CACHE);
+    patch = (patch_t*)I_N64ScanReadLump(lumpnum);
     if (!patch)
         return;
 
@@ -862,7 +882,7 @@ static void I_N64MarkFlatIndices(int lumpnum, boolean used[256])
     if (len != 64 * 64)
         return;
 
-    data = (const byte*)W_CacheLumpNum(lumpnum, PU_CACHE);
+    data = (const byte*)I_N64ScanReadLump(lumpnum);
     if (!data)
         return;
 
@@ -884,7 +904,7 @@ static void I_N64MarkWorldArtIndices(boolean used[256])
 
     // Wall-texture patches: every lump named in PNAMES (patch format).
     {
-        const byte* names = (const byte*)W_CacheLumpName("PNAMES", PU_CACHE);
+        const byte* names = (const byte*)I_N64ScanReadLump(W_CheckNumForName("PNAMES"));
         if (names)
         {
             int nummappatches = LONG(*((const int*)names));
@@ -934,8 +954,7 @@ static void I_N64MarkColormapOutputs(const boolean raw_used[256],
     int lumpnum, nmaps, l, i;
 
     lumpnum = W_CheckNumForName("COLORMAP");
-    cmap = (lumpnum >= 0) ? (const byte*)W_CacheLumpNum(lumpnum, PU_CACHE)
-                          : NULL;
+    cmap = (const byte*)I_N64ScanReadLump(lumpnum);
     if (!cmap)
     {
         // No COLORMAP (cannot happen for a valid IWAD): conservatively treat
