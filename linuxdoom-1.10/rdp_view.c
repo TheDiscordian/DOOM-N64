@@ -803,10 +803,13 @@ static int DL_DownsampleErr(int texnum, int tw, int th)
 // Downsample-error threshold (err x100 luma/texel). Below this the merged column
 // pairs sit close enough to their originals that halving the stored width is
 // visually safe; above it the wide stays NATIVE. Calibrated conservatively from
-// the routed wall set (DL_DS_DIAG build): the detailed wides Ryan named --
-// COMPUTE2 (256-wide computer bank), STARTAN3 (128, metallic striping), TEKWALL
-// (circuit accents) -- all score above it (their fine vertical structure is
-// destroyed by a column-pair merge); large flat/low-frequency wides score below.
+// the routed wall set (DL_DS_DIAG build). This gate governs SUB-256 textures only
+// (>=256-wides are decided earlier by the protect boundary + dl_downsample2x_names,
+// NOT by this threshold). The sub-256 detail Ryan named -- STARTAN3 (128, metallic
+// striping), TEKWALL (circuit accents) -- scores above it (fine vertical structure
+// destroyed by a column-pair merge); large flat/low-frequency sub-256 wides score
+// below. NB: COMPUTE2 (256-wide) is INTENTIONALLY 2x-halved via the HALF list, not
+// gated here -- earlier comments grouping it with the native sub-256 set were stale.
 // When in doubt the texture lands native (the safe side).
 #define DL_DS_ERR_THRESH  450
 
@@ -1008,12 +1011,16 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     // S (width) toward 64 so their CI4 row fits the TMEM half in fewer T-bands --
     // and 128->64 reaches the one-quad fits_hw class (1 LOAD_TILE + 1 tri-pair).
     // The split is PER TEXTURE, decided from the texture's own horizontal detail
-    // (DL_HorizDetail), conservative -- when in doubt, native:
-    //   - COMPUTE2 (256-wide computer bank), STARTAN3 (128, metallic striping),
-    //     TEKWALL (circuit accents): high HF -> NATIVE, no resolution loss. Ryan
+    // (DL_DownsampleErr for sub-256; the protect boundary + dl_downsample2x_names for
+    // >=256-wides), conservative -- when in doubt, native:
+    //   - STARTAN3 (128, metallic striping), TEKWALL (circuit accents): high HF and
+    //     sub-256, so the error gate keeps them NATIVE -- no resolution loss. Ryan
     //     rejected the blanket downsample (038c7f3/e94c39a) on exactly these.
-    //   - Large flat/low-frequency wides: low HF -> halve S (the box-average lands
-    //     between two near-equal columns, no visible smear), recovering their loads.
+    //   - COMPUTE2 / the other dl_downsample2x_names >=256-wides: INTENTIONALLY 2x
+    //     (256->128, the HALF tier) -- a deliberate load/fidelity tradeoff agreed with
+    //     Ryan. NOT native; earlier comments that called COMPUTE2 native were stale.
+    //   - Large flat/low-frequency sub-256 wides: low HF -> halve S (the box-average
+    //     lands between two near-equal columns, no visible smear), recovering loads.
     //
     // T (height) is NEVER downsampled: the blanket path's ts_shift>0 carried a
     // functional T-stretch bug (DEFECTS "few pixels draw then stretched downwards"
