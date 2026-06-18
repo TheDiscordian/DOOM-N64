@@ -78,7 +78,8 @@ pull — fixed in `0951cb3`).
 ## ares lifecycle — MANDATORY (leaked / stuck windows are a hard no)
 - **NEVER launch ares directly. Use a committed launcher:** `bench/run-bench.sh`
   for timing runs, `bench/scan-marks.sh <marks-rom> <outdir>` for frozen-marks
-  frame capture. Both `setsid` ares into its own session under a `timeout -s KILL`
+  frame capture, `bench/ares-run.sh <rom> [seconds]` for any one-off boot/repro
+  run. They `setsid` ares into its own session under a `timeout -s KILL`
   backstop and trap EXIT/INT/TERM, so ares is reaped on normal exit, on a signal,
   AND even if the script (or the agent running it) is hard-killed before any trap
   runs — the detached `timeout` still SIGKILLs ares at the deadline.
@@ -86,8 +87,12 @@ pull — fixed in `0951cb3`).
   ran `setsid ares & ; trap cleanup EXIT` with NO `timeout` backstop: a capture that
   ran to completion closed ares, but one interrupted partway (agent death, abandon,
   force-stop) orphaned the `setsid`'d window forever (~"half don't close"). Do NOT
-  write another. If you genuinely need a one-off launch, copy `scan-marks.sh`'s
-  idiom exactly: `setsid … timeout -s KILL <T> ares …` + `trap cleanup EXIT INT TERM`.
+  write another, and do NOT bare-`ares`: for a one-off launch run `bench/ares-run.sh`
+  (it scrubs the per-ROM save first AND has the SIGKILL-proof teardown). A bare `ares`
+  skips the scrub — a poisoned EEPROM then boots EVERY later launch straight to the WAD
+  selector (reads as a "flake" but is stale-save). And run any launcher SINGLE-
+  backgrounded (the harness's run_in_background) — NEVER `nohup … &` inside another
+  background, which detaches it untracked and leaks the window.
   (Separately: `setsid ares & ARES_PGID=$!` captures the WRONG pgid when the caller
   has job control ON — `$!` is the dead fork-parent — so a later `kill -- -$!` misses
   ares. Read the pgid from the setsid leader's own `$$`, as the committed scripts do.)
