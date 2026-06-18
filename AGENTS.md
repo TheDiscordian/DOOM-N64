@@ -1,6 +1,12 @@
 # Project Summary
 Software port of original DOOM game for PC modified to run on original N64 game console
 
+> ⚠️ **STALE upstream doc.** The "Building The Project" section below is the original
+> upstream guidance and is **WRONG for this fork** — we do NOT build via WSL/README, and
+> the `DEBUG`/`UPLOAD` flags are not how this fork is built. The real build is Docker
+> (`doom-n64:tc`); see **CLAUDE.md → Build** for the authoritative workflow. This file is
+> still correct for the **Target Platform Hardware** notes below (RDRAM, FPU, cache).
+
 # Building The Project
 WSL (Windows Subsystem for LInux) instead of developing natively on Linux. Use "WSL" command in terminal to enter linux subsystem. Once buld runs on N64, debug.log file is created in project root
 - `README.md` contains build instructions

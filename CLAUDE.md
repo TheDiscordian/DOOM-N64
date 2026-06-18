@@ -1,9 +1,78 @@
 # CLAUDE.md — DOOM-N64 RDP renderer: lessons & workflow
 
-`AGENTS.md` holds the upstream project summary, N64 hardware notes, and build basics.
 This file captures hard-won lessons from the `perf/rdp-renderer` effort (CPU game
-logic + RDP rasterization). Read it before touching the plane/wall renderer or the
-bench/capture tooling.
+logic + RDP rasterization) AND the day-to-day navigation/build/bench workflow. Read
+the **Build** + **Project map** + **Cheatsheet** sections below before touching
+anything; read the renderer/bench/ares sections before changing those subsystems.
+
+> ⚠️ `AGENTS.md` is the STALE upstream doc. Its "Building The Project" section (WSL,
+> `README.md`, `DEBUG=1`/`UPLOAD=1`) is **wrong for this fork** — ignore it. Builds run
+> in Docker (see below). AGENTS.md is still good for the **hardware notes only** (RDRAM
+> bandwidth, FPU denormal-flush, R4300i cache/branch behaviour).
+
+## Build — ALWAYS in Docker, NEVER on the host
+**The host has no N64 toolchain.** `libdragon/bin/mips64-elf-gcc` does not exist on the
+host; a bare `make` ALWAYS dies with `mips64-elf-gcc: No such file or directory` (error
+127). Every build goes through the `doom-n64:tc` image (toolchain baked at
+`/n64_toolchain`). The container runs as **root**, so it writes `build/` + `filesystem/`
+back as `root:root` — chown them back afterward or the tree goes un-rebuildable.
+
+Prefer a committed wrapper; only hand-roll `docker run` for a marks/standalone build.
+- **Release ROMs:** `./build-roms.sh` — the two cart ROMs, ownership-safe (chown-back via EXIT trap).
+- **Timing bench:** `bench/run-bench.sh [label]` — builds (Docker) + runs ares + scrapes the result.
+  Env flags: `BENCH_FORCE_RDP=1`, `BENCH_FORCE_PLANES_ONLY=1`, `BENCH_FORCE_WALLS_ONLY=1`,
+  `BENCH_MARKS=1`, `BENCH_MP=N`, `KEEP_ROM=/path` (keep the ROM), `ROM=/path` (skip build, run existing).
+- **Standalone build (e.g. a marks ROM for capture)** — the canonical docker line, then chown back:
+  ```bash
+  docker run --rm -v "$PWD":/doom -w /doom -e N64_INST=/n64_toolchain doom-n64:tc \
+      bash -c "rm -rf filesystem build && make BENCH=1 <FLAGS> -j4"      # ROM -> ./Doom-N64.z64
+  docker run --rm -v "$PWD":/doom doom-n64:tc chown -R "$(id -u):$(id -g)" /doom   # un-root the tree
+  ```
+  `rm -rf filesystem build` is the in-container equivalent of the mandatory `make clean`
+  (see Build & bench flags) — a `-D` flag change does NOT trigger a recompile otherwise.
+
+## Project map — where things live
+- `linuxdoom-1.10/` — the DOOM engine (this is where 99% of edits go):
+  - `d_main.c` — `D_DoomMain`; the `BENCH_FORCE_*` startup block (~L2185-2216) sets the renderer
+    gates per build flag. Neither sub-flag ⇒ **full RDP** (walls+planes) since `764b334`.
+  - `rdp_view.c` / `.h` — RDP display-list builder. CI4 wall path: `DL_RowMajorBlock`,
+    `DL_BuildSubPalette` (median-cut quantizer), `DL_PrequantTexture` (level-load pre-quant).
+    Route gates `DL_WallRouteOn()` / `DL_PlaneRouteOn()`.
+  - `r_plane.c` — RDP plane (floor+ceiling) path: `R_DrawPlanes`→`R_EmitPlanePolys`→
+    `R_EmitIslandRuns`→`R_EmitRunPoly`. `PLANE_UV_TRACE` / `PLANE_GEOM_TRACE` diagnostics.
+  - `i_video_n64.c` — N64 video glue, framebuffer, `I_N64ScanReadLump` (font-stomp fix), `I_ReadScreen`.
+  - `r_data.c` — texture/flat caching; `R_PrecacheLevel` calls `DL_PrequantTexture`.
+  - `m_menu.c` — options menu (framerate selector removed). `n64_bench.c` — bench timers +
+    `BENCH_MARK` markers + `N64Bench_FrameNo()`. `g_game.c`/`m_misc.c`/`i_system_n64.c` — timing/defaults.
+- `bench/` — tooling: `run-bench.sh` (build+time), `scan-marks.sh` (frozen-marks capture),
+  `ares-run.sh` (one-off boot). `ref-frames-off/` = cached software reference frames + log.
+- `Docs/` — design docs (PORTING_PLAN, RDP_RENDERER_DESIGN/NOTES, RDP_PRIOR_ART, CI4_WALL_FEASIBILITY).
+- `libdragon/`, `tiny3d/` — external libs, **DO NOT modify**. `WADs/` (+`WADs_rom1/2/`) — asset
+  staging the build swaps in. `filesystem/` — generated asset stage. `build/` — generated objects.
+
+## Renderer gates (runtime flags)
+- `n64_use_rdp_renderer` (master) · `n64_rdp_wall_ab` (RDP walls) · `n64_rdp_plane_ab` (RDP planes).
+- `DL_WallRouteOn()` = `use_rdp && wall_ab`; `DL_PlaneRouteOn()` = `use_rdp && plane_ab`.
+- Shipped default: RDP **off** (software). `BENCH_FORCE_RDP=1` pins master on; with neither
+  sub-flag ⇒ both walls+planes (full RDP); `PLANES_ONLY`/`WALLS_ONLY` pin exactly one.
+
+## Cheatsheet
+```bash
+# Timing-bench one config (Docker build + ares run + scrape), reuse recorded baselines:
+bench/run-bench.sh full-rdp            # software baseline is CACHED — see Build & bench flags
+BENCH_FORCE_RDP=1 bench/run-bench.sh full-rdp
+BENCH_FORCE_RDP=1 BENCH_FORCE_PLANES_ONLY=1 bench/run-bench.sh planes-only
+
+# Build a frozen-marks ROM for visual A/B, then capture frames (grim on frozen markers):
+docker run --rm -v "$PWD":/doom -w /doom -e N64_INST=/n64_toolchain doom-n64:tc \
+    bash -c "rm -rf filesystem build && make BENCH=1 BENCH_FORCE_RDP=1 BENCH_MARKS=1 -j4"
+cp Doom-N64.z64 /tmp/full-rdp-marks.z64
+docker run --rm -v "$PWD":/doom doom-n64:tc chown -R "$(id -u):$(id -g)" /doom
+bench/scan-marks.sh /tmp/full-rdp-marks.z64 /tmp/cap/full 40 200   # -> /tmp/cap/full/frame-N.png
+
+# One-off boot / repro (scrubs EEPROM, SIGKILL-proof teardown):
+bench/ares-run.sh /tmp/full-rdp-marks.z64 120
+```
 
 ## Renderer layout
 - The **RDP plane path** (runtime flag `n64_rdp_plane_ab`) renders floors **and**
