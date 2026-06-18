@@ -37,6 +37,10 @@
 #include "m_fixed.h"
 #include "r_defs.h"
 #include "r_main.h"
+#include "r_state.h"            // viewx/viewangle/centerx/projectiony (mesh transform)
+#include "tables.h"             // finesine/finecosine/ANGLETOFINESHIFT (mesh transform)
+#include "r_bake.h"             // bake_walls / bake_numwalls (GPU port)
+#include <math.h>               // sqrtf (mesh wall length)
 #include "z_zone.h"
 #include "w_wad.h"
 #include "i_system.h"
@@ -2339,6 +2343,113 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
     *x1 = xhi;
     *y1 = yhi;
     return 1;
+}
+
+// =====================================================================
+//  GPU PORT -- static world-mesh wall draw (Phase 1b). See Docs/GPU_PORT_PLAN.md.
+// =====================================================================
+// Transform each baked world-space wall quad to a screen-space rdp_wall_t and hand
+// it to the existing arena (DL_EmitWallTier) so DL_Flush draws it through the proven
+// CI4 path. View-space divide projection -- DOOM's projection computed 4-corners-
+// per-quad instead of per-column (that is where the seg_rast CPU cost goes). The
+// invw / screen-Y conventions MATCH DL_EmitRunPiece: invw = 65536/depth (dl_invw_k =
+// 1/projection), screen_y = centery - (z-viewz)*centerx/depth.
+// Phase 1b scope: single-sided walls only, near-plane SKIP (no clip yet), NO cull.
+int n64_rdp_mesh = 0;       // BENCH_FORCE_MESH gate (set in d_main.c)
+
+int DL_MeshRouteOn(void)
+{
+    return n64_use_rdp_renderer && n64_rdp_mesh
+        && bake_walls != NULL && bake_numwalls > 0;
+}
+
+void DL_MeshDrawWalls(void)
+{
+    int     i;
+    int     emitted = 0;        /* DIAG */
+    fixed_t vcos, vsin;
+    float   viewzf;
+    const fixed_t nearz = 4 << FRACBITS;
+
+    if (!DL_MeshRouteOn())
+        return;
+
+    vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+
+    for (i = 0; i < bake_numwalls; i++)
+    {
+        const bake_wall_t* bw = &bake_walls[i];
+        fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
+        fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
+        fixed_t dA  = FixedMul(txa, vcos) + FixedMul(tya, vsin);    // depth at v1
+        fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);    // depth at v2
+        fixed_t lA, lB;
+        float   invwA, invwB, scA, scB, sxA, sxB, topf, botf, dxf, dyf;
+        int     xa, xb, lvl;
+        rdp_wall_t w;
+
+        if (dA < nearz && dB < nearz) continue;     // both behind near plane
+        if (dA < nearz || dB < nearz) continue;     // straddles -- clip is a TODO
+
+        lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
+        lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
+
+        invwA = 65536.0f / (float)dA;               // == 1/depth_mapunits (dl_invw_k)
+        invwB = 65536.0f / (float)dB;
+        scA   = (float)centerx * invwA;             // px per map-unit height at v1
+        scB   = (float)centerx * invwB;
+
+        sxA = (float)centerx - (float)lA * (1.0f / 65536.0f) * scA;
+        sxB = (float)centerx - (float)lB * (1.0f / 65536.0f) * scB;
+        if (sxB <= sxA) continue;                   // back-facing / degenerate
+
+        xa = (int)(sxA + 0.5f);
+        xb = (int)(sxB + 0.5f);
+        if (xa < 0) xa = 0;
+        if (xb > SCREENWIDTH - 1) xb = SCREENWIDTH - 1;
+        if (xb <= xa) continue;
+        w.x1 = (int16_t)xa;
+        w.x2 = (int16_t)xb;
+
+        topf = (float)bw->ztop * (1.0f / 65536.0f) - viewzf;
+        botf = (float)bw->zbot * (1.0f / 65536.0f) - viewzf;
+        w.ytop_l = (float)centery - topf * scA;
+        w.ybot_l = (float)centery - botf * scA;
+        w.ytop_r = (float)centery - topf * scB;
+        w.ybot_r = (float)centery - botf * scB;
+
+        // Texture S spans the wall length (1 map unit = 1 texel). Offset + pegging
+        // are a Phase-1 TODO: S starts at 0, T top-pegged.
+        dxf = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
+        dyf = (float)(bw->y2 - bw->y1) * (1.0f / 65536.0f);
+        w.s_l = 0.0f;
+        w.s_r = sqrtf(dxf * dxf + dyf * dyf);
+        w.t_top_l = w.t_top_r = 0.0f;
+        w.t_bot_l = w.t_bot_r = (float)(bw->ztop - bw->zbot) * (1.0f / 65536.0f);
+        w.invw_l = invwA;
+        w.invw_r = invwB;
+
+        lvl = (255 - bw->light) >> 3;               // sector light -> colormap level
+        if (lvl < 0) lvl = 0;
+        if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+        w.light = (uint8_t)lvl;
+        w.texid = (uint16_t)bw->texture;
+        w.bucket_next = -1;
+
+        DL_EmitWallTier(&w);
+        emitted++;
+    }
+
+    // No cull/occlusion yet (Phase 2): all front-facing in-frustum walls emit and
+    // OVERDRAW (no Z, no BSP order) -- the "draws through things" state. Throttled
+    // emit count for tuning (BENCH builds only; debugf compiles out otherwise).
+    {
+        static unsigned mf = 0;
+        if ((mf++ & 511) == 0)
+            debugf("MESH: emitted %d / %d baked walls\n", emitted, bake_numwalls);
+    }
 }
 
 int DL_WallRouteOn(void)

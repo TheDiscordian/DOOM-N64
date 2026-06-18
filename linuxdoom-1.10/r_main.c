@@ -1087,6 +1087,10 @@ void R_RenderPlayerView (player_t* player)
     R_RenderBSPNode (numnodes-1);
 #endif
 
+    // GPU port: emit the static-mesh walls into the same arena as the BSP walk,
+    // before the present flush. Self-gates on DL_MeshRouteOn (n64_rdp_mesh).
+    DL_MeshDrawWalls ();
+
     // Mid-render NetUpdate keeps the net serviced during a long frame. In
     // 1p there is no net to service, so it only burns I_GetTime + joypad
     // polling; gate on netgame (true for local split-screen MP too).

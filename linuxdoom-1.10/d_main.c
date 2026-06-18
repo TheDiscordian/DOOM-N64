@@ -2211,6 +2211,10 @@ void D_DoomMain (void)
     n64_rdp_plane_ab = 1;
     debugf("BENCH: FULL RDP -> walls + planes\n");
 #endif
+#ifdef BENCH_FORCE_MESH
+    n64_rdp_mesh = 1;
+    debugf("BENCH: MESH walls ON (static world mesh)\n");
+#endif
 #else
     n64_use_rdp_renderer = 0;
 #endif

@@ -253,6 +253,13 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1);
 // tiers.
 int DL_WallRouteOn(void);
 
+// GPU port (Docs/GPU_PORT_PLAN.md): the static-world-mesh wall route. DL_MeshDrawWalls
+// transforms the baked mesh (r_bake.c) into screen records each frame; DL_MeshRouteOn
+// gates it (n64_rdp_mesh, set by BENCH_FORCE_MESH).
+extern int n64_rdp_mesh;
+int  DL_MeshRouteOn(void);
+void DL_MeshDrawWalls(void);
+
 // Pre-build one wall texture's CI4 block + sub-palette at LEVEL LOAD (called from
 // R_PrecacheLevel) so the per-frame render never pays the first-touch median-cut
 // quantisation burst. No-op unless the RDP wall path is the active renderer.
