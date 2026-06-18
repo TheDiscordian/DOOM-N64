@@ -626,9 +626,10 @@ R_StoreWallRange
     // mark the segment as visible for auto map
     linedef->flags |= ML_MAPPED;
 
-    // GPU port: flag this single-sided wall visible so DL_MeshDrawWalls emits only
-    // occlusion-surviving walls (R_StoreWallRange runs only for visible segs).
-    if (n64_rdp_mesh && !curline->backsector)
+    // GPU port: flag this wall visible (single- or two-sided) so DL_MeshDrawWalls
+    // emits only occlusion-surviving walls (R_StoreWallRange runs only for visible
+    // segs); the back-face cull in the transform picks the right side's step quads.
+    if (n64_rdp_mesh)
         R_MeshMarkLine ((int)(linedef - lines));
 
     // calculate rw_distance for scale calculation
