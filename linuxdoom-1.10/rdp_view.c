@@ -2365,11 +2365,14 @@ int DL_MeshRouteOn(void)
 
 void DL_MeshDrawWalls(void)
 {
-    int     i;
-    int     emitted = 0;        /* DIAG */
+    int     i, nrec = 0;
     fixed_t vcos, vsin;
     float   viewzf;
     const fixed_t nearz = 4 << FRACBITS;
+    // Collected this frame, then depth-sorted for painter's order. Static per-frame
+    // scratch (kept off the stack); sized to the wall arena.
+    static rdp_wall_t mrec[DL_WALL_ARENA];
+    static fixed_t    mdepth[DL_WALL_ARENA];
 
     if (!DL_MeshRouteOn())
         return;
@@ -2439,17 +2442,38 @@ void DL_MeshDrawWalls(void)
         w.texid = (uint16_t)bw->texture;
         w.bucket_next = -1;
 
-        DL_EmitWallTier(&w);
-        emitted++;
+        if (nrec < DL_WALL_ARENA)
+        {
+            mrec[nrec]   = w;
+            mdepth[nrec] = (dA < dB) ? dA : dB;     // nearest corner = sort key
+            nrec++;
+        }
     }
 
-    // No cull/occlusion yet (Phase 2): all front-facing in-frustum walls emit and
-    // OVERDRAW (no Z, no BSP order) -- the "draws through things" state. Throttled
-    // emit count for tuning (BENCH builds only; debugf compiles out otherwise).
+    // Painter's order (no Z-buffer): emit FAR-to-NEAR so a nearer wall overwrites a
+    // farther one in shared columns. Insertion sort -- nrec is tiny (tens/frame).
+    {
+        int a, b;
+        for (a = 1; a < nrec; a++)
+        {
+            rdp_wall_t tw = mrec[a];
+            fixed_t    td = mdepth[a];
+            for (b = a - 1; b >= 0 && mdepth[b] < td; b--)
+            {
+                mrec[b + 1]   = mrec[b];
+                mdepth[b + 1] = mdepth[b];
+            }
+            mrec[b + 1]   = tw;
+            mdepth[b + 1] = td;
+        }
+        for (a = 0; a < nrec; a++)
+            DL_EmitWallTier(&mrec[a]);
+    }
+
     {
         static unsigned mf = 0;
         if ((mf++ & 511) == 0)
-            debugf("MESH: emitted %d / %d baked walls\n", emitted, bake_numwalls);
+            debugf("MESH: emitted %d / %d baked walls\n", nrec, bake_numwalls);
     }
 }
 
