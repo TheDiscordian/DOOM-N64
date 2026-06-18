@@ -2203,6 +2203,14 @@ void D_DoomMain (void)
     n64_rdp_plane_ab = 0;
     debugf("BENCH: BENCH_FORCE_WALLS_ONLY -> walls RDP, planes CPU\n");
 #endif
+#if !defined(BENCH_FORCE_PLANES_ONLY) && !defined(BENCH_FORCE_WALLS_ONLY)
+    // Neither sub-flag: TRUE full RDP (walls AND planes). The shipped startup
+    // default is wall_ab=0 (planes-only), so set both here to exercise the full
+    // GPU path -- the GPU-port target config.
+    n64_rdp_wall_ab  = 1;
+    n64_rdp_plane_ab = 1;
+    debugf("BENCH: FULL RDP -> walls + planes\n");
+#endif
 #else
     n64_use_rdp_renderer = 0;
 #endif
