@@ -45,6 +45,7 @@ rcsid[] = "$Id: p_setup.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
 #include "s_sound.h"
 
 #include "doomstat.h"
+#include "r_bake.h"
 
 
 void	P_SpawnMapThing (mapthing_t*	mthing);
@@ -723,6 +724,13 @@ P_SetupLevel
 	
     rejectmatrix = W_CacheLumpNum (lumpnum+ML_REJECT,PU_LEVEL);
     P_GroupLines ();
+
+#ifdef BENCH_FORCE_MESH
+    // GPU port: bake the static world-space mesh once, now that all geometry +
+    // sector groupings are loaded. See Docs/GPU_PORT_PLAN.md. Gated until the
+    // mesh render path lands; harmless (builds data, nothing reads it yet).
+    P_BakeWorldMesh ();
+#endif
 
     bodyqueslot = 0;
     deathmatch_p = deathmatchstarts;

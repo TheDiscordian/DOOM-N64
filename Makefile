@@ -115,6 +115,13 @@ endif
 ifeq ($(BENCH_FORCE_WALLS_ONLY),1)
 CFLAGS += -DBENCH_FORCE_WALLS_ONLY=1
 endif
+#   BENCH_FORCE_MESH=1        -> GPU port: bake the static world mesh at level load
+#   (p_setup.c). Phase 1: nothing RENDERS from it yet, so frames stay byte-identical
+#   -- this only proves the bake compiles + produces sane counts. See
+#   Docs/GPU_PORT_PLAN.md.
+ifeq ($(BENCH_FORCE_MESH),1)
+CFLAGS += -DBENCH_FORCE_MESH=1
+endif
 endif
 # BENCH_FORCE_SHOW_FPS=1: pin the on-screen SHOW-FPS counter ON at startup
 # (d_main.c) so a BENCH_MARKS capture can grab the overlay for an A/B vs the
@@ -239,6 +246,7 @@ DOOM_COMMON_SRCS = \
 	$(DOOM_SRC)/p_tick.c \
 	$(DOOM_SRC)/p_saveg.c \
 	$(DOOM_SRC)/p_user.c \
+	$(DOOM_SRC)/r_bake.c \
 	$(DOOM_SRC)/r_bsp.c \
 	$(DOOM_SRC)/r_data.c \
 	$(DOOM_SRC)/r_draw.c \
