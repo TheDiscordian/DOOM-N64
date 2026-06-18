@@ -1,0 +1,128 @@
+# GPU Port Plan — static world mesh + cull + RSP-fed raster
+
+Goal: collapse the p95 CPU tail toward locked-60 by replacing DOOM's per-frame
+CPU geometry generation (BSP-walk projection + per-column wall fill + per-frame
+visplane tessellation) with a **static world-space polygon mesh** baked once at
+level load, a **cull** pass that picks the visible subset, and the existing RDP
+raster path. The RDP is idle (`rdpbusy ~5µs`); the bottleneck is the CPU turning
+the world into screen triangles every frame (`bsp_walk` + `seg_rast` + `planes` +
+`dlbuild` ≈ 7ms on dense frames). This plan moves that work off the per-frame path.
+
+This plan was produced by a design pass (4 parallel readers) and **corrected by an
+adversarial review that refuted the first synthesis' central premise** — see §Vehicle.
+
+## Architecture
+
+1. **Bake (once, at level load).** `P_SetupLevel` (p_setup.c:651) gains a
+   `P_BakeWorldMesh` (new `r_bake.c`) that converts the static lumps into a
+   world-space mesh in **absolute map-unit coordinates** (DOOM map coords are
+   on-disk shorts, p_setup.c:214 — they fit int16 with no scaling; validate range
+   at bake):
+   - **Walls** from sidedefs (NOT segs — segs are BSP-split fragments that multiply
+     count + add T-junctions): up to 3 quads per sidedef — single-sided = 1 mid
+     quad `[floorheight..ceilingheight]`; two-sided = a top quad
+     `[back.ceil..front.ceil]` + a bottom quad `[front.floor..back.floor]`; the
+     optional see-through midtexture is handled separately (masked). Texture index 0
+     (`'-'` sentinel, r_data.c:704) = no-draw, so 1/2/3 quads emit per sidedef.
+   - **Floors/ceilings** as one convex **leaf fan per subsector** (the DOOM-64
+     model; subsector_t is a convex BSP leaf, r_defs.h:227). ⚠️ Vanilla nodes have
+     **no minisegs**, so a subsector's seg loop is an *open* fan — the bake must
+     **close each leaf to its convex hull** (or clip against the BSP partition
+     stack) or floors gap along partition edges. This is the one genuinely hard
+     bake step.
+2. **Cull (per frame).** A **stripped BSP walk, cull-only**: keep `R_RenderBSPNode`
+   + `R_CheckBBox` node prune + the 1-D `solidsegs` occlusion in `R_AddLine`
+   (r_bsp.c), but strip the rasterization tail (`R_StoreWallRange`/`R_RenderSegLoop`).
+   It outputs the **visible-subsector list in BSP back-to-front order** + the cheap
+   per-seg side-effects (below). This is strictly cheaper than today and gives the
+   draw order we need with **no Z-buffer**.
+3. **Transform + raster (per frame).** For each visible quad/fan, a **hand-rolled
+   fixed-point world→screen transform** (the 4 corners) feeds the **existing
+   `rdpq_triangle(&TRIFMT_*)` path** with DOOM's existing CI4/CI8 + colormap
+   combiner + TLUT. Back-to-front order gives correct opaque overlap with **no
+   Z-image**.
+
+## Vehicle — why NOT tiny3d (adversary's key finding)
+
+The first synthesis chose tiny3d for transform, claiming `t3d_frame_start` "sets
+neither combiner nor TLUT" so DOOM's state coexists. **That is false in-tree:**
+`t3d_frame_start` (tiny3d/src/t3d/t3d.c:170) calls `rdpq_set_mode_standard()`
+(rdpq_mode.c:99) which resets the combiner to a plain TEX0 passthrough, clears the
+TLUT mode, and force-enables `zbuf`/`persp`/AA/dither/fog. t3d's triangle format
+also hardwires a Z attribute (rsp_tiny3d.rspl:23) and every t3d example attaches
+`display_get_zbuf()`, whereas DOOM attaches `rdpq_attach(disp, NULL)` — **no Z**
+(i_video_n64.c:1241). So "transform-only t3d, DOOM owns the combiner, no Z" is not a
+mode t3d supports.
+
+**Decision:** hand-rolled VR4300 fixed-point transform → existing `rdpq_triangle`.
+Same RSP triangle-**setup** ucode (the shared `rspq_triangle` the rdpq path already
+uses), DOOM keeps its combiner/TLUT, no Z-image. (A project-owned t3d *fork* that
+strips `set_mode_standard`/zbuf/persp + the Z attr is the alternative, but that is
+real work, not "additive, zero-risk". Start hand-rolled; move the transform onto the
+RSP later only if the CPU transform of 4 verts/quad ever shows up as a cost — it
+won't initially, vs today's per-column projection.)
+
+> T&L offload does **not** lower the RSP triangle-setup floor (~150–173 cyc/tri,
+> shared ucode; RDP_PRIOR_ART.md:124-176). The win must come from the **cull cutting
+> drawn-primitive count** + killing the per-frame CPU geometry generation — not from
+> "using the RSP" per se. Measure recs/uploads/tris every phase.
+
+## DOOM gotchas (must handle, or the game breaks)
+
+- **Moving sectors (doors/lifts/crushers/stairs):** only `sector_t.floorheight`/
+  `ceilingheight` (r_defs.h:103) move; runtime movers all route per-tic motion
+  through `T_MovePlane` (p_floor.c:71). No vertex XY, topology, or texture changes.
+  → bake static, mark a sector mesh-dirty in `T_MovePlane`, and once per frame
+  Z-patch that sector's wall-quad top/bottom + re-fan its subsector at the new
+  height. Dirty set = active thinkers only (single-digit typical; bounded by
+  MAXPLATS/MAXCEILINGS + door/floor thinkers).
+- **Sprites/masked ordering without the BSP:** `R_DrawSprite`/`R_DrawMasked`
+  (r_things.c:916/1034) read per-drawseg `silhouette`/`sprtopclip`/`sprbottomclip`/
+  `scale` in BSP back-to-front order. ⚠️ The clip **arrays** are produced by the
+  per-column clip walk in `R_RenderSegLoop` (r_segs.c:436-541) — that is NOT free,
+  so Phase 2 must **keep the clip walk and only remove the texel fill** (the
+  seg_rast saving is smaller than a naive "it all collapses"). The cull preserves
+  back-to-front order; never replace it with a Z-buffer.
+- **Automap:** `ML_MAPPED` is set only in `R_StoreWallRange` (r_segs.c:626); the
+  cull walk must set it per visible wall or walked-past walls never map.
+- **Sky:** the sky flat (r_plane.c:1607) stays on the CPU column path; the bake
+  skips `picnum==skyflatnum` ceilings and reproduces the r_segs sky hack.
+- **Transparent midtextures:** route two-sided midtex quads through the **existing**
+  masked path (`R_RenderMaskedSegRange`), not the opaque mesh (Phase 5).
+- **Colormap/sector light + CI4 flash:** lightlevel → per-quad/fan SHADE through the
+  existing combiner; the CI4 sub-palette pre-quant (DL_PrequantTexture) and the
+  damage-flash re-tint (DL_RetintSlot) + uniform plane-flash overlay (d76a750) are
+  reused unchanged (the transform doesn't own the combiner).
+
+## Phases (each A/B-verified against the current renderer behind a flag)
+
+- **Phase 0 — Measure & gate (no renderer change).** Run the two UNRUN probes:
+  `BENCH_PVS` (r_bsp.c:535 — does REJECT cull buy >25% of the p95 tail? <10% = drop
+  the extra PVS layer) and `BAKEFAN_PROBE` (r_bsp.c:570 — leaf-fan tri count vs
+  trapezoid tessellation) — but **fix BAKEFAN to count the CLOSED hull**, not the
+  open `numsegs-2`. Validate int16 map-coord range. Resolve "opaque tris ordered
+  with no Z" on paper (answer: cull's back-to-front order via the non-Z rdpq path).
+- **Phase 1 — Bake + render the start subsector's single-sided walls** via the
+  hand-rolled transform behind `BENCH_FORCE_MESH=1` / `DL_MeshRouteOn()`; A/B the
+  start-room frame vs the software reference. Proves bake XY + transform + viewz
+  handling + combiner coexistence + the side-effect re-emit on the smallest surface.
+  (Resolve the key-clear/keyed-present integration here — Phase 1 is only isolatable
+  once the mesh quads share the present blit correctly.)
+- **Phase 2 — All walls** (top/mid/bottom, two-sided) driven by the cull walk; keep
+  the clip-array walk, drop only the fill; re-emit drawsegs + ML_MAPPED. Verify
+  sprites still occlude on a sprite-heavy frame.
+- **Phase 3 — Baked leaf-fan floors/ceilings** (close each leaf to its hull;
+  validate with PLANE_GEOM_TRACE, not the eye; reproduce per-band/corner plane
+  lighting). Sky stays CPU.
+- **Phase 4 — Moving sectors:** the `T_MovePlane` dirty-mark + per-frame Z-patch;
+  A/B a frame mid door/lift animation.
+- **Phase 5 — Transparent midtex + flash/colormap + end-state sweep:** masked
+  midtex through the existing path; confirm flash/colormap; full RDP-vs-software
+  avg+p95 sweep.
+
+## Open go/no-go numbers (Phase 0 settles these)
+
+- `BENCH_PVS cull_pct_p95tail` — is an extra REJECT/PVS cull layer worth building?
+- `BAKEFAN` closed-hull tri count vs the current trapezoid tessellation.
+- int16 posA range across the map (start room is safe; map-wide overflow possible).
+- The realized per-quad transform cost vs today's per-column projection.
