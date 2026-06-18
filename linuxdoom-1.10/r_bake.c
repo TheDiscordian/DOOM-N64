@@ -4,9 +4,12 @@
 #include "z_zone.h"
 #include "r_state.h"     // lines, sides, sectors, numlines
 #include "r_bake.h"
+#include <string.h>      // memset (visibility gate)
 
-bake_wall_t*    bake_walls   = NULL;
+bake_wall_t*    bake_walls    = NULL;
 int             bake_numwalls = 0;
+byte*           bake_linevis  = NULL;    // per-linedef visibility (PU_LEVEL)
+int             bake_numlines = 0;
 
 //
 // P_BakeWorldMesh
@@ -70,8 +73,15 @@ void P_BakeWorldMesh (void)
         w->ztop    = sec->ceilingheight;
         w->texture = sd->midtexture;
         w->light   = sec->lightlevel;
+        w->line    = (short)i;
     }
     bake_numwalls = count;
+
+    // Per-linedef visibility gate: reset each frame, set by the BSP walk
+    // (R_StoreWallRange marks occlusion-surviving single-sided walls visible).
+    bake_numlines = numlines;
+    bake_linevis  = Z_Malloc(numlines, PU_LEVEL, NULL);
+    memset(bake_linevis, 0, numlines);
 
     // int16 map-coord range check: the per-frame transform stores posA as int16, and
     // DOOM map units are on-disk shorts, so the integer part fits -- assert it once
@@ -90,4 +100,24 @@ void P_BakeWorldMesh (void)
 
     debugf ("P_BakeWorldMesh: baked %d single-sided wall quads (of %d linedefs)\n",
             bake_numwalls, numlines);
+}
+
+//
+// R_MeshResetVis -- clear the per-linedef visibility flags. Call once per frame
+// BEFORE the BSP walk (R_RenderPlayerView). No-op until a level is baked.
+//
+void R_MeshResetVis (void)
+{
+    if (bake_linevis)
+        memset (bake_linevis, 0, bake_numlines);
+}
+
+//
+// R_MeshMarkLine -- flag a linedef visible. Called from R_StoreWallRange for each
+// occlusion-surviving single-sided wall, so DL_MeshDrawWalls emits only those.
+//
+void R_MeshMarkLine (int lineidx)
+{
+    if (bake_linevis && (unsigned)lineidx < (unsigned)bake_numlines)
+        bake_linevis[lineidx] = 1;
 }

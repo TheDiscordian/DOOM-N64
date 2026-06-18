@@ -45,6 +45,7 @@ rcsid[] = "$Id: r_segs.c,v 1.3 1997/01/29 20:10:19 b1 Exp $";
 
 #ifdef N64
 #include "rdp_view.h"
+#include "r_bake.h"
 
 #if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
 #include <libdragon.h>      // debugf for the diagnostic seg-claim trace
@@ -624,7 +625,12 @@ R_StoreWallRange
 
     // mark the segment as visible for auto map
     linedef->flags |= ML_MAPPED;
-    
+
+    // GPU port: flag this single-sided wall visible so DL_MeshDrawWalls emits only
+    // occlusion-surviving walls (R_StoreWallRange runs only for visible segs).
+    if (n64_rdp_mesh && !curline->backsector)
+        R_MeshMarkLine ((int)(linedef - lines));
+
     // calculate rw_distance for scale calculation
     rw_normalangle = curline->angle + ANG90;
     offsetangle = abs(rw_normalangle-rw_angle1);

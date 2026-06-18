@@ -44,6 +44,7 @@ static const char rcsid[] = "$Id: r_main.c,v 1.5 1997/02/03 22:45:12 b1 Exp $";
 #ifdef N64
 #include "i_video.h"
 #include "rdp_view.h"   // DL_AnyRouteOn (key-clear arming gate)
+#include "r_bake.h"     // R_MeshResetVis (GPU-port per-frame visibility gate)
 #endif
 
 #ifdef N64_BENCH
@@ -1080,6 +1081,7 @@ void R_RenderPlayerView (player_t* player)
     // walk is BSP_WALK; R_RenderSegLoop switches to SEG_RASTER around its
     // per-column fill and back, so the wall raster cost is attributed
     // separately (the RDP renderer offloads SEG_RASTER, keeps BSP_WALK).
+    R_MeshResetVis ();      // GPU port: clear per-line vis before the walk re-marks it
 #ifdef N64_BENCH
     N64Bench_PhaseBegin(BPH_BSP_WALK);
     R_RenderBSPNode (numnodes-1);

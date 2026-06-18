@@ -2390,6 +2390,7 @@ void DL_MeshDrawWalls(void)
         int     xa, xb, lvl;
         rdp_wall_t w;
 
+        if (bake_linevis && !bake_linevis[bw->line]) continue;  // BSP-occlusion gate
         if (dA < nearz && dB < nearz) continue;     // both behind near plane
         if (dA < nearz || dB < nearz) continue;     // straddles -- clip is a TODO
 

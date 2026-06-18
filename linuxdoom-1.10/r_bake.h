@@ -22,12 +22,24 @@ typedef struct
     fixed_t ztop;       // top edge height    (sector ceilingheight)
     short   texture;    // wall texture index (>0; 0 = '-' sentinel, not baked)
     short   light;      // owning sector lightlevel (SHADE through the colormap)
+    short   line;       // owning linedef index (for the per-frame visibility gate)
 } bake_wall_t;
 
 extern bake_wall_t* bake_walls;     // PU_LEVEL; rebuilt each P_SetupLevel
 extern int          bake_numwalls;
 
+// Per-linedef visibility, set by the BSP walk (R_StoreWallRange marks a line whose
+// seg survives the solidsegs occlusion) and consumed by DL_MeshDrawWalls so only
+// occlusion-surviving walls emit. PU_LEVEL, sized numlines. Reset each frame.
+extern byte*        bake_linevis;
+extern int          bake_numlines;
+
 // Build the static world mesh for the current level. Call AFTER P_GroupLines().
 void P_BakeWorldMesh (void);
+
+// Per-frame visibility gate (GPU port). R_MeshResetVis clears the flags (call once
+// before the BSP walk); R_MeshMarkLine flags a linedef visible (called from the walk).
+void R_MeshResetVis (void);
+void R_MeshMarkLine (int lineidx);
 
 #endif
