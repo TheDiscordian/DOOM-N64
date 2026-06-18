@@ -931,8 +931,21 @@ static int DL_Tex2xDownsample(int texnum)
 #define DL_TIER_NATIVE   0
 #define DL_TIER_HALF     1
 #define DL_TIER_ONEQUAD  2
+// WALL TEXTURE DOWNSAMPLE -- DISABLED: route every wall texture NATIVE.
+// The HALF/ONEQUAD tiers existed to cut RSP load/command volume, but the texture
+// pre-load (DL_PrequantTexture at R_PrecacheLevel) now builds every routed block
+// ONCE at level load, so the per-frame saving is gone. Measured all-native avg
+// 20036us vs the downsampled 21873us this session -- same-or-better -- because the
+// RDP is idle (rdpbusy ~5us) and CPU emit is the bottleneck, not RSP volume. And the
+// halved blocks visibly SMEARED detailed walls (the brown-ribbed faces): a downsample
+// should never smear, so native is both crisp and not slower. The classifier below is
+// retained (gated by a non-const flag, so it stays live) for an easy re-enable if the
+// perf regime ever shifts back to RSP-volume-bound.
+static int dl_wall_downsample_enabled = 0;
 static int DL_TexDownsampleTier(int texnum, int tw, int th)
 {
+    if (!dl_wall_downsample_enabled)
+        return DL_TIER_NATIVE;
     if (DL_TexIsProtectedWide(texnum, tw))      // >=256-wide (or name-pinned native)
         return DL_Tex2xDownsample(texnum) ? DL_TIER_HALF : DL_TIER_NATIVE;
     // Below the width boundary: the existing one-quad collapse, still gated by the
