@@ -1257,6 +1257,23 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     return block;
 }
 
+// Pre-build the CI4 row-major block + sub-palette for ONE wall texture at LEVEL
+// LOAD (from R_PrecacheLevel), so the per-frame render never pays the median-cut
+// quantisation. Lazily quantising MANY new textures in a single frame is the
+// dlbuild burst (measured 50-97k us) on area-transition frames; doing it up-front
+// folds it into the loading pause instead. No-op unless the RDP wall path is the
+// active renderer. Idempotent: DL_RowMajorBlock self-guards on slot->raw/block,
+// and DL_InitCaches guards on dl_rowmajor_inited.
+void DL_PrequantTexture(int texnum)
+{
+    if (!n64_use_rdp_renderer || !n64_rdp_wall_ab)
+        return;
+    if (texnum < 0 || texnum >= numtextures)
+        return;
+    DL_InitCaches();                        // ensure dl_rowmajor exists pre-frame
+    (void)DL_RowMajorBlock(texnum, NULL, NULL);
+}
+
 // --- in-flight block tracking (PU_CACHE async-read race) -------------------
 // Per-slot generation stamps replace the former fixed 2x16-entry pending/
 // previous lists (Stage-3 insurance: the lists overflowed silently past 16

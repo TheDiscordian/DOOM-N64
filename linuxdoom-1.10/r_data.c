@@ -40,6 +40,9 @@ rcsid[] = "$Id: r_data.c,v 1.4 1997/02/03 16:47:55 b1 Exp $";
 
 #include "doomstat.h"
 #include "r_sky.h"
+#ifdef N64
+#include "rdp_view.h"   // DL_PrequantTexture (level-load CI4 pre-build)
+#endif
 
 #if defined(LINUX) || defined(N64)
 #include  <alloca.h>
@@ -813,8 +816,14 @@ void R_PrecacheLevel (void)
 	    texturememory += lumpinfo[lump].size;
 	    W_CacheLumpNum(lump , PU_CACHE);
 	}
+#ifdef N64
+	// RDP GPU port: pre-build this wall texture's CI4 block + sub-palette at
+	// load so the per-frame render never pays the first-touch quantise burst
+	// (no-op unless the RDP wall path is active).
+	DL_PrequantTexture(i);
+#endif
     }
-    
+
     // Precache sprites.
     spritepresent = alloca(numsprites);
     memset (spritepresent,0, numsprites);

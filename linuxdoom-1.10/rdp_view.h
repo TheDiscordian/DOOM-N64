@@ -253,6 +253,11 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1);
 // tiers.
 int DL_WallRouteOn(void);
 
+// Pre-build one wall texture's CI4 block + sub-palette at LEVEL LOAD (called from
+// R_PrecacheLevel) so the per-frame render never pays the first-touch median-cut
+// quantisation burst. No-op unless the RDP wall path is the active renderer.
+void DL_PrequantTexture(int texnum);
+
 // True if the RDP plane path is enabled (flag on + plane A/B toggle on). Mirror
 // of DL_WallRouteOn for the Stage-4 floor/ceiling span path; R_MapPlane calls it
 // at its leaf to decide whether to emit a span (RDP) or run spanfunc() (CPU).
