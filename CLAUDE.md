@@ -59,9 +59,20 @@ pull — fixed in `0951cb3`).
   identical game state on every build**, so frame-N captures are directly A/B
   comparable across builds. NEVER use a BENCH_MARKS build for timing (the marker
   debugf + freeze skew the numbers).
-- Timing runs: `bench/run-bench.sh` (no BENCH_MARKS). Software baseline ≈
-  **avg 19793µs / p95 31648µs**. Determinism is byte-stable run-to-run, so a
-  fingerprint drift (drawsegs/visplanes/etc.) means a real behaviour change.
+- Timing builds: **`make clean` FIRST is mandatory** for any BENCH/flag build.
+  Incremental `make` does NOT recompile when only a `-D` flag changes, so you get a
+  Frankenstein mix of BENCH and non-BENCH objects — link errors (undefined
+  `I_N64ForceSelectedWad`) or a silent boot hang before `S_Init`. The hours-long
+  "bench won't boot" was exactly this, nothing deeper.
+- **The bench is DETERMINISTIC: measure each config ONCE, record the number, reuse
+  it. NEVER re-bench software or any config you did not change — it LITERALLY
+  returns the same result every time.** Only re-bench the thing you actually
+  changed, and A/B it against the recorded baseline.
+- Recorded baselines (current ares, clean builds; absolute µs are ares-version-
+  dependent so A/B within one session): **software avg 28193µs / p95 49632µs**. The
+  tail is plane-dominated (planes p95 20320, worst-frame 31899µs), then seg_rast
+  (p95 12960), with audio spiking to ~13000µs on the worst frames. Fingerprint
+  (drawsegs=14 visplanes=8 vissprites=4 mean) drift means a real behaviour change.
 
 ## Capture & comparison reliability
 - **Software (RDP-off) output is deterministic — capture the reference ONCE and
