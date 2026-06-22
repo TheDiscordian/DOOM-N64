@@ -2419,32 +2419,56 @@ void DL_MeshDrawWalls(void)
         sxA = (float)centerx - (float)lA * (1.0f / 65536.0f) * scA;
         sxB = (float)centerx - (float)lB * (1.0f / 65536.0f) * scB;
         if (sxB <= sxA) continue;                   // back-facing / degenerate
-
-        xa = (int)(sxA + 0.5f);
-        xb = (int)(sxB + 0.5f);
-        if (xa < 0) xa = 0;
-        if (xb > SCREENWIDTH - 1) xb = SCREENWIDTH - 1;
-        if (xb <= xa) continue;
-        w.x1 = (int16_t)xa;
-        w.x2 = (int16_t)xb;
+        if (sxB <= 0.0f || sxA >= (float)(SCREENWIDTH - 1)) continue;  // fully off-screen
 
         topf = (float)bw->ztop * (1.0f / 65536.0f) - viewzf;
         botf = (float)bw->zbot * (1.0f / 65536.0f) - viewzf;
-        w.ytop_l = (float)centery - topf * scA;
-        w.ybot_l = (float)centery - botf * scA;
-        w.ytop_r = (float)centery - topf * scB;
-        w.ybot_r = (float)centery - botf * scB;
-
-        // Texture S spans the wall length (1 map unit = 1 texel). Offset + pegging
-        // are a Phase-1 TODO: S starts at 0, T top-pegged.
         dxf = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
         dyf = (float)(bw->y2 - bw->y1) * (1.0f / 65536.0f);
-        w.s_l = 0.0f;
-        w.s_r = sqrtf(dxf * dxf + dyf * dyf);
-        w.t_top_l = w.t_top_r = 0.0f;
-        w.t_bot_l = w.t_bot_r = (float)(bw->ztop - bw->zbot) * (1.0f / 65536.0f);
-        w.invw_l = invwA;
-        w.invw_r = invwB;
+
+        // Perspective-correct SCREEN-EDGE clip. The naive version clamped screen x
+        // (xa/xb) but kept the off-screen corner's S/invw/Y -> a wall spanning past a
+        // screen edge had its texture SHEARED across the visible span (the close-wall
+        // smear). invw, S*invw, and screen Y are ALL linear in screen x for a planar
+        // wall quad, so clip each edge by lerping every attribute at the clip x.
+        {
+            float sLen = sqrtf(dxf * dxf + dyf * dyf);
+            float ytA  = (float)centery - topf * scA, ybA = (float)centery - botf * scA;
+            float ytB  = (float)centery - topf * scB, ybB = (float)centery - botf * scB;
+            float siA  = 0.0f * invwA, siB = sLen * invwB;  // S*invw at each corner
+            float dsx  = sxB - sxA;
+            float tL   = (sxA < 0.0f) ? (0.0f - sxA) / dsx : 0.0f;
+            float tR   = (sxB > (float)(SCREENWIDTH - 1))
+                             ? ((float)(SCREENWIDTH - 1) - sxA) / dsx : 1.0f;
+            float invw_l = invwA + tL * (invwB - invwA);
+            float invw_r = invwA + tR * (invwB - invwA);
+            float si_l   = siA + tL * (siB - siA);
+            float si_r   = siA + tR * (siB - siA);
+            float sx_l   = sxA + tL * dsx;
+            float sx_r   = sxA + tR * dsx;
+
+            xa = (int)(sx_l + 0.5f);
+            xb = (int)(sx_r + 0.5f);
+            if (xa < 0) xa = 0;
+            if (xb > SCREENWIDTH - 1) xb = SCREENWIDTH - 1;
+            if (xb <= xa) continue;
+            w.x1 = (int16_t)xa;
+            w.x2 = (int16_t)xb;
+
+            w.ytop_l = ytA + tL * (ytB - ytA);
+            w.ybot_l = ybA + tL * (ybB - ybA);
+            w.ytop_r = ytA + tR * (ytB - ytA);
+            w.ybot_r = ybA + tR * (ybB - ybA);
+
+            // S = (S*invw)/invw at the (possibly clipped) endpoints. T spans wall
+            // height; pegging/offset still a Phase-1 TODO (S0=0, T top-pegged).
+            w.s_l = si_l / invw_l;
+            w.s_r = si_r / invw_r;
+            w.t_top_l = w.t_top_r = 0.0f;
+            w.t_bot_l = w.t_bot_r = (float)(bw->ztop - bw->zbot) * (1.0f / 65536.0f);
+            w.invw_l = invw_l;
+            w.invw_r = invw_r;
+        }
 
         lvl = (255 - bw->light) >> 3;               // sector light -> colormap level
         if (lvl < 0) lvl = 0;
