@@ -2391,9 +2391,33 @@ DEFINE_RSP_UCODE(rsp_dlwall);
 // Overlay ID assigned by rspq_overlay_register (preshifted by 28; 0 = unregistered).
 static uint32_t rsp_dlwall_ovl_id = 0;
 
-// rspq command index for DLWallCmd_Loopback (must match the RSPQ_DefineCommand order
-// in rsp/rsp_dlwall.S -- it is the first and only command, index 0).
+// rspq command indices (must match the RSPQ_DefineCommand order in rsp/rsp_dlwall.S).
 #define DLWALL_CMD_LOOPBACK 0
+#define DLWALL_CMD_XFORM    1
+
+// ---- Phase 1 transform DMA blocks. Layouts MUST match rsp_dlwall.S byte-for-byte
+// (VIEWBLK / WALLIN / WALLOUT). All 32-bit signed words; no FPU on the RSP, so the
+// output is fixed-point and the CPU converts on read.
+typedef struct {
+    int32_t viewx, viewy, viewz;   // 0x00,0x04,0x08  fixed_t
+    int32_t vcos, vsin;            // 0x0C,0x10        fixed_t finecosine/finesine
+    int32_t centerx, centery;      // 0x14,0x18        plain int
+    int32_t pad0;                  // 0x1C
+} rsp_view_blk_t;                  // 32 bytes
+
+typedef struct {
+    int32_t x1, y1, x2, y2;        // 0x00..0x0C  fixed_t wall corners
+    int32_t ztop, zbot;            // 0x10,0x14   fixed_t snapshotted live heights
+    int32_t pad0, pad1;            // 0x18,0x1C
+} rsp_wall_in_t;                   // 32 bytes
+
+typedef struct {
+    int32_t dA, dB;                // 0x00,0x04  depth 16.16
+    int32_t lA, lB;                // 0x08,0x0C  lateral 16.16
+    int32_t invwA, invwB;          // 0x10,0x14  RAW 32-bit vrcp reciprocal of depth
+    int32_t sxA, sxB;              // 0x18,0x1C  screen X 16.16
+    int32_t ytA, ybA, ytB, ybB;    // 0x20..0x2C screen Y top/bot per corner 16.16
+} rsp_wall_out_t;                  // 48 bytes
 #endif
 
 // Map a record's per-edge INV_W (== 1/depth in map units, see dl_invw_k) to a
@@ -2495,6 +2519,187 @@ static void DL_RSPLoopbackProbe(void)
     free(src);
     free(dst);
 }
+
+// =====================================================================
+//  RSP PORT -- PHASE 1: ONE-WALL TRANSFORM, bit-exact compare gate.
+// =====================================================================
+// The load-bearing precision gate (Docs/RSP_PORT_PLAN.md Sec 4/5). Picks the first
+// baked wall that passes the near gate with BOTH corners past the near plane and on
+// screen (so the float screen-edge-clip lerps DON'T run -- those are linear-in-float
+// and not a hardware precision risk; isolating the two real risks, the FixedMul and
+// the 65536/depth divide). Packs a fixed-point view block + the wall, runs the RSP
+// transform overlay, reads back the fixed-point rsp_wall_out_t, recomputes every
+// field CPU-side in IEEE32 float exactly as DL_MeshDrawWalls does, and logs the max
+// per-field delta + a MATCH/DRIFT verdict.
+//
+// invw scale: the RSP returns the RAW 32-bit vrcp reciprocal of depth_fixed. vrcp
+// produces ~ 2^31/X (with a documented 1-LSB right shift -> effectively 2^31 numerator
+// for our normalized 16.16 inputs). The CPU bridges to the real 65536/depth by the
+// known scale factor RSP_INVW_SCALE and reports the RELATIVE error -- a wrong power of
+// two would show as a clean 2x in the log (self-diagnosing), the vrcp epsilon shows as
+// a small relative delta (the divide-risk datum).
+static void DL_RSPXformProbe(void)
+{
+    static int probed = 0;
+    int i, pick = -1;
+    fixed_t vcos, vsin;
+    const fixed_t nearz = 4 << FRACBITS;
+
+    rsp_view_blk_t *vb;
+    rsp_wall_in_t  *wi;
+    rsp_wall_out_t *wo;
+
+    if (probed) return;
+
+    if (!bake_walls || bake_numwalls <= 0) {
+        debugf("RSP-XFORM: SKIP (no baked walls)\n");
+        probed = 1;
+        return;
+    }
+    if (rsp_dlwall_ovl_id == 0) {            // share the loopback probe's registration
+        rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+        debugf("RSP-XFORM: overlay registered, id=0x%08lx\n",
+               (unsigned long)rsp_dlwall_ovl_id);
+    }
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+
+    // ---- choose an unclipped, on-screen, front-facing wall ----
+    for (i = 0; i < bake_numwalls; i++) {
+        const bake_wall_t* bw = &bake_walls[i];
+        fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
+        fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
+        fixed_t dA  = FixedMul(txa, vcos) + FixedMul(tya, vsin);
+        fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);
+        fixed_t lA, lB, ztopz, zbotz;
+        float invwA, invwB, scA, scB, sxA, sxB;
+
+        if (dA < nearz || dB < nearz) continue;     // BOTH past near -> no clip
+        ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                              : sectors[bw->ztop_sec].floorheight;
+        zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                              : sectors[bw->zbot_sec].floorheight;
+        if (ztopz <= zbotz) continue;
+
+        lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
+        lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
+        invwA = 65536.0f / (float)dA;
+        invwB = 65536.0f / (float)dB;
+        scA = (float)centerx * invwA;
+        scB = (float)centerx * invwB;
+        sxA = (float)centerx - (float)lA * (1.0f/65536.0f) * scA;
+        sxB = (float)centerx - (float)lB * (1.0f/65536.0f) * scB;
+        if (sxB <= sxA) continue;
+        if (sxA < 0.5f || sxB > (float)(SCREENWIDTH - 1) - 0.5f) continue; // fully on, no edge clip
+        pick = i;
+        break;
+    }
+    if (pick < 0) {
+        debugf("RSP-XFORM: no unclipped on-screen wall this frame (retry)\n");
+        return;     // try again next frame -- don't set probed; need a clean wall
+    }
+    probed = 1;
+
+    {
+        const bake_wall_t* bw = &bake_walls[pick];
+        fixed_t ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                                      : sectors[bw->ztop_sec].floorheight;
+        fixed_t zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                                      : sectors[bw->zbot_sec].floorheight;
+
+        // ---- CPU reference (IEEE32 float, mirrors DL_MeshDrawWalls) ----
+        fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
+        fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
+        fixed_t dA  = FixedMul(txa, vcos) + FixedMul(tya, vsin);
+        fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);
+        fixed_t lA  = FixedMul(tya, vcos) - FixedMul(txa, vsin);
+        fixed_t lB  = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
+        float viewzf = (float)viewz * (1.0f/65536.0f);
+        float invwA  = 65536.0f / (float)dA;
+        float invwB  = 65536.0f / (float)dB;
+        float scA    = (float)centerx * invwA;
+        float scB    = (float)centerx * invwB;
+        float sxA    = (float)centerx - (float)lA * (1.0f/65536.0f) * scA;
+        float sxB    = (float)centerx - (float)lB * (1.0f/65536.0f) * scB;
+        float topf   = (float)ztopz * (1.0f/65536.0f) - viewzf;
+        float botf   = (float)zbotz * (1.0f/65536.0f) - viewzf;
+        float ytA = (float)centery - topf*scA, ybA = (float)centery - botf*scA;
+        float ytB = (float)centery - topf*scB, ybB = (float)centery - botf*scB;
+
+        // ---- pack DMA blocks (cache-line aligned) ----
+        vb = memalign(16, sizeof *vb);
+        wi = memalign(16, sizeof *wi);
+        wo = memalign(16, sizeof *wo);
+        if (!vb || !wi || !wo) {
+            if (vb) free(vb); if (wi) free(wi); if (wo) free(wo);
+            debugf("RSP-XFORM: SKIP (alloc failed)\n");
+            return;
+        }
+        vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
+        vb->vcos = vcos;   vb->vsin = vsin;
+        vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
+        wi->x1 = bw->x1; wi->y1 = bw->y1; wi->x2 = bw->x2; wi->y2 = bw->y2;
+        wi->ztop = ztopz; wi->zbot = zbotz; wi->pad0 = wi->pad1 = 0;
+        memset(wo, 0xA5, sizeof *wo);
+
+        data_cache_hit_writeback(vb, sizeof *vb);
+        data_cache_hit_writeback(wi, sizeof *wi);
+        data_cache_hit_writeback(wo, sizeof *wo);  // flush poison so a no-write can't pass
+
+        rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_XFORM,
+                   PhysicalAddr(vb), PhysicalAddr(wi), PhysicalAddr(wo));
+        rspq_wait();
+        data_cache_hit_invalidate(wo, sizeof *wo);
+
+        // ---- convert RSP fixed-point output to float ----
+        float r_dA = (float)wo->dA * (1.0f/65536.0f);
+        float r_dB = (float)wo->dB * (1.0f/65536.0f);
+        float r_lA = (float)wo->lA * (1.0f/65536.0f);
+        float r_lB = (float)wo->lB * (1.0f/65536.0f);
+        // RSP invw = FixedDiv(65536, depth) = 2^32/depth_fixed in 16.16 == invw_real
+        // in 16.16. Convert by /65536. (The FIXEDDIV_SH constant in the ucode lands the
+        // 16.16 scale; the log's relative error reveals a wrong power-of-two as a clean
+        // 2^n, vs the genuine vrcp epsilon.)
+        double r_invwA = (double)(int32_t)wo->invwA / 65536.0;
+        double r_invwB = (double)(int32_t)wo->invwB / 65536.0;
+        float r_sxA = (float)wo->sxA * (1.0f/65536.0f);
+        float r_sxB = (float)wo->sxB * (1.0f/65536.0f);
+        float r_ytA = (float)wo->ytA * (1.0f/65536.0f);
+        float r_ybA = (float)wo->ybA * (1.0f/65536.0f);
+        float r_ytB = (float)wo->ytB * (1.0f/65536.0f);
+        float r_ybB = (float)wo->ybB * (1.0f/65536.0f);
+
+        // ---- max per-field deltas ----
+        float d_d  = fmaxf(fabsf(r_dA - (float)dA*(1.0f/65536.0f)),
+                           fabsf(r_dB - (float)dB*(1.0f/65536.0f)));
+        float d_l  = fmaxf(fabsf(r_lA - (float)lA*(1.0f/65536.0f)),
+                           fabsf(r_lB - (float)lB*(1.0f/65536.0f)));
+        double e_iA = fabs((r_invwA - (double)invwA) / (double)invwA);
+        double e_iB = fabs((r_invwB - (double)invwB) / (double)invwB);
+        double d_invw = (e_iA > e_iB) ? e_iA : e_iB;
+        float d_sx = fmaxf(fabsf(r_sxA - sxA), fabsf(r_sxB - sxB));
+        float d_sy = fmaxf(fmaxf(fabsf(r_ytA - ytA), fabsf(r_ybA - ybA)),
+                           fmaxf(fabsf(r_ytB - ytB), fabsf(r_ybB - ybB)));
+
+        // screen coords within 0.5px, invw within a small relative epsilon
+        int match = (d_sx <= 0.5f) && (d_sy <= 0.5f) && (d_invw <= 0.01);
+
+        debugf("RSP-XFORM wall=%d pick_depthA=%d depthB=%d\n", pick, dA, dB);
+        debugf("RSP-XFORM cpu  sxA=%d.%03d sxB=%d.%03d ytA=%d ybA=%d invwA=%d(e-6)\n",
+               (int)sxA, (int)((sxA-(int)sxA)*1000), (int)sxB, (int)((sxB-(int)sxB)*1000),
+               (int)ytA, (int)ybA, (int)(invwA*1e6f));
+        debugf("RSP-XFORM rsp  sxA=%d.%03d sxB=%d.%03d ytA=%d ybA=%d invwA=%d(e-6)\n",
+               (int)r_sxA, (int)((r_sxA-(int)r_sxA)*1000), (int)r_sxB,
+               (int)((r_sxB-(int)r_sxB)*1000), (int)r_ytA, (int)r_ybA, (int)(r_invwA*1e6));
+        debugf("RSP-XFORM wall=%d dmax_d=%d(e-3) dmax_l=%d(e-3) dmax_sx=%d(e-3) "
+               "dmax_sy=%d(e-3) dmax_invw=%d(e-6) verdict=%s\n",
+               pick, (int)(d_d*1000), (int)(d_l*1000), (int)(d_sx*1000),
+               (int)(d_sy*1000), (int)(d_invw*1e6), match ? "MATCH" : "DRIFT");
+
+        free(vb); free(wi); free(wo);
+    }
+}
 #endif // BENCH_FORCE_MESH_RSP
 
 void DL_MeshDrawWalls(void)
@@ -2511,10 +2716,13 @@ void DL_MeshDrawWalls(void)
     if (!DL_MeshRouteOn())
         return;
 
-    // RSP port Phase 0: one-time DMA-loopback probe (logs only, no render effect).
+    // RSP port probes (logs only, no render effect): Phase 0 DMA loopback +
+    // Phase 1 one-wall transform compare gate.
 #ifdef BENCH_FORCE_MESH_RSP
-    if (n64_rdp_mesh_rsp)
+    if (n64_rdp_mesh_rsp) {
         DL_RSPLoopbackProbe();
+        DL_RSPXformProbe();
+    }
 #endif
 
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
