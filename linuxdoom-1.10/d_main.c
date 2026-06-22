@@ -2218,6 +2218,12 @@ void D_DoomMain (void)
     n64_rdp_mesh    = 1;
     n64_rdp_wall_ab = 0;
     debugf("BENCH: MESH walls ON (static world mesh + Z-buffer; RDP wall route off)\n");
+#ifdef BENCH_FORCE_MESH_FLOORS
+    // Phase 3 floor leaves (baked convex-polygon floors on the RDP). OFF by default:
+    // measured a PERF LOSS vs the coalesced visplane path. Opt-in for experiments.
+    n64_rdp_mesh_floors = 1;
+    debugf("BENCH: MESH floors ON (baked leaf fans; perf-loss experiment)\n");
+#endif
 #endif
 #else
     n64_use_rdp_renderer = 0;

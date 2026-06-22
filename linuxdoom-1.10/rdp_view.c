@@ -2356,6 +2356,10 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
 // 1/projection), screen_y = centery - (z-viewz)*centerx/depth.
 // Phase 1b scope: single-sided walls only, near-plane SKIP (no clip yet), NO cull.
 int n64_rdp_mesh = 0;       // BENCH_FORCE_MESH gate (set in d_main.c)
+int n64_rdp_mesh_floors = 0;// BENCH_FORCE_MESH_FLOORS gate -- Phase 3 floor leaves; OFF by
+                            // default: measured a PERF LOSS (mesh floors slower than the
+                            // already-coalesced visplane path). Separate flag so the
+                            // default mesh build keeps the validated wall-only perf.
 int dl_wall_z       = 0;    // mesh wall pass: draw with the Z-buffer (set in DL_Flush)
 int dl_zbuf_attached = 0;   // set by i_video each frame: 1 iff a z-image is attached
 
@@ -3644,7 +3648,7 @@ static void DL_DrawMeshLeaves(void)
     float   viewzf;
     int     ss, drew = 0;
 
-    if (!DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+    if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
         return;
 
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
@@ -3660,87 +3664,110 @@ static void DL_DrawMeshLeaves(void)
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
     }
 
-    for (ss = 0; ss < numsubsectors; ss++)
+    // Pass 1: collect visible non-sky leaves + their DISTINCT floor flats, so each
+    // flat is uploaded to TMEM exactly ONCE this frame (the per-leaf upload spiked
+    // dlbuild to 150ms). Pass 2 then walks per flat.
     {
-        bake_leaf_t* lf = &bake_leaves[ss];
-        sector_t*    sec;
-        float        hf, umin, vmin;
-        float        cx[DL_LEAF_MAXV], cy[DL_LEAF_MAXV], cz[DL_LEAF_MAXV];
-        float        cu[DL_LEAF_MAXV], cv[DL_LEAF_MAXV], cw[DL_LEAF_MAXV];
-        int          n, i, lvl, flatidx, ubias, vbias, bad = 0;
-        byte*        block;
-        uint32_t     prim;
+        static int vis[2048];
+        static int flats[256];
+        int nvis = 0, nflat = 0, vi, fi;
 
-        if (!bake_leafvis[ss]) continue;
-        n = lf->numverts;
-        if (n < 3 || n > DL_LEAF_MAXV) continue;
-        if (lf->floorpic == skyflatnum) continue;       // sky floor stays CPU
-        sec = &sectors[lf->sector];
-        hf  = (float)sec->floorheight * (1.0f / 65536.0f) - viewzf;
-
-        umin = 1.0e30f; vmin = 1.0e30f;
-        for (i = 0; i < n; i++)
+        for (ss = 0; ss < numsubsectors; ss++)
         {
-            fixed_t wx = bake_leaf_verts[lf->firstvert + i][0];
-            fixed_t wy = bake_leaf_verts[lf->firstvert + i][1];
-            fixed_t tx = wx - viewx, ty = wy - viewy;
-            fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
-            fixed_t lat;
-            float   invw, sc, u, v;
-            if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: slice-1 cull
-            lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
-            invw = 65536.0f / (float)depth;
-            sc   = (float)centerx * invw;
-            cx[i] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
-            cy[i] = (float)centery - hf * sc;
-            // Slice-1 safety: the leaf fan is NOT screen-clipped yet, so a grazing
-            // corner can project to extreme coords -> a degenerate huge triangle that
-            // stalls the RDP. Cull the whole leaf if any corner lands far off-screen
-            // (proper per-edge screen clip, like the walls, comes next).
-            if (cx[i] < -2048.0f || cx[i] > (float)SCREENWIDTH + 2048.0f ||
-                cy[i] < -2048.0f || cy[i] > (float)SCREENHEIGHT + 2048.0f)
-            { bad = 1; break; }
-            cz[i] = DL_WallZ(invw);
-            cw[i] = invw;
-            u = (float)(wx >> FRACBITS);    // world-aligned flat texel (64-period)
-            v = (float)(wy >> FRACBITS);
-            cu[i] = u; cv[i] = v;
-            if (u < umin) umin = u;
-            if (v < vmin) vmin = v;
-        }
-        if (bad) continue;
-
-        // Whole-64 period bias (mask-6 S wrap = sampling-identical) keeps texels in
-        // rdpq's s10.5 range; V is then halved for the 64->32 decimated tile.
-        ubias = IFLOOR(umin / 64.0f) * 64;
-        vbias = IFLOOR(vmin / 64.0f) * 64;
-        for (i = 0; i < n; i++)
-        {
-            cu[i] -= (float)ubias;
-            cv[i]  = (cv[i] - (float)vbias) * 0.5f;
+            bake_leaf_t* lf = &bake_leaves[ss];
+            int fl, j, seen;
+            if (!bake_leafvis[ss]) continue;
+            if (lf->numverts < 3 || lf->numverts > DL_LEAF_MAXV) continue;
+            if (lf->floorpic == skyflatnum) continue;       // sky floor stays CPU
+            if (nvis >= 2048) break;
+            vis[nvis++] = ss;
+            fl = flattranslation[lf->floorpic];
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
         }
 
-        flatidx = flattranslation[lf->floorpic];
-        block   = DL_FlatBlock(flatidx);
-        if (!block) continue;
+        // Pass 2: per distinct flat, upload once, then draw every visible leaf on it.
+        for (fi = 0; fi < nflat; fi++)
         {
-            surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
-            rdpq_set_texture_image(&fs);
-        }
+            int   flatidx = flats[fi];
+            byte* block   = DL_FlatBlock(flatidx);
+            if (!block) continue;
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
 
-        lvl = (255 - sec->lightlevel) >> 3;
-        if (lvl < 0) lvl = 0;
-        if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
-        prim = dl_prim_lut[lvl];
-        rdpq_set_prim_color(color_from_packed32(prim));
+            for (vi = 0; vi < nvis; vi++)
+            {
+                bake_leaf_t* lf = &bake_leaves[vis[vi]];
+                sector_t*    sec;
+                float        hf, umin, vmin;
+                float        cx[DL_LEAF_MAXV], cy[DL_LEAF_MAXV], cz[DL_LEAF_MAXV];
+                float        cu[DL_LEAF_MAXV], cv[DL_LEAF_MAXV], cw[DL_LEAF_MAXV];
+                int          n, i, lvl, ubias, vbias, bad = 0;
+                uint32_t     prim;
 
-        for (i = 1; i < n - 1; i++)
-        {
-            float t0[6] = { cx[0],   cy[0],   cz[0],   cu[0],   cv[0],   cw[0]   };
-            float t1[6] = { cx[i],   cy[i],   cz[i],   cu[i],   cv[i],   cw[i]   };
-            float t2[6] = { cx[i+1], cy[i+1], cz[i+1], cu[i+1], cv[i+1], cw[i+1] };
-            rdpq_triangle(&TRIFMT_ZBUF_TEX, t0, t1, t2);
-            drew++;
+                if (flattranslation[lf->floorpic] != flatidx) continue;  // a different flat
+                n   = lf->numverts;
+                sec = &sectors[lf->sector];
+                hf  = (float)sec->floorheight * (1.0f / 65536.0f) - viewzf;
+
+                umin = 1.0e30f; vmin = 1.0e30f;
+                for (i = 0; i < n; i++)
+                {
+                    fixed_t wx = bake_leaf_verts[lf->firstvert + i][0];
+                    fixed_t wy = bake_leaf_verts[lf->firstvert + i][1];
+                    fixed_t tx = wx - viewx, ty = wy - viewy;
+                    fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+                    fixed_t lat;
+                    float   invw, sc, u, v;
+                    if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: cull
+                    lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+                    invw = 65536.0f / (float)depth;
+                    sc   = (float)centerx * invw;
+                    cx[i] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+                    cy[i] = (float)centery - hf * sc;
+                    // Not screen-clipped yet: cull a leaf projecting far off-screen so a
+                    // degenerate huge triangle can't stall the RDP (per-edge clip next).
+                    if (cx[i] < -2048.0f || cx[i] > (float)SCREENWIDTH + 2048.0f ||
+                        cy[i] < -2048.0f || cy[i] > (float)SCREENHEIGHT + 2048.0f)
+                    { bad = 1; break; }
+                    cz[i] = DL_WallZ(invw);
+                    cw[i] = invw;
+                    u = (float)(wx >> FRACBITS);    // world-aligned flat texel (64-period)
+                    v = (float)(wy >> FRACBITS);
+                    cu[i] = u; cv[i] = v;
+                    if (u < umin) umin = u;
+                    if (v < vmin) vmin = v;
+                }
+                if (bad) continue;
+
+                // Whole-64 period bias (mask-6 S wrap = sampling-identical); V halved
+                // for the 64->32 decimated tile.
+                ubias = IFLOOR(umin / 64.0f) * 64;
+                vbias = IFLOOR(vmin / 64.0f) * 64;
+                for (i = 0; i < n; i++)
+                {
+                    cu[i] -= (float)ubias;
+                    cv[i]  = (cv[i] - (float)vbias) * 0.5f;
+                }
+
+                lvl = (255 - sec->lightlevel) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                prim = dl_prim_lut[lvl];
+                rdpq_set_prim_color(color_from_packed32(prim));
+
+                for (i = 1; i < n - 1; i++)
+                {
+                    float t0[6] = { cx[0],   cy[0],   cz[0],   cu[0],   cv[0],   cw[0]   };
+                    float t1[6] = { cx[i],   cy[i],   cz[i],   cu[i],   cv[i],   cw[i]   };
+                    float t2[6] = { cx[i+1], cy[i+1], cz[i+1], cu[i+1], cv[i+1], cw[i+1] };
+                    rdpq_triangle(&TRIFMT_ZBUF_TEX, t0, t1, t2);
+                    drew++;
+                }
+            }
         }
     }
 
@@ -3769,7 +3796,11 @@ void DL_Flush(void)
 {
     int ti;
 
-    dl_wall_z = n64_rdp_mesh && dl_zbuf_attached;   // only z-test with a real z-image
+    // The Z-buffer is only needed so the floor leaves occlude against walls; walls
+    // alone occlude correctly + FREE via the painter's-order sort. So z-test only when
+    // mesh FLOORS are on -- otherwise the wall z-emit is pure cost (~+1200us) for no
+    // benefit. Gating it here keeps the default mesh build at the wall-only perf.
+    dl_wall_z = n64_rdp_mesh && n64_rdp_mesh_floors && dl_zbuf_attached;
 
 #if DL_DEBUG_TRACE
     dl_present_no++;

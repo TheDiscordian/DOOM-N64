@@ -1610,7 +1610,7 @@ void R_DrawPlanes (void)
 	// sits below the eye (height < viewz); ceilings (height >= viewz) + sky stay on
 	// the existing path (mesh ceilings are a later slice). NOTE slice-1: a raised
 	// floor above the eye is mis-classified as a ceiling here -- a known edge case.
-	if (n64_rdp_mesh && pl->picnum != skyflatnum && pl->height < viewz)
+	if (n64_rdp_mesh_floors && pl->picnum != skyflatnum && pl->height < viewz)
 	    continue;
 #endif
 
