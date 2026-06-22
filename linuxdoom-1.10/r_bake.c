@@ -17,17 +17,28 @@ int             bake_numlines = 0;
 // bake_quad -- append one wall quad, if it has a texture and a positive height.
 // Winding (x1,y1)->(x2,y2) sets the facing; the per-frame transform back-face-culls.
 //
+// Live height of a sector edge: floorheight (ceil==0) or ceilingheight (ceil==1).
+static fixed_t bake_secz (int secidx, int ceil)
+{
+    sector_t* s = &sectors[secidx];
+    return ceil ? s->ceilingheight : s->floorheight;
+}
+
 static void bake_quad (bake_wall_t* arr, int* n,
                        fixed_t x1, fixed_t y1, fixed_t x2, fixed_t y2,
-                       fixed_t zbot, fixed_t ztop,
+                       int zbot_sec, int zbot_ceil, int ztop_sec, int ztop_ceil,
                        int tex, int light, int line)
 {
     bake_wall_t* w;
-    if (tex <= 0 || ztop <= zbot)       // '-'/missing texture, or no exposed step
+    // Bake-time heights only decide whether the step is exposed NOW (doors start
+    // closed -> their upper step IS exposed at level load, so it bakes; it then
+    // SHRINKS at runtime as the door opens via the live resolve in DL_MeshDrawWalls).
+    if (tex <= 0 || bake_secz(ztop_sec, ztop_ceil) <= bake_secz(zbot_sec, zbot_ceil))
         return;
     w = &arr[(*n)++];
     w->x1 = x1; w->y1 = y1; w->x2 = x2; w->y2 = y2;
-    w->zbot = zbot; w->ztop = ztop;
+    w->zbot_sec = (int16_t)zbot_sec; w->zbot_ceil = (uint8_t)zbot_ceil;
+    w->ztop_sec = (int16_t)ztop_sec; w->ztop_ceil = (uint8_t)ztop_ceil;
     w->texture = (short)tex; w->light = (short)light; w->line = (short)line;
 }
 
@@ -293,9 +304,12 @@ void P_BakeWorldMesh (void)
         {
             // Single-sided: one midtexture quad, front floor..ceiling.
             fsec = fs->sector;
-            bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
-                       fsec->floorheight, fsec->ceilingheight,
-                       fs->midtexture, fsec->lightlevel, i);
+            {
+                int fsi = (int)(fsec - sectors);
+                bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
+                           fsi, 0, fsi, 1,              // front floor .. front ceiling
+                           fs->midtexture, fsec->lightlevel, i);
+            }
             continue;
         }
 
@@ -306,19 +320,21 @@ void P_BakeWorldMesh (void)
         bs   = &sides[ld->sidenum[1]];
         fsec = fs->sector;
         bsec = bs->sector;
-
-        bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
-                   bsec->ceilingheight, fsec->ceilingheight,        // front upper step
-                   fs->toptexture, fsec->lightlevel, i);
-        bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
-                   fsec->floorheight, bsec->floorheight,            // front lower step
-                   fs->bottomtexture, fsec->lightlevel, i);
-        bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
-                   fsec->ceilingheight, bsec->ceilingheight,        // back upper step
-                   bs->toptexture, bsec->lightlevel, i);
-        bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
-                   bsec->floorheight, fsec->floorheight,            // back lower step
-                   bs->bottomtexture, bsec->lightlevel, i);
+        {
+            int fsi = (int)(fsec - sectors), bsi = (int)(bsec - sectors);
+            bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
+                       bsi, 1, fsi, 1,                  // front upper: back.ceil .. front.ceil
+                       fs->toptexture, fsec->lightlevel, i);
+            bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
+                       fsi, 0, bsi, 0,                  // front lower: front.floor .. back.floor
+                       fs->bottomtexture, fsec->lightlevel, i);
+            bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
+                       fsi, 1, bsi, 1,                  // back upper: front.ceil .. back.ceil
+                       bs->toptexture, bsec->lightlevel, i);
+            bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
+                       bsi, 0, fsi, 0,                  // back lower: back.floor .. front.floor
+                       bs->bottomtexture, bsec->lightlevel, i);
+        }
     }
     bake_numwalls = count;
 

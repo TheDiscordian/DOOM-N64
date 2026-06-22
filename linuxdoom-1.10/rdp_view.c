@@ -2407,10 +2407,21 @@ void DL_MeshDrawWalls(void)
         float   invwA, invwB, scA, scB, sxA, sxB, topf, botf, dxf, dyf;
         float   sLen, sA, sB;
         int     xa, xb, lvl;
+        fixed_t ztopz, zbotz;
         rdp_wall_t w;
 
         if (bake_linevis && !bake_linevis[bw->line]) continue;  // BSP-occlusion gate
         if (dA < nearz && dB < nearz) continue;     // both behind near plane
+
+        // LIVE edge heights -- resolve the quad's sector references each frame so moving
+        // sectors (doors/lifts/crushers) follow the geometry instead of leaving a ghost.
+        // A step whose top has dropped to/below its bottom this frame (door fully open)
+        // is not exposed -> skip it.
+        ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                              : sectors[bw->ztop_sec].floorheight;
+        zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                              : sectors[bw->zbot_sec].floorheight;
+        if (ztopz <= zbotz) continue;
 
         // S runs 0..sLen (1 map unit = 1 texel) from corner A to corner B.
         dxf  = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
@@ -2453,8 +2464,8 @@ void DL_MeshDrawWalls(void)
         if (sxB <= sxA) continue;                   // back-facing / degenerate
         if (sxB <= 0.0f || sxA >= (float)(SCREENWIDTH - 1)) continue;  // fully off-screen
 
-        topf = (float)bw->ztop * (1.0f / 65536.0f) - viewzf;
-        botf = (float)bw->zbot * (1.0f / 65536.0f) - viewzf;
+        topf = (float)ztopz * (1.0f / 65536.0f) - viewzf;
+        botf = (float)zbotz * (1.0f / 65536.0f) - viewzf;
 
         // Perspective-correct SCREEN-EDGE clip. The naive version clamped screen x
         // (xa/xb) but kept the off-screen corner's S/invw/Y -> a wall spanning past a
@@ -2494,7 +2505,7 @@ void DL_MeshDrawWalls(void)
             w.s_l = si_l / invw_l;
             w.s_r = si_r / invw_r;
             w.t_top_l = w.t_top_r = 0.0f;
-            w.t_bot_l = w.t_bot_r = (float)(bw->ztop - bw->zbot) * (1.0f / 65536.0f);
+            w.t_bot_l = w.t_bot_r = (float)(ztopz - zbotz) * (1.0f / 65536.0f);
             w.invw_l = invw_l;
             w.invw_r = invw_r;
         }

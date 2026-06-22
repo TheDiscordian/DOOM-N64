@@ -9,6 +9,7 @@
 #ifndef __R_BAKE_H__
 #define __R_BAKE_H__
 
+#include <stdint.h>
 #include "doomtype.h"
 #include "m_fixed.h"
 
@@ -18,8 +19,13 @@ typedef struct
 {
     fixed_t x1, y1;     // wall start vertex (linedef v1)
     fixed_t x2, y2;     // wall end vertex   (linedef v2)
-    fixed_t zbot;       // bottom edge height (sector floorheight)
-    fixed_t ztop;       // top edge height    (sector ceilingheight)
+    // The top/bottom edge heights are NOT frozen at bake -- they track a sector's live
+    // floor/ceiling so doors/lifts/crushers (moving sectors) follow the geometry
+    // instead of leaving a ghost. zbot_sec/ztop_sec index sectors[]; zbot_ceil/ztop_ceil
+    // pick floorheight (0) or ceilingheight (1) of that sector. Resolved each frame in
+    // DL_MeshDrawWalls.
+    int16_t zbot_sec, ztop_sec;
+    uint8_t zbot_ceil, ztop_ceil;
     short   texture;    // wall texture index (>0; 0 = '-' sentinel, not baked)
     short   light;      // owning sector lightlevel (SHADE through the colormap)
     short   line;       // owning linedef index (for the per-frame visibility gate)
