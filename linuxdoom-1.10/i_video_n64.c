@@ -1238,7 +1238,37 @@ void I_FinishUpdate(void)
 
     rdp_on = (n64_use_rdp_renderer != 0);
 
-    rdpq_attach(disp, NULL);
+    // GPU port: attach a Z-buffer for the mesh wall pass (correct opaque depth
+    // occlusion). Allocated once, lazily, sized to the ACTUAL display surface. z-mode
+    // (DL_Flush) is enabled ONLY when dl_zbuf_attached -- never against a NULL z-image
+    // (which froze the CPU on a cart-space write). Non-mesh builds attach NULL.
+    dl_zbuf_attached = 0;
+    if (n64_rdp_mesh && disp)
+    {
+        static surface_t dl_zbuf;
+        static int       dl_zbuf_ready = 0;
+        if (!dl_zbuf_ready)
+        {
+            dl_zbuf = surface_alloc(FMT_RGBA16, disp->width, disp->height);
+            dl_zbuf_ready = (dl_zbuf.buffer != NULL);
+            N64_DEBUGF("GPU-PORT zbuf alloc %dx%d -> %s\n", disp->width, disp->height,
+                       dl_zbuf_ready ? "ok" : "FAILED");
+        }
+        if (dl_zbuf_ready)
+        {
+            rdpq_attach(disp, &dl_zbuf);
+            rdpq_clear_z(0xFFFF);       // far; nearer walls (smaller Z) overwrite
+            dl_zbuf_attached = 1;
+        }
+        else
+        {
+            rdpq_attach(disp, NULL);
+        }
+    }
+    else
+    {
+        rdpq_attach(disp, NULL);
+    }
 
     // Whether the RDP world pass actually drew geometry this frame (Stage 2:
     // the single routed midtexture seg, if one was eligible). Drives both the

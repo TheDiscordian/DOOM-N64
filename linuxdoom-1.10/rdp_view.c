@@ -2356,6 +2356,17 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
 // 1/projection), screen_y = centery - (z-viewz)*centerx/depth.
 // Phase 1b scope: single-sided walls only, near-plane SKIP (no clip yet), NO cull.
 int n64_rdp_mesh = 0;       // BENCH_FORCE_MESH gate (set in d_main.c)
+int dl_wall_z       = 0;    // mesh wall pass: draw with the Z-buffer (set in DL_Flush)
+int dl_zbuf_attached = 0;   // set by i_video each frame: 1 iff a z-image is attached
+
+// Map a record's per-edge INV_W (== 1/depth in map units, see dl_invw_k) to a
+// z-buffer depth in [0,1] (near = small). Z = depth / 32768 (the map extent),
+// clamped. Used only on the mesh wall pass (dl_wall_z).
+static inline float DL_WallZ(float invw)
+{
+    float z = (invw > 0.0f) ? (1.0f / (invw * 32768.0f)) : 1.0f;
+    return z < 0.0f ? 0.0f : (z > 1.0f ? 1.0f : z);
+}
 
 int DL_MeshRouteOn(void)
 {
@@ -2719,6 +2730,18 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
         // texel-T (hardware wraps mod blkh). Y edges are the record's own edges.
         ytl = w->ytop_l; ybl = w->ybot_l;
         ytr = w->ytop_r; ybr = w->ybot_r;
+        if (dl_wall_z)
+        {
+            float zl = DL_WallZ(w->invw_l), zr = DL_WallZ(w->invw_r);
+            float tl[6] = { xl, ytl, zl, s_l, tl0, w->invw_l };
+            float tr[6] = { xr, ytr, zr, s_r, tr0, w->invw_r };
+            float bl[6] = { xl, ybl, zl, s_l, tl1, w->invw_l };
+            float br[6] = { xr, ybr, zr, s_r, tr1, w->invw_r };
+            rdpq_triangle(&TRIFMT_ZBUF_TEX, tl, tr, bl);
+            rdpq_triangle(&TRIFMT_ZBUF_TEX, tr, br, bl);
+            dl_tris += 2;
+        }
+        else
         {
             float tl[5] = { xl, ytl, s_l, tl0, w->invw_l };
             float tr[5] = { xr, ytr, s_r, tr0, w->invw_r };
@@ -2879,6 +2902,18 @@ static int DL_DrawRecord(const rdp_wall_t* w, byte* block, int blkh, int blkw,
         // period base only -- NOT by src_lo as the old band-local upload was).
         base = (float)period_base;
 
+        if (dl_wall_z)
+        {
+            float zl = DL_WallZ(w->invw_l), zr = DL_WallZ(w->invw_r);
+            float tl[6] = { xl, ytl, zl, s_l, a_l - base, w->invw_l };
+            float tr[6] = { xr, ytr, zr, s_r, a_r - base, w->invw_r };
+            float bl[6] = { xl, ybl, zl, s_l, b_l - base, w->invw_l };
+            float br[6] = { xr, ybr, zr, s_r, b_r - base, w->invw_r };
+            rdpq_triangle(&TRIFMT_ZBUF_TEX, tl, tr, bl);
+            rdpq_triangle(&TRIFMT_ZBUF_TEX, tr, br, bl);
+            dl_tris += 2;
+        }
+        else
         {
             float tl[5] = { xl, ytl, s_l, a_l - base, w->invw_l };
             float tr[5] = { xr, ytr, s_r, a_r - base, w->invw_r };
@@ -3555,6 +3590,8 @@ void DL_Flush(void)
 {
     int ti;
 
+    dl_wall_z = n64_rdp_mesh && dl_zbuf_attached;   // only z-test with a real z-image
+
 #if DL_DEBUG_TRACE
     dl_present_no++;
     // Stamp the present number into the CI8 bottom row as a 2px-wide binary
@@ -3623,6 +3660,12 @@ void DL_Flush(void)
     // with the world on damage/pickup/radsuit flashes, at O(touched) cost on a
     // flash frame and zero on un-flashed frames.
     DL_RetintSubPalettes();
+
+    // GPU port: the mesh wall pass uses a Z-buffer for correct opaque occlusion (the
+    // z-image is cleared right after rdpq_attach in i_video). Enable depth test+write
+    // for the walls only -- disabled again before the planes draw below.
+    if (dl_wall_z)
+        rdpq_mode_zbuf(true, true);
 
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw
@@ -3755,6 +3798,10 @@ void DL_Flush(void)
     // the CI8 sprites/HUD/COPY blit; this is the in-flush synchronous counterpart.
     if (dl_touched_count > 0)
         I_N64UploadMasterTLUT();
+
+    // Walls done -- the planes/spans below draw WITHOUT the Z-buffer.
+    if (dl_wall_z)
+        rdpq_mode_zbuf(false, false);
 
     // Stage-4: drain the floors/ceilings after the walls, same rspq stream,
     // still scissored to the view window. Two mutually-exclusive paths (only one

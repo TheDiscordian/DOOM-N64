@@ -11,6 +11,20 @@ the world into screen triangles every frame (`bsp_walk` + `seg_rast` + `planes` 
 This plan was produced by a design pass (4 parallel readers) and **corrected by an
 adversarial review that refuted the first synthesis' central premise** — see §Vehicle.
 
+> **Correction (Z-buffer, post-Phase-2).** The original "no Z-image, BSP
+> back-to-front painter's order suffices" premise was **refuted in practice** for
+> opaque walls. We bake at **sidedef** granularity (§Architecture rationale: fewer
+> quads, no T-junctions) — but that deliberately discards the BSP **seg** split, and
+> the seg split is exactly what makes a back-to-front total order *valid*. Whole
+> sidedef quads can **mutually overlap** in screen space (one quad's left edge in
+> front of wall B, its right edge behind it) — the cyclic-overlap case painter's
+> algorithm cannot resolve without splitting. Observed as "walls draw through each
+> other / far walls drawn inside" across the flagged frames. **Fix: a 16-bit Z-image
+> attached for the opaque mesh-wall flush only** (`TRIFMT_ZBUF_TEX`, per-corner Z from
+> `invw`). This does **not** contradict the sprite/masked note in §gotchas — that
+> path still needs the back-to-front **drawseg clip arrays**; the Z-image governs only
+> opaque wall-vs-wall pixels. See §Z-buffer.
+
 ## Architecture
 
 1. **Bake (once, at level load).** `P_SetupLevel` (p_setup.c:651) gains a
@@ -82,7 +96,8 @@ won't initially, vs today's per-column projection.)
   per-column clip walk in `R_RenderSegLoop` (r_segs.c:436-541) — that is NOT free,
   so Phase 2 must **keep the clip walk and only remove the texel fill** (the
   seg_rast saving is smaller than a naive "it all collapses"). The cull preserves
-  back-to-front order; never replace it with a Z-buffer.
+  back-to-front order for **sprites/masked**; the opaque-wall Z-image (§Z-buffer)
+  does not feed this path — the clip arrays still come from the drawseg walk.
 - **Automap:** `ML_MAPPED` is set only in `R_StoreWallRange` (r_segs.c:626); the
   cull walk must set it per visible wall or walked-past walls never map.
 - **Sky:** the sky flat (r_plane.c:1607) stays on the CPU column path; the bake

@@ -2212,8 +2212,12 @@ void D_DoomMain (void)
     debugf("BENCH: FULL RDP -> walls + planes\n");
 #endif
 #ifdef BENCH_FORCE_MESH
-    n64_rdp_mesh = 1;
-    debugf("BENCH: MESH walls ON (static world mesh)\n");
+    // Mesh REPLACES the RDP wall route: wall_ab=0 leaves the wall arena mesh-only,
+    // so the whole wall flush draws through the Z-buffer (DL_Flush dl_wall_z). Planes
+    // stay on RDP. Walls that aren't mesh-covered fall back to the software CI8 fill.
+    n64_rdp_mesh    = 1;
+    n64_rdp_wall_ab = 0;
+    debugf("BENCH: MESH walls ON (static world mesh + Z-buffer; RDP wall route off)\n");
 #endif
 #else
     n64_use_rdp_renderer = 0;

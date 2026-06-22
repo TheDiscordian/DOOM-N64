@@ -257,6 +257,7 @@ int DL_WallRouteOn(void);
 // transforms the baked mesh (r_bake.c) into screen records each frame; DL_MeshRouteOn
 // gates it (n64_rdp_mesh, set by BENCH_FORCE_MESH).
 extern int n64_rdp_mesh;
+extern int dl_zbuf_attached;    // set by i_video each frame (1 = z-image attached)
 int  DL_MeshRouteOn(void);
 void DL_MeshDrawWalls(void);
 
