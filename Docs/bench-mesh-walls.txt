@@ -1,0 +1,7 @@
+GPU-PORT mesh wall validation (same-session, run-bench.sh, 4117-frame E1M1 demo)
+  full-RDP (per-column capture):  avg=20094 p95=40544 max=53452  (49.7 / 24.6 fps)
+  mesh+Z+suppression (static):    avg=16429 p95=27040 max=166454 (60.8 / 36.9 fps)
+  delta: avg -18.2%, p95 -33.3%   (max spike = one-time P_BakeWorldMesh at level load)
+ROMs: /tmp/mesh-timing.z64 (9449cbd...), /tmp/rdp-timing.z64
+Occlusion: FIXED by Z-buffer (e61c096); mesh displayed via fill-suppression (01537be).
+Remaining wall defect: close/grazing texture smear = no near-plane clip in DL_MeshDrawWalls.
