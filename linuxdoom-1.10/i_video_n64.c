@@ -1325,6 +1325,26 @@ void I_FinishUpdate(void)
                 n64_palette_dirty = false;
             }
 
+            // GHOST FIX (moving walls): clear the RDP colour buffer in the view
+            // region BEFORE drawing the mesh walls. The N64 rotates 3 hardware
+            // framebuffers (display_init(...,3,...)), so `disp` holds the image
+            // from 3 frames ago. A STATIC wall redraws in place every frame and
+            // self-covers, but a MOVING wall (door/lift) draws at a NEW screen
+            // position each frame and leaves its OLD position holding the
+            // 3-frames-ago pixels -- a trailing ghost of past door positions in
+            // the keyed-through region. The non-mesh full-RDP path never shows
+            // this because its RDP planes repaint the whole view every frame; the
+            // mesh path draws only walls, so the vacated pixels are never
+            // overwritten. A per-frame fill of the view rect retires the stale
+            // image so only THIS frame's walls survive. Mesh-only (the non-mesh
+            // path is unperturbed); cheap (one RDP fill rect, fill mode).
+            if (n64_rdp_mesh)
+            {
+                rdpq_set_scissor(vx0, vy0, vx1, vy1);
+                rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
+                rdpq_fill_rectangle(vx0, vy0, vx1, vy1);
+            }
+
             // Standard 1-cycle textured: TEX0*PRIM (free light), CI8 via TLUT,
             // perspective-correct (free INV_W). Scissor to the view window so
             // the quads can't spill outside the 3D view (DESIGN section 4).
