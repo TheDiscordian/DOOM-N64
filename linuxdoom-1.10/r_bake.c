@@ -12,6 +12,7 @@ bake_wall_t*    bake_walls    = NULL;
 int             bake_numwalls = 0;
 byte*           bake_linevis  = NULL;    // per-linedef visibility (PU_LEVEL)
 int             bake_numlines = 0;
+byte*           bake_line_meshed = NULL; // per-linedef: 1 if baked into the mesh (PU_LEVEL)
 
 //
 // bake_quad -- append one wall quad, if it has a texture and a positive height.
@@ -282,17 +283,60 @@ static void P_BakeLeafFans (void)
 void P_BakeWorldMesh (void)
 {
     int     i, count = 0, cap;
+    byte*   bake_sector_movable = NULL;  // local: door/lift sectors, freed at end
 
     bake_walls    = NULL;
     bake_numwalls = 0;
     bake_linevis  = NULL;
     bake_numlines = 0;
+    bake_line_meshed = NULL;
     if (numlines <= 0)
         return;
 
     // <= 4 quads per linedef (two sides x top/bottom step); single-sided uses 1.
     cap = numlines * 4;
     bake_walls = Z_Malloc (sizeof(bake_wall_t) * cap, PU_LEVEL, NULL);
+
+    // Per-linedef "is this line in the static mesh" flag (r_segs.c reads it every
+    // seg loop to decide whether to suppress the CPU wall fill). A line excluded
+    // below stays 0, so it keeps rendering through the software path.
+    bake_line_meshed = Z_Malloc (numlines, PU_LEVEL, NULL);
+    memset (bake_line_meshed, 0, numlines);
+
+    // DOOR / LIFT / MOVER EXCLUSION. Walls whose sector can be displaced by a
+    // special must NOT go into the static mesh: the mesh stores world-space quads
+    // and (a) when the sector moves the wall ghosts/blacks in the keyed present,
+    // (b) a baked-but-skipped wall leaves a black hole. Keep them on the SOFTWARE
+    // path, which derives screen geometry live every frame and renders the correct
+    // texture with no ghost. Build a per-sector "movable" flag, then skip any wall
+    // touching a movable sector.
+    //
+    // Generous by design (no special-number table): a sector targeted by ANY
+    // special line is treated as movable. A manual (tag 0) use-special moves the
+    // line's BACK sector (DR doors, local lifts); a tagged special moves every
+    // sector carrying that tag (remote doors, switched lifts, raised floors). A
+    // false positive (e.g. a light-only trigger) only renders a few extra walls in
+    // software -- safe; a MISSED mover would ghost, so err toward exclusion.
+    bake_sector_movable = Z_Malloc (numsectors, PU_STATIC, NULL);
+    memset (bake_sector_movable, 0, numsectors);
+    for (i = 0; i < numlines; i++)
+    {
+        line_t* ld = &lines[i];
+        if (!ld->special)
+            continue;
+        if (ld->tag == 0)
+        {
+            if (ld->sidenum[1] != -1)
+                bake_sector_movable[(int)(sides[ld->sidenum[1]].sector - sectors)] = 1;
+        }
+        else
+        {
+            int s;
+            for (s = 0; s < numsectors; s++)
+                if (sectors[s].tag == ld->tag)
+                    bake_sector_movable[s] = 1;
+        }
+    }
 
     for (i = 0; i < numlines; i++)
     {
@@ -306,6 +350,17 @@ void P_BakeWorldMesh (void)
             continue;
         fs = &sides[ld->sidenum[0]];
 
+        // Skip walls touching a movable (door/lift/mover) sector -- leave them on
+        // the software path (bake_line_meshed[i] stays 0 -> r_segs keeps the CPU
+        // fill). Catches both the door's own face and the doorway/track sides.
+        {
+            int excl = bake_sector_movable[(int)(fs->sector - sectors)];
+            if (ld->sidenum[1] != -1)
+                excl |= bake_sector_movable[(int)(sides[ld->sidenum[1]].sector - sectors)];
+            if (excl)
+                continue;
+        }
+
         if (ld->sidenum[1] == -1)
         {
             // Single-sided: one midtexture quad, front floor..ceiling.
@@ -316,6 +371,7 @@ void P_BakeWorldMesh (void)
                 // at front.floor + textureheight (bottom-of-texture-at-bottom);
                 // otherwise row 0 at front.ceiling (worldtop). +rowoffset.
                 int pegbot = (ld->flags & ML_DONTPEGBOTTOM) != 0;
+                int before = count;
                 bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
                            fsi, 0, fsi, 1,              // front floor .. front ceiling
                            fs->midtexture, fsec->lightlevel, i,
@@ -323,6 +379,8 @@ void P_BakeWorldMesh (void)
                            pegbot ? 0 : 1,               // peg_ceil: floor if DONTPEGBOTTOM else ceiling
                            pegbot ? 1 : 0,               // peg_addth: +textureheight on DONTPEGBOTTOM
                            fs->rowoffset, fs->textureoffset);
+                if (count > before)
+                    bake_line_meshed[i] = 1;
             }
             continue;
         }
@@ -350,6 +408,7 @@ void P_BakeWorldMesh (void)
             // Both tiers then += sidedef->rowoffset (r_segs.c:863-864).
             int pegtop = (ld->flags & ML_DONTPEGTOP)    != 0;
             int pegbot = (ld->flags & ML_DONTPEGBOTTOM) != 0;
+            int before = count;
 
             // FRONT upper: back.ceil .. front.ceil. Side frontsector = fsec.
             bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
@@ -383,9 +442,12 @@ void P_BakeWorldMesh (void)
                        pegbot ? 1 : 0,                  // peg_ceil: ceiling on DONTPEGBOTTOM else floor
                        0,                               // peg_addth: neither bottom-tier branch adds textureheight
                        bs->rowoffset, bs->textureoffset);
+            if (count > before)
+                bake_line_meshed[i] = 1;
         }
     }
     bake_numwalls = count;
+    Z_Free (bake_sector_movable);
 
     // Per-linedef visibility gate: reset each frame, set by the BSP walk
     // (R_StoreWallRange marks occlusion-surviving walls visible).

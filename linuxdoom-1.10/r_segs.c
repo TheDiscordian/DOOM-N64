@@ -319,8 +319,14 @@ void R_RenderSegLoop (void)
 	rdp_route = 1;
 	DL_RouteBeginSeg();
     }
-    else if (n64_use_rdp_renderer && DL_MeshRouteOn())
+    else if (n64_use_rdp_renderer && DL_MeshRouteOn()
+	     && bake_line_meshed
+	     && bake_line_meshed[(int)(curline->linedef - lines)])
     {
+	// Suppress the CPU fill ONLY for lines actually baked into the static mesh.
+	// Door/lift/mover lines are excluded from the bake (P_BakeWorldMesh), so
+	// bake_line_meshed is 0 for them and they keep rendering through the
+	// software path here -- correct live texture, no mesh ghost/black.
 	mesh_route = 1;     // mesh draws these walls; suppress the CPU fill (no capture)
     }
 #if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE

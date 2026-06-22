@@ -79,6 +79,11 @@ extern byte*          bake_leafvis;
 extern byte*        bake_linevis;
 extern int          bake_numlines;
 
+// Per-linedef: 1 if the line was baked into the static mesh, 0 if excluded (a
+// door/lift/mover wall kept on the software path). r_segs.c gates the CPU-fill
+// suppression on this so excluded lines render normally. PU_LEVEL, sized numlines.
+extern byte*        bake_line_meshed;
+
 // Build the static world mesh for the current level. Call AFTER P_GroupLines().
 void P_BakeWorldMesh (void);
 
