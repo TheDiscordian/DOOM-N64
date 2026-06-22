@@ -1249,10 +1249,23 @@ void I_FinishUpdate(void)
         static int       dl_zbuf_ready = 0;
         if (!dl_zbuf_ready)
         {
-            dl_zbuf = surface_alloc(FMT_RGBA16, disp->width, disp->height);
-            dl_zbuf_ready = (dl_zbuf.buffer != NULL);
-            N64_DEBUGF("GPU-PORT zbuf alloc %dx%d -> %s\n", disp->width, disp->height,
-                       dl_zbuf_ready ? "ok" : "FAILED");
+            // surface_alloc draws from libdragon's heap, which DOOM's Z_Init zone
+            // exhausts at startup -> a 320x200x2 (128KB) RGBA16 z-buffer FAILS every
+            // frame (the GPU-port z-buffer was silently inert; walls occluded via
+            // painter's order only). Allocate from DOOM's zone instead (it owns the
+            // RAM) and 64-byte align for the RDP z-image. RDP-only buffer (never
+            // CPU-read), so a cached zone pointer is fine; PU_STATIC = whole run.
+            int      zw = (int)disp->width, zh = (int)disp->height;
+            uint32_t bytes = (uint32_t)zw * 2u * (uint32_t)zh;
+            byte*    raw = Z_Malloc((int)bytes + 64, PU_STATIC, NULL);
+            if (raw)
+            {
+                byte* al = (byte*)(((uint32_t)(uintptr_t)raw + 63u) & ~63u);
+                dl_zbuf = surface_make_linear(al, FMT_RGBA16, zw, zh);
+            }
+            dl_zbuf_ready = (raw != NULL);
+            debugf("GPU-PORT zbuf via Z_Malloc %dx%d -> %s\n", zw, zh,
+                   dl_zbuf_ready ? "ok" : "FAILED");
         }
         if (dl_zbuf_ready)
         {
