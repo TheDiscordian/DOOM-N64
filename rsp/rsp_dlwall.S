@@ -1051,12 +1051,63 @@ RecipFixVU:
     sllv t8, a3, t9
 7:  sw   t8, %lo(VSCRATCH)+12   # park bn ([bnh][bnl]) for vrcp
     li   t9, %lo(VSCRATCH)
-    lsv  $v02, 0, 14, t9        # bnl (low half)  -> vrcpl
-    lsv  $v03, 0, 12, t9        # bnh (high half) -> vrcph
+    lsv  $v02, 0, 14, t9        # bnl (low half)  -> vrcpl  (v02.e0)
+    lsv  $v03, 0, 12, t9        # bnh (high half) -> vrcph  (v03.e0)
     vxor $v00, $v00, $v00
-    vrcph $v04.e0, $v03.e0      # ri
-    vrcpl $v05.e0, $v02.e0      # rf
+    vrcph $v04.e0, $v03.e0      # ri  (r0 high 16, signed)
+    vrcpl $v05.e0, $v02.e0      # rf  (r0 low  16, unsigned)
     vrcph $v04.e0, $v00.e0      # finalize
+
+    # ----------------------------------------------------------------
+    # ONE Newton-Raphson step (Docs/RSP_PORT_PLAN.md Sec 5.1). vrcp gives a single-
+    # pass r0 = (ri:rf) ~= 2^31/bn (the FIXEDDIV_SH=1 scaling proves r0's numerator is
+    # 2^31: FixedDivApply does (a*r0)>>15 == (a<<16)/bn  =>  r0 == 2^31/bn). Its
+    # relative error grows with |NORMBIT-msb(bn)| -- ~1-2% on depths far from NORMBIT,
+    # large on near-clip divisors. Refine in the SAME normalized domain:
+    #   real Newton  e1 = e0*(2 - bn*e0),  e0 = r0/2^31
+    #   scale by 2^31: r1 = r0*(2 - bn*r0/2^31)
+    # Compute m = (bn*r0)>>15 in 16.16 (~= 1.0 since bn*r0 ~= 2^31), corr = (2<<16)-m
+    # in 16.16, then r1 = (r0*corr)>>16 ~= r0. Both products are the dual-precision
+    # 32x32->(>>16) pattern (vmudl/vmadm/vmadn/vmadh); all operands positive here (bn
+    # normalized >0, r0>0, corr~1.0>0) so the signed pattern is exact. Uses ONLY
+    # t7,t8,t9 (+ v06,v07,v20..v25) so top16/bot16 in t4/t5 stay live for Phase 1; no
+    # jal so ra is untouched.
+    #
+    # m_hi = (bn*r0)>>16 : a = bn = (bnh:bnl) in (v03:v02), b = r0 = (ri:rf) in (v04:v05)
+#ifndef RSP_NR_OFF
+    # Newton scratch lives at VSCRATCH+24..+31 ONLY: +0/+2/+4 are FixedMul/Div a/b
+    # staging, +8/+10 the parked recip, +12/+14 bn, and +16..+19 the RDIV_SH WORD
+    # (do NOT touch +18 -- it is sh's high half; clobbering it corrupts the
+    # un-normalization on large-|sh| batch divisors). +24.. is clear of all of these.
+    vmudl $v24, $v02, $v05      # bnl * rf      (al*bl, unsigned)
+    vmadm $v24, $v03, $v05      # + bnh * rf    (ah*bl)
+    vmadn $v24, $v02, $v04      # + bnl * ri    (al*bh) -> pF lane
+    vmadh $v25, $v03, $v04      # + bnh * ri    (ah*bh) -> pI lane
+    ssv  $v25, 0, 24, t9        # pI (signed high 16 of bn*r0) -> VSCRATCH+24
+    ssv  $v24, 0, 26, t9        # pF (unsigned low 16)         -> VSCRATCH+26
+    lh   t7, %lo(VSCRATCH)+24   # pI
+    lhu  t8, %lo(VSCRATCH)+26   # pF
+    sll  t7, t7, 16
+    or   t7, t7, t8             # t7 = (bn*r0)>>16  (~= 2^15)
+    sll  t7, t7, 1              # m = (bn*r0)>>15 in 16.16 (~= 2^16 == 1.0)
+    li   t8, 0x20000            # 2.0 in 16.16
+    subu t7, t8, t7             # corr = (2<<16) - m   (~= 1.0 in 16.16)
+    # r1 = (r0 * corr)>>16 : a = r0 = (ri:rf) in (v04:v05), b = corr (split hi/lo)
+    sw   t7, %lo(VSCRATCH)+28   # corr [corrh][corrl]
+    lsv  $v06, 0, 28, t9        # corrh (high half, signed)   -> v06.e0
+    lsv  $v07, 0, 30, t9        # corrl (low  half, unsigned) -> v07.e0
+    vmudl $v24, $v05, $v07      # rf  * corrl   (al*bl)
+    vmadm $v24, $v04, $v07      # + ri  * corrl (ah*bl)
+    vmadn $v24, $v05, $v06      # + rf  * corrh (al*bh) -> pF
+    vmadh $v25, $v04, $v06      # + ri  * corrh (ah*bh) -> pI
+    ssv  $v25, 0, 24, t9        # r1 high 16 -> VSCRATCH+24
+    ssv  $v24, 0, 26, t9        # r1 low  16 -> VSCRATCH+26
+    # repack r1 into ri:rf lanes (v04:v05) so the park below stores the refined recip
+    lsv  $v04, 0, 24, t9        # ri' (high 16)
+    lsv  $v05, 0, 26, t9        # rf' (low  16)
+#endif /* RSP_NR_OFF -- A/B: -DRSP_NR_OFF skips the Newton step (single-pass vrcp) */
+    # ----------------------------------------------------------------
+
     ssv  $v04, 0, 8,  t9        # park ri at VSCRATCH+8
     jr   ra
     ssv  $v05, 0, 10, t9        # (delay) park rf at VSCRATCH+10
