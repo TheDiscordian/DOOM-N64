@@ -2750,9 +2750,15 @@ static void DL_RSPXformProbe(void)
 //
 // Buffers are level-load-sized once (bake_numwalls is fixed per level) and reused.
 // (Still inside the BENCH_FORCE_MESH_RSP block opened above for Phase 0/1.)
-static rsp_bwall_in_t  *batch_in  = NULL;
-static rsp_bwall_out_t *batch_out = NULL;
-static int              batch_cap = 0;
+// DMA buffers in BSS, NOT the heap: the old memalign cost ~48KB of libdragon's tight
+// heap (DOOM's zone is malloc'd from it and takes most of RAM), which starved the audio
+// mixer -> mixer_ch_play "Out of memory" assert when a sound's sample buffer couldn't
+// allocate late in the demo (the wall-only build, with no RSP buffers, never crashed).
+// BSS is part of the program image, off the heap. Sized to the wall arena.
+static rsp_bwall_in_t  batch_in_buf[DL_WALL_ARENA]  __attribute__((aligned(16)));
+static rsp_bwall_out_t batch_out_buf[DL_WALL_ARENA] __attribute__((aligned(16)));
+static rsp_bwall_in_t  *batch_in  = batch_in_buf;
+static rsp_bwall_out_t *batch_out = batch_out_buf;
 
 // Worst deltas observed across the whole run (for the end-of-demo report).
 static float  batch_run_worst_sx   = 0.0f;
@@ -2785,28 +2791,26 @@ static void DL_RSPBatchProbe(void)
                (unsigned long)rsp_dlwall_ovl_id);
     }
 
-    // Allocate (once) the cache-line-aligned DMA arrays sized to the wall set.
-    if (batch_cap < bake_numwalls) {
-        if (batch_in)  free(batch_in);
-        if (batch_out) free(batch_out);
-        batch_in  = memalign(16, (size_t)bake_numwalls * sizeof(rsp_bwall_in_t));
-        batch_out = memalign(16, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
-        if (!batch_in || !batch_out) {
-            if (batch_in)  { free(batch_in);  batch_in  = NULL; }
-            if (batch_out) { free(batch_out); batch_out = NULL; }
-            batch_cap = 0;
-            debugf("RSP-BATCH: SKIP (alloc failed)\n");
-            return;
-        }
-        batch_cap = bake_numwalls;
+    // batch_in/out are static BSS arrays (off the heap) covering DL_WALL_ARENA walls.
+    if (bake_numwalls > DL_WALL_ARENA) {
+        debugf("RSP-BATCH: SKIP (walls %d > arena %d)\n", bake_numwalls, DL_WALL_ARENA);
+        return;
     }
 
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
     vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
     viewzf = (float)viewz * (1.0f / 65536.0f);
 
-    // ---- pack the view block (separate alloc; small) ----
-    vb = memalign(16, sizeof *vb);
+    // ---- pack the view block (ONE-TIME static alloc) ----
+    // Was a per-frame memalign+free -> over the demo it churned/leaked the tight
+    // libdragon heap (DOOM's zone takes most of RAM) until a monster's lazily-allocated
+    // sound sample-buffer hit malloc_uncached==NULL -> the mixer "Out of memory" assert
+    // (~frame 494, where a door wakes a monster). Alloc once, reuse, never free.
+    {
+        static rsp_view_blk_t* vb_cache = NULL;
+        if (!vb_cache) vb_cache = memalign(16, sizeof *vb_cache);
+        vb = vb_cache;
+    }
     if (!vb) { debugf("RSP-BATCH: SKIP (vb alloc)\n"); return; }
     vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
     vb->vcos = vcos;   vb->vsin = vsin;
@@ -2966,8 +2970,7 @@ static void DL_RSPBatchProbe(void)
                (int)(batch_run_worst_invw*1e6));
     }
     batch_frame++;
-
-    free(vb);
+    /* vb is a one-time static cache (vb_cache) -- never freed, so no per-frame heap churn */
 }
 #endif // BENCH_FORCE_MESH_RSP
 
