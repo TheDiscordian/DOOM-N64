@@ -3030,12 +3030,20 @@ void DL_MeshDrawWalls(void)
                               : sectors[bw->zbot_sec].floorheight;
         if (ztopz <= zbotz) continue;
 
-        // S runs 0..sLen (1 map unit = 1 texel) from corner A to corner B.
+        // S runs sOff .. sOff+sLen (1 map unit = 1 texel) from corner A to corner B.
+        // sOff = sidedef->textureoffset (texels): software's rw_offset starts at
+        // sidedef->textureoffset + curline->offset (r_segs.c:895); the bake is the
+        // WHOLE linedef so curline->offset (the seg start within the line) is 0 at
+        // corner A. The bake winds corner A as each side's own seg-v1 (front v1->v2,
+        // back v2->v1), so this single sOff is correct for both sides.
         dxf  = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
         dyf  = (float)(bw->y2 - bw->y1) * (1.0f / 65536.0f);
         sLen = sqrtf(dxf * dxf + dyf * dyf);
-        sA   = 0.0f;
-        sB   = sLen;
+        {
+            float sOff = (float)bw->textureoffset * (1.0f / 65536.0f);
+            sA   = sOff;
+            sB   = sOff + sLen;
+        }
 
         // Near-plane CLIP the straddling corner: slide it along the edge to depth
         // == nearz instead of dropping the whole wall (a dropped straddler flickers
@@ -3107,12 +3115,34 @@ void DL_MeshDrawWalls(void)
             w.ytop_r = ytA + tR * (ytB - ytA);
             w.ybot_r = ybA + tR * (ybB - ybA);
 
-            // S = (S*invw)/invw at the (possibly clipped) endpoints. T spans wall
-            // height; pegging/offset still a Phase-1 TODO (S0=0, T top-pegged).
+            // S = (S*invw)/invw at the (possibly clipped) endpoints.
             w.s_l = si_l / invw_l;
             w.s_r = si_r / invw_r;
-            w.t_top_l = w.t_top_r = 0.0f;
-            w.t_bot_l = w.t_bot_r = (float)(ztopz - zbotz) * (1.0f / 65536.0f);
+
+            // VERTICAL PEGGING (mirror of R_StoreWallRange's rw_*texturemid, r_segs.c).
+            // texturemid_world = the ABSOLUTE world height that maps to texture row 0:
+            //   peg sector's live floor/ceiling [+ textureheight] + rowoffset.
+            // This drops the "- viewz" from software's *texturemid (which is viewz-
+            // relative) -- the mesh lives in world space, so T is viewz-independent.
+            // T(z) = texturemid_world - z  in texels (1 map unit = 1 texel vertically),
+            // matching software's column-T = dc_texturemid - (worldz - viewz). Heights
+            // are LIVE (resolved from the peg sector this frame) so a moving door pegs
+            // to the live height -- door tracks no longer slide as the sector moves.
+            {
+                fixed_t pegz = bw->peg_ceil ? sectors[bw->peg_sec].ceilingheight
+                                            : sectors[bw->peg_sec].floorheight;
+                float   midw = (float)pegz * (1.0f / 65536.0f);
+                if (bw->peg_addth)
+                    midw += (float)textureheight[bw->texture] * (1.0f / 65536.0f);
+                midw += (float)bw->rowoffset * (1.0f / 65536.0f);  // sidedef rowoffset
+
+                {
+                    float ztopf = (float)ztopz * (1.0f / 65536.0f);
+                    float zbotf = (float)zbotz * (1.0f / 65536.0f);
+                    w.t_top_l = w.t_top_r = midw - ztopf;   // T at the top edge
+                    w.t_bot_l = w.t_bot_r = midw - zbotf;   // T at the bottom edge
+                }
+            }
             w.invw_l = invw_l;
             w.invw_r = invw_r;
         }

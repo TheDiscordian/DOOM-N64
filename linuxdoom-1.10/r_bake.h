@@ -29,6 +29,18 @@ typedef struct
     short   texture;    // wall texture index (>0; 0 = '-' sentinel, not baked)
     short   light;      // owning sector lightlevel (SHADE through the colormap)
     short   line;       // owning linedef index (for the per-frame visibility gate)
+    // --- texture pegging / offset (mirror of R_StoreWallRange, r_segs.c) ----
+    // texturemid_world (the absolute world height that maps to texture row 0) is
+    // NOT frozen at bake -- like the edge heights it is resolved per-frame from a
+    // LIVE sector reference, so a moving sector (door/lift) pegs to the live height.
+    // texturemid_world = sectors[peg_sec].(ceil|floor) [+ textureheight] + rowoffset.
+    // The per-frame transform then derives texel-T at any edge height z as
+    // (texturemid_world - z), matching software's dc_texturemid -> column-T chain.
+    int16_t peg_sec;    // sector whose live floor/ceiling height anchors texture row 0
+    uint8_t peg_ceil;   // 0 = that sector's floorheight, 1 = its ceilingheight
+    uint8_t peg_addth;  // 1 = add textureheight[texture] (DONTPEGBOTTOM/non-DONTPEGTOP)
+    fixed_t rowoffset;     // sidedef->rowoffset    (16.16 map units -> vertical texel shift)
+    fixed_t textureoffset; // sidedef->textureoffset (16.16; S at v1, +1 texel/map-unit to v2)
 } bake_wall_t;
 
 extern bake_wall_t* bake_walls;     // PU_LEVEL; rebuilt each P_SetupLevel
