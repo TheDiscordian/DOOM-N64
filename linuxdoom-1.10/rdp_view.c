@@ -3625,6 +3625,133 @@ static void DL_FlushSpans(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU port Phase 3: draw the baked floor leaf fans for visible subsectors.
+// Mirrors DL_MeshDrawWalls's per-corner world->screen transform, but per LEAF with
+// the LIVE sector floor height (doors/lifts move it). The flat texture is world-
+// aligned (texel = world x/y, 64-period); the stored flat is V-decimated 64->32 so V
+// is halved + mask-5 T-wrap, matching DL_DrawPlanePoly. Emits a triangle fan (corner
+// 0 + edge i,i+1) with TRIFMT_ZBUF_TEX so the wall Z-buffer occludes floors. Called
+// from DL_Flush after the wall bucket walk, WHILE Z is still enabled, with the world
+// textured mode (RDPQ_COMBINER_TEX_FLAT, persp on) + master TLUT resident. Per-leaf
+// flat upload (no bucketing yet -- correctness first). Slice 1: floors only, near-
+// plane straddlers culled; ceilings/sky + the plane-suppression A/B come next.
+#define DL_LEAF_MAXV 64
+static int dl_leaf_tris = 0;
+static void DL_DrawMeshLeaves(void)
+{
+    fixed_t vcos, vsin;
+    float   viewzf;
+    int     ss, drew = 0;
+
+    if (!DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+        return;
+
+    vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+
+    // Flat tile geometry: 64-wide x 32-tall decimated CI8, mask-6 S / mask-5 T wrap.
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;
+        tp.t.mask = 5;
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+    }
+
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        bake_leaf_t* lf = &bake_leaves[ss];
+        sector_t*    sec;
+        float        hf, umin, vmin;
+        float        cx[DL_LEAF_MAXV], cy[DL_LEAF_MAXV], cz[DL_LEAF_MAXV];
+        float        cu[DL_LEAF_MAXV], cv[DL_LEAF_MAXV], cw[DL_LEAF_MAXV];
+        int          n, i, lvl, flatidx, ubias, vbias, bad = 0;
+        byte*        block;
+        uint32_t     prim;
+
+        if (!bake_leafvis[ss]) continue;
+        n = lf->numverts;
+        if (n < 3 || n > DL_LEAF_MAXV) continue;
+        if (lf->floorpic == skyflatnum) continue;       // sky floor stays CPU
+        sec = &sectors[lf->sector];
+        hf  = (float)sec->floorheight * (1.0f / 65536.0f) - viewzf;
+
+        umin = 1.0e30f; vmin = 1.0e30f;
+        for (i = 0; i < n; i++)
+        {
+            fixed_t wx = bake_leaf_verts[lf->firstvert + i][0];
+            fixed_t wy = bake_leaf_verts[lf->firstvert + i][1];
+            fixed_t tx = wx - viewx, ty = wy - viewy;
+            fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+            fixed_t lat;
+            float   invw, sc, u, v;
+            if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: slice-1 cull
+            lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+            invw = 65536.0f / (float)depth;
+            sc   = (float)centerx * invw;
+            cx[i] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+            cy[i] = (float)centery - hf * sc;
+            // Slice-1 safety: the leaf fan is NOT screen-clipped yet, so a grazing
+            // corner can project to extreme coords -> a degenerate huge triangle that
+            // stalls the RDP. Cull the whole leaf if any corner lands far off-screen
+            // (proper per-edge screen clip, like the walls, comes next).
+            if (cx[i] < -2048.0f || cx[i] > (float)SCREENWIDTH + 2048.0f ||
+                cy[i] < -2048.0f || cy[i] > (float)SCREENHEIGHT + 2048.0f)
+            { bad = 1; break; }
+            cz[i] = DL_WallZ(invw);
+            cw[i] = invw;
+            u = (float)(wx >> FRACBITS);    // world-aligned flat texel (64-period)
+            v = (float)(wy >> FRACBITS);
+            cu[i] = u; cv[i] = v;
+            if (u < umin) umin = u;
+            if (v < vmin) vmin = v;
+        }
+        if (bad) continue;
+
+        // Whole-64 period bias (mask-6 S wrap = sampling-identical) keeps texels in
+        // rdpq's s10.5 range; V is then halved for the 64->32 decimated tile.
+        ubias = IFLOOR(umin / 64.0f) * 64;
+        vbias = IFLOOR(vmin / 64.0f) * 64;
+        for (i = 0; i < n; i++)
+        {
+            cu[i] -= (float)ubias;
+            cv[i]  = (cv[i] - (float)vbias) * 0.5f;
+        }
+
+        flatidx = flattranslation[lf->floorpic];
+        block   = DL_FlatBlock(flatidx);
+        if (!block) continue;
+        {
+            surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+            rdpq_set_texture_image(&fs);
+        }
+
+        lvl = (255 - sec->lightlevel) >> 3;
+        if (lvl < 0) lvl = 0;
+        if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+        prim = dl_prim_lut[lvl];
+        rdpq_set_prim_color(color_from_packed32(prim));
+
+        for (i = 1; i < n - 1; i++)
+        {
+            float t0[6] = { cx[0],   cy[0],   cz[0],   cu[0],   cv[0],   cw[0]   };
+            float t1[6] = { cx[i],   cy[i],   cz[i],   cu[i],   cv[i],   cw[i]   };
+            float t2[6] = { cx[i+1], cy[i+1], cz[i+1], cu[i+1], cv[i+1], cw[i+1] };
+            rdpq_triangle(&TRIFMT_ZBUF_TEX, t0, t1, t2);
+            drew++;
+        }
+    }
+
+    dl_leaf_tris = drew;
+    {
+        static unsigned lf_n = 0;
+        if ((lf_n++ & 511) == 0)
+            debugf("MESH: leaf floor tris=%d\n", dl_leaf_tris);
+    }
+}
+
 // Drain the emitted wall records into the attached display fb. Stage 3: a
 // per-TEXTURE bucket walk -- for each touched texture, fetch + pin its transpose
 // block ONCE, then draw every record in that texture's bucket (DL_DrawRecord)
@@ -3850,6 +3977,11 @@ void DL_Flush(void)
     // the CI8 sprites/HUD/COPY blit; this is the in-flush synchronous counterpart.
     if (dl_touched_count > 0)
         I_N64UploadMasterTLUT();
+
+    // GPU port Phase 3: draw the baked floor leaf fans here -- WHILE the Z-buffer is
+    // still enabled, so the walls just drawn occlude the floors correctly. Same world
+    // textured mode (TEX0*PRIM, persp on). Self-gates on DL_MeshRouteOn + a z-image.
+    DL_DrawMeshLeaves();
 
     // Walls done -- the planes/spans below draw WITHOUT the Z-buffer.
     if (dl_wall_z)
