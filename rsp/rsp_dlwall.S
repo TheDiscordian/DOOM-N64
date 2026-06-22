@@ -34,6 +34,7 @@
 RSPQ_BeginOverlayHeader
     RSPQ_DefineCommand DLWallCmd_Loopback, 12   # 0x00: (size, src, dst) = 3 words
     RSPQ_DefineCommand DLWallCmd_Xform,    12   # 0x04: (viewblk, wall, out) = 3 words
+    RSPQ_DefineCommand DLWallCmd_Batch,    16   # 0x08: (viewblk, in, out, count) = 4 words
 RSPQ_EndOverlayHeader
 
 # The overlay needs no persisted state across commands.
@@ -96,6 +97,87 @@ WO_ybB:     .word 0     # 0x2C screen Y bottom at B
 # Vector scratch in DMEM for staging 16-bit lane data the VU loads via lqv/ldv.
     .align 4
 VSCRATCH: .ds.b 64
+
+# ---- Phase 2 batch scratch (DMEM) ------------------------------------
+# The CPU packs the WHOLE visible wall set; the RSP can't hold it all in DMEM
+# (491 E1M1 walls * 32B = ~15 KiB >> DMEM), so the batch command DMAs the wall
+# inputs in chunks of BATCH_N walls, transforms each, and DMAs a matching chunk
+# of outputs back. BATCH_N kept small (DMEM is shared with the whole rspq state).
+#
+# Per-wall input (BWALL_IN, 32B): same fields the CPU resolves each frame plus a
+# precomputed visibility byte (bake_linevis[line] && ztop>zbot). Layout MUST match
+# rsp_bwall_in_t in rdp_view.c.
+#define BWI_x1    0x00
+#define BWI_y1    0x04
+#define BWI_x2    0x08
+#define BWI_y2    0x0C
+#define BWI_ztop  0x10
+#define BWI_zbot  0x14
+#define BWI_vis   0x18      /* 1 = passed bake_linevis && ztop>zbot, else skip */
+#define BWI_pad   0x1C
+#define BWALL_IN_BYTES 32
+
+# Per-wall output (BWALL_OUT, 64B): the 48B WALLOUT fields + an emit flag word +
+# padding to a 64B granule. Layout MUST match rsp_bwall_out_t in rdp_view.c.
+#define BWO_dA    0x00
+#define BWO_dB    0x04
+#define BWO_lA    0x08
+#define BWO_lB    0x0C
+#define BWO_invwA 0x10
+#define BWO_invwB 0x14
+#define BWO_sxA   0x18
+#define BWO_sxB   0x1C
+#define BWO_ytA   0x20
+#define BWO_ybA   0x24
+#define BWO_ytB   0x28
+#define BWO_ybB   0x2C
+#define BWO_emit  0x30      /* 1 = wall survives all skips (emitted), 0 = culled */
+#define BWO_pad0  0x34
+#define BWO_pad1  0x38
+#define BWO_pad2  0x3C
+#define BWALL_OUT_BYTES 64
+
+# How many walls to transform per DMA chunk. Kept small: the overlay's whole
+# .data+.bss must fit DMEM (4 KiB) alongside the persistent rspq state + the
+# 256B command buffer, AND the Phase-0 LOOP_BUF (1 KiB) is still resident. 8 in *
+# 32B = 256B, 8 out * 64B = 512B = 768B of batch scratch. ~491 E1M1 walls => ~62
+# chunks/frame; this is a correctness phase (CPU still renders), so chunk count is
+# not a perf concern.
+#define BATCH_N 8
+    .align 3
+BIN_BUF:  .ds.b BATCH_N * BWALL_IN_BYTES      # staged wall inputs (DMA'd in)
+    .align 3
+BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back)
+
+# Batch loop bookkeeping (MUST be in .bss/DMEM -- the RSP scalar lw/sw only reach
+# DMEM 0x000-0xFFF; a .text/IMEM address here silently corrupts every load/store).
+    .align 3
+BATCH_STATE:
+BS_inrd:   .word 0      # current RDRAM read cursor (input array)
+BS_outrd:  .word 0      # current RDRAM write cursor (output array)
+BS_remain: .word 0      # walls left to process
+BS_chunk:  .word 0      # walls in the chunk currently in DMEM
+BS_idx:    .word 0      # wall index within the current chunk
+BS_inptr:  .word 0      # DMEM ptr into BIN_BUF for the current wall
+BS_outptr: .word 0      # DMEM ptr into BOUT_BUF for the current wall
+BS_pad:    .word 0
+
+# Per-wall transform scratch (also DMEM): ra/in/out + near-clipped intermediates.
+    .align 3
+XW_ra:    .word 0    # saved return address (helpers clobber ra)
+XW_in:    .word 0    # saved input  DMEM ptr
+XW_out:   .word 0    # saved output DMEM ptr
+XW_txa:   .word 0    # near-clipped tx/ty per corner
+XW_tya:   .word 0
+XW_txb:   .word 0
+XW_tyb:   .word 0
+XW_dA:    .word 0    # near-clipped depths
+XW_dB:    .word 0
+XW_top16: .word 0    # ztop - viewz
+XW_bot16: .word 0
+XW_cx:    .word 0    # centerx
+XW_cy:    .word 0    # centery
+XW_pad:   .word 0
 
     .text
 
@@ -346,6 +428,488 @@ DLWallCmd_Xform:
 
 
 # ============================================================
+# PHASE 2: full-batch transform. The CPU still owns the render; this proves the
+# RSP transform + emit decisions match the CPU at scale over a whole frame.
+#   a0 = RDRAM addr of the 32-byte view block (same rsp_view_blk_t as Phase 1)
+#   a1 = RDRAM addr of the wall-input array  (rsp_bwall_in_t[count], 32B each)
+#   a2 = RDRAM addr of the wall-output array (rsp_bwall_out_t[count], 64B each)
+#   a3 = wall count
+#
+# The RSP DMAs the view block once, then walks the input array in chunks of
+# BATCH_N walls: DMA a chunk in, transform each into BOUT_BUF, DMA the chunk out.
+# Each wall's transform mirrors DL_MeshDrawWalls EXACTLY for the EMIT decision and
+# the per-corner (post-near-clip) screen geometry: bake_linevis && ztop>zbot (the
+# CPU folds these into BWI_vis), both-corners-behind-near skip, near-plane corner
+# slide, back-face (sxB<=sxA) skip, fully-off-screen skip. BWO_emit records the
+# verdict; on a skip the geometry fields are left 0 (the CPU ignores them when
+# emit=0, comparing only the emit flag for culled walls -- so the slot alignment is
+# preserved 1:1 between CPU and RSP).
+#
+# Loop bookkeeping (BATCH_STATE / BS_*) lives in DMEM -- declared in .bss above
+# (the RSP scalar lw/sw only reach DMEM; an IMEM/.text address would corrupt every
+# load/store). Only the compile-time constants live here in .text.
+#define NEARZ (4 << 16)             /* nearz = 4<<FRACBITS, same as the CPU */
+#define SCRW_M1_16 ((320 - 1) << 16)  /* (SCREENWIDTH-1) in 16.16 for the offscreen test */
+
+DLWallCmd_Batch:
+    # ---- DMA the view block in (once for the whole batch) ----
+    li   t0, DMA_SIZE(VIEWBLK_BYTES, 1) & 0xFFF
+    li   s4, %lo(VIEWBLK)
+    jal  DMAIn
+    move s0, a0                  # (delay) s0 = view block RDRAM addr
+
+    # Park the batch cursors in DMEM.
+    sw   a1, %lo(BS_inrd)
+    sw   a2, %lo(BS_outrd)
+    sw   a3, %lo(BS_remain)
+
+BatchChunkLoop:
+    lw   t4, %lo(BS_remain)
+    blez t4, BatchDone           # nothing left
+    nop
+    # chunk = min(remain, BATCH_N)
+    li   t5, BATCH_N
+    sltu t3, t4, t5              # remain < BATCH_N ?
+    beqz t3, 1f
+    nop
+    move t5, t4                  # chunk = remain (remain < BATCH_N)
+1:
+    sw   t5, %lo(BS_chunk)
+
+    # ---- DMA this chunk of inputs in: chunk * BWALL_IN_BYTES bytes ----
+    sll  t6, t5, 5               # bytes = chunk * 32  (BWALL_IN_BYTES==32 -> <<5)
+    addiu t6, t6, -1            # DMA width word = byte_count - 1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(BIN_BUF)
+    lw   s0, %lo(BS_inrd)
+    jal  DMAIn
+    nop
+
+    # ---- per-wall loop over the chunk ----
+    sw   zero, %lo(BS_idx)
+    li   t0, %lo(BIN_BUF)
+    sw   t0, %lo(BS_inptr)
+    li   t0, %lo(BOUT_BUF)
+    sw   t0, %lo(BS_outptr)
+
+BatchWallLoop:
+    lw   t0, %lo(BS_idx)
+    lw   t5, %lo(BS_chunk)
+    bge  t0, t5, BatchChunkEmit
+    nop
+    jal  XformWall               # transforms BS_inptr -> BS_outptr (reads VIEWBLK)
+    nop
+    # advance per-wall cursors
+    lw   t0, %lo(BS_idx)
+    addiu t0, t0, 1
+    sw   t0, %lo(BS_idx)
+    lw   t1, %lo(BS_inptr)
+    addiu t1, t1, BWALL_IN_BYTES
+    sw   t1, %lo(BS_inptr)
+    lw   t1, %lo(BS_outptr)
+    addiu t1, t1, BWALL_OUT_BYTES
+    sw   t1, %lo(BS_outptr)
+    j    BatchWallLoop
+    nop
+
+BatchChunkEmit:
+    # ---- DMA this chunk of outputs back: chunk * BWALL_OUT_BYTES bytes ----
+    lw   t5, %lo(BS_chunk)
+    sll  t6, t5, 6               # bytes = chunk * 64 (BWALL_OUT_BYTES==64 -> <<6)
+    addiu t6, t6, -1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(BOUT_BUF)
+    lw   s0, %lo(BS_outrd)
+    jal  DMAOut
+    nop
+
+    # advance the RDRAM cursors + remaining count for the next chunk
+    lw   t5, %lo(BS_chunk)
+    lw   t1, %lo(BS_inrd)
+    sll  t6, t5, 5
+    addu t1, t1, t6
+    sw   t1, %lo(BS_inrd)
+    lw   t1, %lo(BS_outrd)
+    sll  t6, t5, 6
+    addu t1, t1, t6
+    sw   t1, %lo(BS_outrd)
+    lw   t1, %lo(BS_remain)
+    subu t1, t1, t5
+    j    BatchChunkLoop
+    sw   t1, %lo(BS_remain)      # (delay)
+
+BatchDone:
+    j    RSPQ_Loop
+    nop
+
+
+# ============================================================
+# XformWall : transform one batched wall.
+#   reads:  VIEWBLK (DMEM), the wall at DMEM ptr BS_inptr (BWALL_IN layout)
+#   writes: the output slot at DMEM ptr BS_outptr (BWALL_OUT layout)
+#   ra preserved across all inner helper calls by saving it in DMEM (XW_ra).
+#
+# Mirrors DL_MeshDrawWalls's emit decision + per-corner transform. On any skip,
+# BWO_emit is set 0 and the geometry fields are zeroed. Otherwise BWO_emit=1 and
+# all 12 geometry fields are filled (depth/lateral/invw/sx/ytop/ybot per corner).
+# (XW_* scratch is declared in .bss above -- it MUST be in DMEM.)
+# ============================================================
+    .set noat
+XformWall:
+    sw   ra, %lo(XW_ra)
+    lw   t8, %lo(BS_inptr)
+    lw   t9, %lo(BS_outptr)
+    sw   t8, %lo(XW_in)
+    sw   t9, %lo(XW_out)
+
+    # Zero the whole 64-byte output slot first (so a skipped wall reads clean).
+    sw   zero, BWO_dA(t9)
+    sw   zero, BWO_dB(t9)
+    sw   zero, BWO_lA(t9)
+    sw   zero, BWO_lB(t9)
+    sw   zero, BWO_invwA(t9)
+    sw   zero, BWO_invwB(t9)
+    sw   zero, BWO_sxA(t9)
+    sw   zero, BWO_sxB(t9)
+    sw   zero, BWO_ytA(t9)
+    sw   zero, BWO_ybA(t9)
+    sw   zero, BWO_ytB(t9)
+    sw   zero, BWO_ybB(t9)
+    sw   zero, BWO_emit(t9)
+    sw   zero, BWO_pad0(t9)
+    sw   zero, BWO_pad1(t9)
+    sw   zero, BWO_pad2(t9)
+
+    # ---- vis gate (bake_linevis && ztop>zbot, folded by the CPU) ----
+    lw   t0, BWI_vis(t8)
+    beqz t0, XW_skip             # vis==0 -> culled before transform
+    nop
+
+    # ---- load corners + view, compute view-space tx/ty ----
+    lw   t0, BWI_x1(t8)
+    lw   t1, BWI_y1(t8)
+    lw   t2, BWI_x2(t8)
+    lw   t3, BWI_y2(t8)
+    lw   s1, %lo(VB_viewx)
+    lw   s2, %lo(VB_viewy)
+    sub  t0, t0, s1              # txa
+    sub  t1, t1, s2              # tya
+    sub  t2, t2, s1              # txb
+    sub  t3, t3, s2              # tyb
+    sw   t0, %lo(XW_txa)
+    sw   t1, %lo(XW_tya)
+    sw   t2, %lo(XW_txb)
+    sw   t3, %lo(XW_tyb)
+
+    # ---- depth at each (raw) corner: dA = txa*vcos + tya*vsin ----
+    lw   s3, %lo(VB_vcos)
+    lw   s5, %lo(VB_vsin)
+    move a3, t0
+    jal  FixedMulVU
+    move s7, s3                  # (delay) txa*vcos
+    move s0, v1
+    move a3, t1
+    jal  FixedMulVU
+    move s7, s5                  # tya*vsin
+    add  s0, s0, v1              # dA
+    sw   s0, %lo(XW_dA)
+    move a3, t2
+    jal  FixedMulVU
+    move s7, s3                  # txb*vcos
+    move s0, v1
+    move a3, t3
+    jal  FixedMulVU
+    move s7, s5                  # tyb*vsin
+    add  s0, s0, v1              # dB
+    sw   s0, %lo(XW_dB)
+
+    # ---- both-behind-near skip: if dA<NEARZ && dB<NEARZ -> cull ----
+    # NEARZ kept in t8 (not $at: $at collides with gas's slt/li macro expansion).
+    lw   t4, %lo(XW_dA)
+    lw   t5, %lo(XW_dB)
+    li   t8, NEARZ
+    slt  t6, t4, t8              # dA < nearz ?
+    slt  t7, t5, t8             # dB < nearz ?
+    and  t6, t6, t7
+    bnez t6, XW_skip
+    nop
+
+    # ---- near-plane corner slide (matches DL_MeshDrawWalls) ----
+    # when dA<nearz: u=(nearz-dA)/(dB-dA); txa+=u*(txb-txa); tya+=u*(tyb-tya); dA=nearz
+    # otherwise dB<nearz: u=(nearz-dB)/(dA-dB); txb+=u*(txa-txb); tyb+=u*(tya-tyb); dB=nearz
+    lw   t4, %lo(XW_dA)
+    li   t8, NEARZ
+    slt  t6, t4, t8
+    beqz t6, XW_clipB_chk
+    nop
+    # --- clip corner A ---
+    lw   t5, %lo(XW_dB)
+    sub  a3, t8, t4              # nearz - dA   (t8 == NEARZ)
+    sub  s7, t5, t4              # dB - dA
+    sw   a3, %lo(XW_pad)         # stash numerator (a3) -- RecipFixVU takes b in a3
+    move a3, s7                  # b = (dB - dA)
+    jal  RecipFixVU              # park recip(dB-dA)
+    nop
+    lw   a3, %lo(XW_pad)         # numerator = nearz - dA
+    jal  FixedDivApply           # v1 = u = (nearz-dA)/(dB-dA) in 16.16
+    nop
+    sw   v1, %lo(XW_pad)         # stash u in DMEM (FixedMulVU clobbers t-regs)
+    # txa += FixedMul(u, txb - txa)
+    lw   t0, %lo(XW_txa)
+    lw   t2, %lo(XW_txb)
+    sub  s7, t2, t0              # txb - txa
+    lw   a3, %lo(XW_pad)         # u
+    jal  FixedMulVU
+    nop
+    lw   t0, %lo(XW_txa)
+    add  t0, t0, v1
+    sw   t0, %lo(XW_txa)
+    # tya += FixedMul(u, tyb - tya)
+    lw   t1, %lo(XW_tya)
+    lw   t3, %lo(XW_tyb)
+    sub  s7, t3, t1
+    lw   a3, %lo(XW_pad)         # u
+    jal  FixedMulVU
+    nop
+    lw   t1, %lo(XW_tya)
+    add  t1, t1, v1
+    sw   t1, %lo(XW_tya)
+    li   t8, NEARZ
+    sw   t8, %lo(XW_dA)          # dA = nearz
+    j    XW_after_clip
+    nop
+XW_clipB_chk:
+    lw   t5, %lo(XW_dB)
+    li   t8, NEARZ
+    slt  t6, t5, t8
+    beqz t6, XW_after_clip
+    nop
+    # --- clip corner B ---
+    lw   t4, %lo(XW_dA)
+    sub  a3, t8, t5              # nearz - dB
+    sub  s7, t4, t5              # dA - dB
+    sw   a3, %lo(XW_pad)
+    move a3, s7
+    jal  RecipFixVU
+    nop
+    lw   a3, %lo(XW_pad)
+    jal  FixedDivApply           # u
+    nop
+    sw   v1, %lo(XW_pad)         # stash u in DMEM (FixedMulVU clobbers t-regs)
+    lw   t0, %lo(XW_txa)
+    lw   t2, %lo(XW_txb)
+    sub  s7, t0, t2              # txa - txb
+    lw   a3, %lo(XW_pad)         # u
+    jal  FixedMulVU
+    nop
+    lw   t2, %lo(XW_txb)
+    add  t2, t2, v1
+    sw   t2, %lo(XW_txb)
+    lw   t1, %lo(XW_tya)
+    lw   t3, %lo(XW_tyb)
+    sub  s7, t1, t3              # tya - tyb
+    lw   a3, %lo(XW_pad)         # u
+    jal  FixedMulVU
+    nop
+    lw   t3, %lo(XW_tyb)
+    add  t3, t3, v1
+    sw   t3, %lo(XW_tyb)
+    li   t8, NEARZ
+    sw   t8, %lo(XW_dB)          # dB = nearz
+
+XW_after_clip:
+    # Store final depths to the output (the CPU also clamps to nearz here).
+    lw   t9, %lo(XW_out)
+    lw   t4, %lo(XW_dA)
+    lw   t5, %lo(XW_dB)
+    sw   t4, BWO_dA(t9)
+    sw   t5, BWO_dB(t9)
+
+    # ---- lateral: lA = tya*vcos - txa*vsin ; lB = tyb*vcos - txb*vsin ----
+    lw   s3, %lo(VB_vcos)
+    lw   s5, %lo(VB_vsin)
+    lw   t0, %lo(XW_txa)
+    lw   t1, %lo(XW_tya)
+    lw   t2, %lo(XW_txb)
+    lw   t3, %lo(XW_tyb)
+    move a3, t1
+    jal  FixedMulVU
+    move s7, s3                  # tya*vcos
+    move s0, v1
+    move a3, t0
+    jal  FixedMulVU
+    move s7, s5                  # txa*vsin
+    sub  s0, s0, v1              # lA
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_lA(t9)
+    move a3, t3
+    jal  FixedMulVU
+    move s7, s3                  # tyb*vcos
+    move s0, v1
+    move a3, t2
+    jal  FixedMulVU
+    move s7, s5                  # txb*vsin
+    sub  s0, s0, v1              # lB
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_lB(t9)
+
+    # ---- centerx / centery / heights into DMEM ----
+    lw   s3, %lo(VB_centerx)
+    lw   s6, %lo(VB_centery)
+    sw   s3, %lo(XW_cx)
+    sw   s6, %lo(XW_cy)
+    lw   t8, %lo(XW_in)
+    lw   t4, BWI_ztop(t8)
+    lw   t5, BWI_zbot(t8)
+    lw   t6, %lo(VB_viewz)
+    sub  t4, t4, t6
+    sub  t5, t5, t6
+    sw   t4, %lo(XW_top16)
+    sw   t5, %lo(XW_bot16)
+
+    # ============================================================
+    # Per-corner perspective: identical reformulation to Phase 1.
+    #   invw = FixedDiv(65536, depth)                    (16.16 == invw_real)
+    #   sx   = (centerx<<16) - centerx * FixedDiv(l, depth)
+    #   yt   = (centery<<16) - centerx * FixedMul(top16, invw)
+    #   yb   = (centery<<16) - centerx * FixedMul(bot16, invw)
+    # ============================================================
+    # ---- corner A ----
+    lw   t9, %lo(XW_out)
+    lw   a3, BWO_dA(t9)
+    jal  RecipFixVU
+    nop
+    li   a3, 0x10000
+    jal  FixedDivApply           # invwA
+    nop
+    lw   t9, %lo(XW_out)
+    sw   v1, BWO_invwA(t9)
+    lw   a3, BWO_lA(t9)
+    jal  FixedDivApply           # ratio_lA = FixedDiv(lA, dA)
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU                # centerx * ratio_lA
+    nop
+    lw   s3, %lo(XW_cx)
+    sll  t7, s3, 16
+    sub  s0, t7, v1              # sxA
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_sxA(t9)
+    # ytA
+    lw   s7, BWO_invwA(t9)
+    lw   a3, %lo(XW_top16)
+    jal  FixedMulVU              # top16 * invwA
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU
+    nop
+    lw   s6, %lo(XW_cy)
+    sll  t8, s6, 16
+    sub  s0, t8, v1              # ytA
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_ytA(t9)
+    # ybA
+    lw   s7, BWO_invwA(t9)
+    lw   a3, %lo(XW_bot16)
+    jal  FixedMulVU
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU
+    nop
+    lw   s6, %lo(XW_cy)
+    sll  t8, s6, 16
+    sub  s0, t8, v1              # ybA
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_ybA(t9)
+
+    # ---- corner B ----
+    lw   a3, BWO_dB(t9)
+    jal  RecipFixVU
+    nop
+    li   a3, 0x10000
+    jal  FixedDivApply           # invwB
+    nop
+    lw   t9, %lo(XW_out)
+    sw   v1, BWO_invwB(t9)
+    lw   a3, BWO_lB(t9)
+    jal  FixedDivApply           # ratio_lB
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU
+    nop
+    lw   s3, %lo(XW_cx)
+    sll  t7, s3, 16
+    sub  s0, t7, v1              # sxB
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_sxB(t9)
+    # ytB
+    lw   s7, BWO_invwB(t9)
+    lw   a3, %lo(XW_top16)
+    jal  FixedMulVU
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU
+    nop
+    lw   s6, %lo(XW_cy)
+    sll  t8, s6, 16
+    sub  s0, t8, v1              # ytB
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_ytB(t9)
+    # ybB
+    lw   s7, BWO_invwB(t9)
+    lw   a3, %lo(XW_bot16)
+    jal  FixedMulVU
+    nop
+    move a3, v1
+    lw   s7, %lo(XW_cx)
+    jal  MulIntVU
+    nop
+    lw   s6, %lo(XW_cy)
+    sll  t8, s6, 16
+    sub  s0, t8, v1              # ybB
+    lw   t9, %lo(XW_out)
+    sw   s0, BWO_ybB(t9)
+
+    # ---- emit decision: back-face (sxB<=sxA) + off-screen ----
+    #   when sxB <= sxA          -> cull (degenerate/back-facing)
+    #   when sxB <= 0            -> cull (fully off left)
+    #   when sxA >= (SCRW-1)<<16 -> cull (fully off right)
+    lw   t9, %lo(XW_out)
+    lw   t0, BWO_sxA(t9)          # sxA 16.16 (signed)
+    lw   t1, BWO_sxB(t9)          # sxB 16.16
+    slt  t6, t0, t1              # sxA < sxB ?  (need sxB > sxA, i.e. NOT <=)
+    beqz t6, XW_skip             # sxB <= sxA -> cull
+    nop
+    blez t1, XW_skip             # sxB <= 0 -> cull (signed)
+    nop
+    li   t8, SCRW_M1_16
+    slt  t6, t0, t8              # sxA < (SCRW-1)<<16 ?
+    beqz t6, XW_skip             # sxA >= edge -> cull
+    nop
+
+    # survived all skips -> emit
+    li   t0, 1
+    sw   t0, BWO_emit(t9)
+    lw   ra, %lo(XW_ra)
+    jr   ra
+    nop
+
+XW_skip:
+    # culled: emit stays 0 (slot already zeroed). Keep the slot aligned with the CPU.
+    lw   t9, %lo(XW_out)
+    sw   zero, BWO_emit(t9)
+    lw   ra, %lo(XW_ra)
+    jr   ra
+    nop
+    .set at
+
+
+# ============================================================
 # FixedMulVU(a3, s7) -> v1 = (a3 * s7) >> 16, signed 16.16 fixed multiply.
 # Reproduces FixedMul((long long)a*(long long)b >> 16) EXACTLY using the VU
 # dual-precision partial-product pattern (the RSP scalar core has no multiply).
@@ -418,41 +982,95 @@ MulIntVU:
 # several numerators (invw, lateral-ratio, top-ratio, bot-ratio share the same depth)
 # saves three vrcp sequences per corner. CLOBBERS at, t9, v00,v02..v05. ra preserved.
 #
-# vrcp(b) returns (ri:rf) ~= 2^31/b_significand with vrcp's built-in 1-LSB shift.
-# We do NOT analytically pin the exponent here; FixedDivApply folds the net scale
-# into a single compile-time shift FIXEDDIV_SH, tuned so the gate's relative error
-# collapses to the vrcp epsilon (a wrong shift shows as a clean power-of-two error).
+# vrcp(b) returns (ri:rf) ~= 2^31/b_significand whose IMPLICIT EXPONENT depends on
+# where b's MSB falls. A single compile-time FIXEDDIV_SH is therefore correct only for
+# ONE divisor magnitude (Phase 1's single wall) -- the full batch spans depths 4..1300+
+# map units, so the shift must track the divisor exponent or invw drifts by powers of
+# two (observed: ~4% on deep walls, catastrophic on the near-clip ratio). Fix:
+# NORMALIZE b to a fixed MSB position (NORMBIT) before vrcp, park the normalization
+# shift, and let FixedDivApply undo it. b is always positive here (depths >= nearz>0;
+# the clip divisor dB-dA>0), so we normalize |b| with a scalar binary-search msb.
 # ============================================================
+#define NORMBIT 23   /* normalize b's MSB to bit 23 (Phase-1 depth regime; keeps the
+                        normalized divisor clear of the sign bit so vrcp treats it as
+                        positive, and matches the FIXEDDIV_SH=1 window). Residual: the
+                        single-pass vrcp gives ~1-2% on depths far from NORMBIT (a
+                        Newton refinement -- Docs/RSP_PORT_PLAN.md Sec 5.1 -- would tighten
+                        it; libdragon's GL ships the same single-pass divide w/ a TODO:NR). */
 RDIV_R: # parked 32-bit reciprocal (ri at +0, rf at +2)  -- in VSCRATCH+8
-RDIV_D: # parked b hi/lo                                  -- in VSCRATCH+12
+RDIV_SH: # parked normalization shift (signed) -- in VSCRATCH+16 (NOT +4: FixedMulVU
+         # stages its 'b' operand at VSCRATCH+4 and would clobber the shift between a
+         # RecipFixVU and its FixedDivApply when an intervening FixedMulVU runs)
     .set noat
 RecipFixVU:
-    sw   a3, %lo(VSCRATCH)+12    # park b ([dh][dl]) for FixedDivApply
+    # --- find msb(b): binary search for the highest set bit of b (b>0) ---
+    # CLOBBERS ONLY t7,t8,t9 (+ v00..v05). Phase 1's DLWallCmd_Xform keeps top16/bot16
+    # live in t4/t5 across this call, so this routine MUST NOT touch t0..t6, s0..s7.
+    # t8 = working value, t9 = msb-bit accumulator, t7 = scratch test ($at can't be an
+    # explicit operand on the RSP gas backend).
+    move t8, a3
+    li   t9, 0
+    # bits 31..16 set -> msb>=16
+    srl  t7, t8, 16
+    beqz t7, 1f
+    nop
+    addiu t9, t9, 16
+    srl  t8, t8, 16
+1:  srl  t7, t8, 8
+    beqz t7, 2f
+    nop
+    addiu t9, t9, 8
+    srl  t8, t8, 8
+2:  srl  t7, t8, 4
+    beqz t7, 3f
+    nop
+    addiu t9, t9, 4
+    srl  t8, t8, 4
+3:  srl  t7, t8, 2
+    beqz t7, 4f
+    nop
+    addiu t9, t9, 2
+    srl  t8, t8, 2
+4:  srl  t7, t8, 1
+    beqz t7, 5f
+    nop
+    addiu t9, t9, 1
+5:  # t9 = msb index of b (0..30 for our positive divisors)
+    # sh = NORMBIT - msb ; bn = (sh>=0) ? b<<sh : b>>(-sh)
+    li   t7, NORMBIT
+    subu t9, t7, t9            # sh = NORMBIT - msb (signed)
+    sw   t9, %lo(VSCRATCH)+16   # park sh (NOT +4 -- FixedMulVU stages 'b' there)
+    bgez t9, 6f
+    move t8, a3                 # (delay) t8 = b
+    # sh < 0 : bn = b >> (-sh)
+    subu t7, zero, t9           # -sh
+    srlv t8, a3, t7
+    j    7f
+    nop
+6:  # sh >= 0 : bn = b << sh
+    sllv t8, a3, t9
+7:  sw   t8, %lo(VSCRATCH)+12   # park bn ([bnh][bnl]) for vrcp
     li   t9, %lo(VSCRATCH)
-    lsv  $v02, 0, 14, t9         # dl (low half)  -> vrcpl  (VSCRATCH+12 -> +14 = lo)
-    lsv  $v03, 0, 12, t9         # dh (high half) -> vrcph
+    lsv  $v02, 0, 14, t9        # bnl (low half)  -> vrcpl
+    lsv  $v03, 0, 12, t9        # bnh (high half) -> vrcph
     vxor $v00, $v00, $v00
-    vrcph $v04.e0, $v03.e0       # ri
-    vrcpl $v05.e0, $v02.e0       # rf
-    vrcph $v04.e0, $v00.e0       # finalize
-    ssv  $v04, 0, 8,  t9         # park ri at VSCRATCH+8
+    vrcph $v04.e0, $v03.e0      # ri
+    vrcpl $v05.e0, $v02.e0      # rf
+    vrcph $v04.e0, $v00.e0      # finalize
+    ssv  $v04, 0, 8,  t9        # park ri at VSCRATCH+8
     jr   ra
-    ssv  $v05, 0, 10, t9         # (delay) park rf at VSCRATCH+10
+    ssv  $v05, 0, 10, t9        # (delay) park rf at VSCRATCH+10
     .set at
 
 
 # ============================================================
 # FixedDivApply(a3 = numerator a, 16.16) -> v1 = (a<<16)/b in 16.16, using the
-# reciprocal of b parked by the most recent RecipFixVU. Computes a * recip(b) with
-# the dual-precision multiply, then applies FIXEDDIV_SH to land 16.16. CLOBBERS at,
-# t7,t8,t9, v20..v25. ra preserved (no inner jal).
-#
-# recip = (ri:rf) is a 32-bit fixed reciprocal. a*(ri:rf) via vmudl/vmadm/vmadn/vmadh
-# gives the 64-bit product in (pI:pF). The correctly-scaled (a<<16)/b is a fixed
-# window of that product; FIXEDDIV_SH selects it. We extract a 32-bit window then a
-# final scalar shift. FIXEDDIV_SH is set so result == FixedDiv(a,b) for the gate.
+# normalized reciprocal of b parked by the most recent RecipFixVU. Computes
+# a*recip(bn) with the dual-precision multiply (giving (a<<16)/bn at FIXEDDIV_SH), then
+# undoes the normalization: (a<<16)/b = (a<<16)/(bn>>sh) = ((a<<16)/bn) << sh.
+# CLOBBERS at, t6,t7,t8,t9, v20..v25. ra preserved (no inner jal).
 # ============================================================
-#define FIXEDDIV_SH 1           /* net scalar left-shift; tuned via the gate's invw error */
+#define FIXEDDIV_SH 1           /* lands (a<<16)/bn for the NORMBIT-normalized divisor */
     .set noat
 FixedDivApply:
     # a -> hi/lo at VSCRATCH+0 ; recip already parked at VSCRATCH+8 (ri:rf).
@@ -463,10 +1081,6 @@ FixedDivApply:
     lsv  $v22, 0, 8, t9          # ri (recip high)
     lsv  $v23, 0, 10, t9         # rf (recip low)
     # product a * recip : (ah:al) * (ri:rf), dual precision.
-    #   acc  = al*rf  (both unsigned low)         vmudl
-    #   acc += ah*rf  (ah signed)                 vmadm
-    #   pF   = al*ri  (ri signed)                 vmadn -> low/frac lanes
-    #   pI   = ah*ri  (signed)                    vmadh -> high/int lanes
     vmudl $v24, $v21, $v23
     vmadm $v24, $v20, $v23
     vmadn $v24, $v21, $v22       # pF
@@ -476,11 +1090,21 @@ FixedDivApply:
     lh   t7, %lo(VSCRATCH)+2     # pI (signed high)
     lhu  t8, %lo(VSCRATCH)+0     # pF (unsigned low)
     sll  t7, t7, 16
-    or   t7, t7, t8             # 32-bit window of a*recip
-    # net scale to 16.16 FixedDiv(a,b): a*recip ~= a * 2^31/b within this 32-bit
-    # window already representing a*2^(31-32)/b = a/(2b); the <<FIXEDDIV_SH lands it
-    # at (a<<16)/b. Tuned empirically by the gate (see FIXEDDIV_SH).
-    sll  t7, t7, FIXEDDIV_SH
-    jr   ra
+    or   t7, t7, t8             # 32-bit window of a*recip = (a<<16)/bn at FIXEDDIV_SH
+#if FIXEDDIV_SH >= 0
+    sll  t7, t7, FIXEDDIV_SH     # -> (a<<16)/bn in 16.16 (left)
+#else
+    sra  t7, t7, (-(FIXEDDIV_SH)) # -> (a<<16)/bn in 16.16 (right)
+#endif
+    # undo normalization: result = ((a<<16)/bn) << sh
+    lw   t6, %lo(VSCRATCH)+16    # sh (signed)
+    bgez t6, 8f
+    nop
+    subu t9, zero, t6           # -sh  (t9 free here -- ptr no longer needed)
+    srav t7, t7, t9             # sh<0 : >> (-sh)  (arithmetic; numerator can be signed)
+    j    9f
+    nop
+8:  sllv t7, t7, t6             # sh>=0 : << sh
+9:  jr   ra
     move v1, t7                 # (delay) v1 = FixedDiv(a,b) in 16.16
     .set at

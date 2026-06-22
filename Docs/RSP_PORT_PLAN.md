@@ -43,8 +43,25 @@ RSP asm rule auto-fires on `rsp_*.S` (`n64.mk:168-209`); toolchain present in Do
 - **Phase 1 — ONE wall, bit-exact compare** vs the CPU `DL_MeshDrawWalls` math. The
   load-bearing gate: if the RSP output can't match within epsilon (0.5px screen / 1 texel),
   the precision risks (§5) are real → NO-GO. Nothing renders yet.
-- **Phase 2 — full batch, CPU still authoritative.** Compare whole batch, 0 mismatches
-  over a full demo (`scan-marks.sh`).
+- **Phase 2 — full batch, CPU still authoritative. DONE (with a characterized precision
+  residual).** `DLWallCmd_Batch` transforms the WHOLE visible wall set on the RSP each
+  frame (DMEM-chunked, `BATCH_N=8`), reproducing every `DL_MeshDrawWalls` skip/clip so the
+  RSP and CPU emit decisions align slot-for-slot; `DL_RSPBatchProbe` compares the whole
+  batch every frame and logs `RSP-BATCH frame=.. walls=.. mismatch=.. emit_disagree=.. worst_*`.
+  Over the full E1M1 demo (495 frames): **emit_disagree ≈ 0** (0-2 walls, a sub-pixel sx
+  flipping an off-screen boundary) — the structural/slot-alignment goal is met. The field
+  residual is the single-pass `vrcp` precision: ~70% of frames are within the Phase-1 gate
+  (invw ≤ 1%), the rest reach ~1-2% invw / ~1px sx on depths far from `NORMBIT`, plus rare
+  large-sx spikes on near-clipped walls whose slid corner sits at depth≈nearz (huge invw).
+  **Phase-3 prerequisite:** a `vrcp` + Newton-Raphson refinement (§5.1) to pull the divide
+  under the gate before the render cutover. Bugs found+fixed en route, all load-bearing:
+  (a) batch loop state / per-wall scratch were emitted in `.text`/IMEM — RSP `lw/sw` only
+  reach DMEM, so every spill silently corrupted; moved to `.bss`. (b) the near-clip `u` was
+  kept in a t-reg across `FixedMulVU` (which clobbers it) — spilled to DMEM. (c) the fixed
+  `FIXEDDIV_SH` only suited ONE divisor magnitude — added divisor-exponent normalization
+  (scalar msb-search → `NORMBIT`) so the divide tracks depth; the parked shift collided with
+  `FixedMulVU`'s operand slot and `RecipFixVU` clobbered Phase-1's live `top16/bot16` regs,
+  both fixed.
 - **Phase 3 — cut over.** Render off the RSP output; A/B pixel-identical; confirm the
   dlbuild wall cost drops (host-independent CP0 ticks).
 - **Phase 4 — floors.** Extend to the leaf-fan transform, same compare→cutover discipline.

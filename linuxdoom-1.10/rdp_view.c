@@ -2394,6 +2394,7 @@ static uint32_t rsp_dlwall_ovl_id = 0;
 // rspq command indices (must match the RSPQ_DefineCommand order in rsp/rsp_dlwall.S).
 #define DLWALL_CMD_LOOPBACK 0
 #define DLWALL_CMD_XFORM    1
+#define DLWALL_CMD_BATCH    2
 
 // ---- Phase 1 transform DMA blocks. Layouts MUST match rsp_dlwall.S byte-for-byte
 // (VIEWBLK / WALLIN / WALLOUT). All 32-bit signed words; no FPU on the RSP, so the
@@ -2418,6 +2419,27 @@ typedef struct {
     int32_t sxA, sxB;              // 0x18,0x1C  screen X 16.16
     int32_t ytA, ybA, ytB, ybB;    // 0x20..0x2C screen Y top/bot per corner 16.16
 } rsp_wall_out_t;                  // 48 bytes
+
+// ---- Phase 2 BATCH DMA blocks. Layouts MUST match rsp_dlwall.S BWALL_IN/BWALL_OUT.
+// The CPU packs the WHOLE visible wall set; the RSP transforms it in DMEM-sized
+// chunks. invw here is FixedDiv(65536,depth) in 16.16 (== invw_real * 65536), the
+// same scale Phase 1's invwA/invwB use after FixedDivApply.
+typedef struct {
+    int32_t x1, y1, x2, y2;        // 0x00..0x0C  fixed_t wall corners
+    int32_t ztop, zbot;            // 0x10,0x14   fixed_t snapshotted live heights
+    int32_t vis;                   // 0x18        1 = bake_linevis[line] && ztop>zbot
+    int32_t pad0;                  // 0x1C
+} rsp_bwall_in_t;                  // 32 bytes
+
+typedef struct {
+    int32_t dA, dB;                // 0x00,0x04   depth 16.16 (post near-clip)
+    int32_t lA, lB;                // 0x08,0x0C   lateral 16.16
+    int32_t invwA, invwB;          // 0x10,0x14   FixedDiv(65536,depth) 16.16
+    int32_t sxA, sxB;              // 0x18,0x1C   screen X 16.16
+    int32_t ytA, ybA, ytB, ybB;    // 0x20..0x2C  screen Y top/bot per corner 16.16
+    int32_t emit;                  // 0x30        1 = survived all skips, else 0
+    int32_t pad0, pad1, pad2;      // 0x34,0x38,0x3C
+} rsp_bwall_out_t;                 // 64 bytes
 #endif
 
 // Map a record's per-edge INV_W (== 1/depth in map units, see dl_invw_k) to a
@@ -2700,6 +2722,253 @@ static void DL_RSPXformProbe(void)
         free(vb); free(wi); free(wo);
     }
 }
+
+// =====================================================================
+//  RSP PORT -- PHASE 2: FULL-BATCH transform, CPU still authoritative.
+// =====================================================================
+// Transforms the ENTIRE visible wall set on the RSP each frame and compares the
+// whole batch against the CPU's own DL_MeshDrawWalls computation. The render still
+// uses the CPU records -- this phase only proves correctness AT SCALE before the
+// Phase-3 cutover. See Docs/RSP_PORT_PLAN.md Sec 4.
+//
+// EMIT-DECISION ALIGNMENT (the load-bearing structural correctness): the RSP and
+// the CPU must agree, slot-for-slot, on WHICH walls emit. We keep them aligned by
+// processing one input slot per baked wall (no compaction): the CPU folds the two
+// deterministic, non-HW gates (bake_linevis[line] and ztop>zbot) into a per-wall
+// `vis` byte; the RSP then reproduces the HW-sensitive skips itself -- both-corners-
+// behind-near, the near-plane corner slide, back-face (sxB<=sxA), and fully-off-
+// screen -- and writes an `emit` flag per slot. The CPU reference below reproduces
+// the SAME gates in float and compares the emit flags first (a structural mismatch),
+// then the geometry fields only for walls both sides agree are emitted.
+//
+// SCOPE BOUNDARY: this matches DL_MeshDrawWalls up to and including the back-face +
+// off-screen emit tests (the `continue`s BEFORE the screen-edge-clip block). The
+// final per-attribute screen-edge clip + sub-pixel xa/xb rounding is float-linear
+// render-stage refinement (Phase 1 classified the edge-clip lerps as non-HW-risk);
+// it does not change the emit set here and is reproduced on the CPU at render time,
+// not in this transform gate.
+//
+// Buffers are level-load-sized once (bake_numwalls is fixed per level) and reused.
+// (Still inside the BENCH_FORCE_MESH_RSP block opened above for Phase 0/1.)
+static rsp_bwall_in_t  *batch_in  = NULL;
+static rsp_bwall_out_t *batch_out = NULL;
+static int              batch_cap = 0;
+
+// Worst deltas observed across the whole run (for the end-of-demo report).
+static float  batch_run_worst_sx   = 0.0f;
+static float  batch_run_worst_sy   = 0.0f;
+static double batch_run_worst_invw = 0.0;
+static long   batch_run_total_mism = 0;
+static unsigned batch_frame = 0;
+
+static void DL_RSPBatchProbe(void)
+{
+    int i;
+    fixed_t vcos, vsin;
+    const fixed_t nearz = 4 << FRACBITS;
+    float viewzf;
+    rsp_view_blk_t *vb;
+    int emitted = 0, mism = 0;
+    float  worst_sx = 0.0f, worst_sy = 0.0f;
+    double worst_invw = 0.0;
+    int    emit_disagree = 0;
+    int    cpu_emitted = 0, rsp_emitted = 0;   // independent CPU/RSP emit counts
+    // context of the worst-sx wall this frame (for the residual-class log)
+    int    wsx_i = -1, wsx_clip = 0; fixed_t wsx_dA = 0, wsx_dB = 0;
+    int    n_clipped = 0, n_clip_mism = 0;
+
+    if (!bake_walls || bake_numwalls <= 0)
+        return;
+    if (rsp_dlwall_ovl_id == 0) {
+        rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+        debugf("RSP-BATCH: overlay registered, id=0x%08lx\n",
+               (unsigned long)rsp_dlwall_ovl_id);
+    }
+
+    // Allocate (once) the cache-line-aligned DMA arrays sized to the wall set.
+    if (batch_cap < bake_numwalls) {
+        if (batch_in)  free(batch_in);
+        if (batch_out) free(batch_out);
+        batch_in  = memalign(16, (size_t)bake_numwalls * sizeof(rsp_bwall_in_t));
+        batch_out = memalign(16, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
+        if (!batch_in || !batch_out) {
+            if (batch_in)  { free(batch_in);  batch_in  = NULL; }
+            if (batch_out) { free(batch_out); batch_out = NULL; }
+            batch_cap = 0;
+            debugf("RSP-BATCH: SKIP (alloc failed)\n");
+            return;
+        }
+        batch_cap = bake_numwalls;
+    }
+
+    vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+
+    // ---- pack the view block (separate alloc; small) ----
+    vb = memalign(16, sizeof *vb);
+    if (!vb) { debugf("RSP-BATCH: SKIP (vb alloc)\n"); return; }
+    vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
+    vb->vcos = vcos;   vb->vsin = vsin;
+    vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
+
+    // ---- pack every wall's input + the folded vis byte ----
+    for (i = 0; i < bake_numwalls; i++) {
+        const bake_wall_t* bw = &bake_walls[i];
+        fixed_t ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                                      : sectors[bw->ztop_sec].floorheight;
+        fixed_t zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                                      : sectors[bw->zbot_sec].floorheight;
+        int vis = 1;
+        if (bake_linevis && !bake_linevis[bw->line]) vis = 0;
+        if (ztopz <= zbotz) vis = 0;
+        batch_in[i].x1 = bw->x1; batch_in[i].y1 = bw->y1;
+        batch_in[i].x2 = bw->x2; batch_in[i].y2 = bw->y2;
+        batch_in[i].ztop = ztopz; batch_in[i].zbot = zbotz;
+        batch_in[i].vis = vis; batch_in[i].pad0 = 0;
+    }
+
+    // ---- coherency: flush inputs + view block, poison + flush outputs ----
+    memset(batch_out, 0xA5, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
+    data_cache_hit_writeback(vb, sizeof *vb);
+    data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_in_t)));
+    data_cache_hit_writeback(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+
+    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
+               PhysicalAddr(vb), PhysicalAddr(batch_in),
+               PhysicalAddr(batch_out), (uint32_t)bake_numwalls);
+    rspq_wait();
+    data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+
+    // ---- per-wall CPU reference + compare ----
+    for (i = 0; i < bake_numwalls; i++) {
+        const bake_wall_t* bw = &bake_walls[i];
+        const rsp_bwall_out_t* ro = &batch_out[i];
+        fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
+        fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
+        fixed_t dA  = FixedMul(txa, vcos) + FixedMul(tya, vsin);
+        fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);
+        fixed_t ztopz = batch_in[i].ztop, zbotz = batch_in[i].zbot;
+        fixed_t dA_raw = dA, dB_raw = dB;
+        int cpu_emit = 1, clipped = 0;
+        float invwA, invwB, scA, scB, sxA, sxB, topf, botf;
+        float ytA, ybA, ytB, ybB;
+
+        // ---- CPU emit decision, mirroring DL_MeshDrawWalls up to the off-screen test ----
+        if (!batch_in[i].vis) cpu_emit = 0;
+        else if (dA < nearz && dB < nearz) cpu_emit = 0;
+
+        if (cpu_emit) {
+            // near-plane corner slide (same as DL_MeshDrawWalls)
+            if (dA < nearz) {
+                float u = (float)(nearz - dA) / (float)(dB - dA);
+                txa += (fixed_t)(u * (float)(txb - txa));
+                tya += (fixed_t)(u * (float)(tyb - tya));
+                dA   = nearz; clipped = 1;
+            } else if (dB < nearz) {
+                float u = (float)(nearz - dB) / (float)(dA - dB);
+                txb += (fixed_t)(u * (float)(txa - txb));
+                tyb += (fixed_t)(u * (float)(tya - tyb));
+                dB   = nearz; clipped = 1;
+            }
+            {
+                fixed_t lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
+                fixed_t lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
+                invwA = 65536.0f / (float)dA;
+                invwB = 65536.0f / (float)dB;
+                scA   = (float)centerx * invwA;
+                scB   = (float)centerx * invwB;
+                sxA = (float)centerx - (float)lA * (1.0f/65536.0f) * scA;
+                sxB = (float)centerx - (float)lB * (1.0f/65536.0f) * scB;
+                if (sxB <= sxA) cpu_emit = 0;
+                else if (sxB <= 0.0f || sxA >= (float)(SCREENWIDTH - 1)) cpu_emit = 0;
+                topf = (float)ztopz * (1.0f/65536.0f) - viewzf;
+                botf = (float)zbotz * (1.0f/65536.0f) - viewzf;
+                ytA = (float)centery - topf*scA; ybA = (float)centery - botf*scA;
+                ytB = (float)centery - topf*scB; ybB = (float)centery - botf*scB;
+            }
+        } else {
+            invwA = invwB = scA = scB = sxA = sxB = 0.0f;
+            ytA = ybA = ytB = ybB = 0.0f;
+        }
+
+        if (cpu_emit) cpu_emitted++;
+        if (ro->emit) rsp_emitted++;
+
+        // ---- structural: emit flags must agree (the load-bearing slot alignment) ----
+        if ((int)ro->emit != cpu_emit) {
+            emit_disagree++;
+            mism++;
+            continue;   // geometry meaningless when emit sets disagree
+        }
+        if (!cpu_emit) continue;   // both agree culled -- nothing to compare
+        emitted++;
+
+        // ---- field compare (RSP fixed-point -> float) ----
+        {
+            float r_sxA = (float)ro->sxA * (1.0f/65536.0f);
+            float r_sxB = (float)ro->sxB * (1.0f/65536.0f);
+            float r_ytA = (float)ro->ytA * (1.0f/65536.0f);
+            float r_ybA = (float)ro->ybA * (1.0f/65536.0f);
+            float r_ytB = (float)ro->ytB * (1.0f/65536.0f);
+            float r_ybB = (float)ro->ybB * (1.0f/65536.0f);
+            double r_invwA = (double)(int32_t)ro->invwA / 65536.0;
+            double r_invwB = (double)(int32_t)ro->invwB / 65536.0;
+            float d_sx = fmaxf(fabsf(r_sxA - sxA), fabsf(r_sxB - sxB));
+            float d_sy = fmaxf(fmaxf(fabsf(r_ytA - ytA), fabsf(r_ybA - ybA)),
+                               fmaxf(fabsf(r_ytB - ytB), fabsf(r_ybB - ybB)));
+            double e_iA = fabs((r_invwA - (double)invwA) / (double)invwA);
+            double e_iB = fabs((r_invwB - (double)invwB) / (double)invwB);
+            double d_invw = (e_iA > e_iB) ? e_iA : e_iB;
+
+            if (d_sx   > worst_sx)   { worst_sx = d_sx; wsx_i = i; wsx_clip = clipped;
+                                       wsx_dA = dA_raw; wsx_dB = dB_raw; }
+            if (d_sy   > worst_sy)   worst_sy   = d_sy;
+            if (d_invw > worst_invw) worst_invw = d_invw;
+
+            if (clipped) n_clipped++;
+
+            // mismatch: any field outside the Phase-1 epsilon (sx/sy >0.5px,
+            // invw >1% rel). S/T are derived from these (S=si/invw, T spans
+            // height) so the sx/sy/invw bounds subsume the >1-texel S/T bound.
+            if (d_sx > 0.5f || d_sy > 0.5f || d_invw > 0.01) {
+                mism++;
+                if (clipped) n_clip_mism++;
+            }
+        }
+    }
+
+    // ---- accumulate run-wide worsts + total ----
+    if (worst_sx   > batch_run_worst_sx)   batch_run_worst_sx   = worst_sx;
+    if (worst_sy   > batch_run_worst_sy)   batch_run_worst_sy   = worst_sy;
+    if (worst_invw > batch_run_worst_invw) batch_run_worst_invw = worst_invw;
+    batch_run_total_mism += mism;
+
+    debugf("RSP-BATCH frame=%u walls=%d cpu_emit=%d rsp_emit=%d mismatch=%d emit_disagree=%d "
+           "worst_sx=%d(e-3) worst_sy=%d(e-3) worst_invw=%d(e-6) n_clip=%d clip_mism=%d\n",
+           batch_frame, emitted, cpu_emitted, rsp_emitted, mism, emit_disagree,
+           (int)(worst_sx*1000.0f), (int)(worst_sy*1000.0f),
+           (int)(worst_invw*1e6), n_clipped, n_clip_mism);
+    // When the worst sx is large, dump the offending wall's depth + clip status so a
+    // pathological class (e.g. near-clipped deep wall) is identifiable in the log.
+    if (worst_sx > 0.5f && wsx_i >= 0)
+        debugf("RSP-BATCH WORST frame=%u i=%d clip=%d dA=%d dB=%d d_sx=%d(e-3)\n",
+               batch_frame, wsx_i, wsx_clip, (int)wsx_dA, (int)wsx_dB,
+               (int)(worst_sx*1000.0f));
+
+    // Periodic run-wide rollup so a long demo's grand total is visible without
+    // summing every per-frame line.
+    if ((batch_frame % 256) == 0) {
+        debugf("RSP-BATCH-RUN frame=%u total_mismatch=%ld run_worst_sx=%d(e-3) "
+               "run_worst_sy=%d(e-3) run_worst_invw=%d(e-6)\n",
+               batch_frame, batch_run_total_mism,
+               (int)(batch_run_worst_sx*1000.0f), (int)(batch_run_worst_sy*1000.0f),
+               (int)(batch_run_worst_invw*1e6));
+    }
+    batch_frame++;
+
+    free(vb);
+}
 #endif // BENCH_FORCE_MESH_RSP
 
 void DL_MeshDrawWalls(void)
@@ -2716,12 +2985,14 @@ void DL_MeshDrawWalls(void)
     if (!DL_MeshRouteOn())
         return;
 
-    // RSP port probes (logs only, no render effect): Phase 0 DMA loopback +
-    // Phase 1 one-wall transform compare gate.
+    // RSP port probes (logs only, no render effect): Phase 0 DMA loopback (once)
+    // + Phase 1 one-wall transform compare gate (once) + Phase 2 full-batch
+    // transform compare (EVERY frame, CPU still authoritative).
 #ifdef BENCH_FORCE_MESH_RSP
     if (n64_rdp_mesh_rsp) {
         DL_RSPLoopbackProbe();
         DL_RSPXformProbe();
+        DL_RSPBatchProbe();
     }
 #endif
 
