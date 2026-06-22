@@ -138,11 +138,16 @@ DLWallCmd_Loopback:
 # ============================================================
 DLWallCmd_Xform:
     # ---- DMA the view block in ----
+    # DMAIn reads the transfer size from t0 (DMA_SIZE width/height); the command
+    # dispatch leaves t0 undefined, so it MUST be set per DMA or a short/garbage
+    # transfer leaves tail fields (e.g. centery, the last VIEWBLK word) stale.
+    li   t0, DMA_SIZE(VIEWBLK_BYTES, 1) & 0xFFF
     li   s4, %lo(VIEWBLK)
     jal  DMAIn
     move s0, a0                  # (delay) s0 = view block RDRAM addr (a0 preserved? no:
                                  #  DMAExec destroys only t2/at; a0/a1/a2 survive)
     # ---- DMA the wall input in ----
+    li   t0, DMA_SIZE(WALLIN_BYTES, 1) & 0xFFF
     li   s4, %lo(WALLIN)
     jal  DMAIn
     move s0, a1                  # (delay) s0 = wall input RDRAM addr
@@ -263,9 +268,16 @@ DLWallCmd_Xform:
     sll  t7, s3, 16              # centerx<<16
     sub  s0, t7, v1
     sw   s0, %lo(WO_sxA)
-    # ytA = (centery<<16) - centerx * FixedDiv(top, dA)
-    move a3, t4
-    jal  FixedDivApply
+    # ytA = (centery<<16) - centerx * FixedMul(top16, invwA)
+    # invwA (16.16) is == invw_real; FixedMul(top16, invwA) = top16*invw_real =
+    # topf*65536*invw_real = topf*scA/centerx (in 16.16). Then *centerx = topf*scA.
+    # (Must NOT use FixedDiv(top16,dA): top16 is a fixed_t (already <<16), so
+    #  (top16<<16) overflows AND the 65536 scale is wrong -- the height is in fixed,
+    #  the lateral ratio path divides a fixed by a fixed so its scales cancel, the
+    #  height path does not.)
+    lw   s7, %lo(WO_invwA)        # invwA 16.16
+    move a3, t4                   # top16
+    jal  FixedMulVU              # v1 = top16*invwA>>16 (16.16 ratio = topf*scA/centerx)
     nop
     move a3, v1
     jal  MulIntVU
@@ -273,9 +285,10 @@ DLWallCmd_Xform:
     sll  t8, s6, 16              # centery<<16
     sub  s0, t8, v1
     sw   s0, %lo(WO_ytA)
-    # ybA = (centery<<16) - centerx * FixedDiv(bot, dA)
-    move a3, t5
-    jal  FixedDivApply
+    # ybA = (centery<<16) - centerx * FixedMul(bot16, invwA)
+    lw   s7, %lo(WO_invwA)
+    move a3, t5                   # bot16
+    jal  FixedMulVU
     nop
     move a3, v1
     jal  MulIntVU
@@ -301,8 +314,10 @@ DLWallCmd_Xform:
     sll  t7, s3, 16
     sub  s0, t7, v1
     sw   s0, %lo(WO_sxB)
-    move a3, t4
-    jal  FixedDivApply
+    # ytB = (centery<<16) - centerx * FixedMul(top16, invwB)
+    lw   s7, %lo(WO_invwB)
+    move a3, t4                   # top16
+    jal  FixedMulVU
     nop
     move a3, v1
     jal  MulIntVU
@@ -310,8 +325,10 @@ DLWallCmd_Xform:
     sll  t8, s6, 16
     sub  s0, t8, v1
     sw   s0, %lo(WO_ytB)
-    move a3, t5
-    jal  FixedDivApply
+    # ybB = (centery<<16) - centerx * FixedMul(bot16, invwB)
+    lw   s7, %lo(WO_invwB)
+    move a3, t5                   # bot16
+    jal  FixedMulVU
     nop
     move a3, v1
     jal  MulIntVU
@@ -415,9 +432,9 @@ RecipFixVU:
     lsv  $v02, 0, 14, t9         # dl (low half)  -> vrcpl  (VSCRATCH+12 -> +14 = lo)
     lsv  $v03, 0, 12, t9         # dh (high half) -> vrcph
     vxor $v00, $v00, $v00
-    vrcph $v04, $v03.e0          # ri
-    vrcpl $v05, $v02.e0          # rf
-    vrcph $v04, $v00.e0          # finalize
+    vrcph $v04.e0, $v03.e0       # ri
+    vrcpl $v05.e0, $v02.e0       # rf
+    vrcph $v04.e0, $v00.e0       # finalize
     ssv  $v04, 0, 8,  t9         # park ri at VSCRATCH+8
     jr   ra
     ssv  $v05, 0, 10, t9         # (delay) park rf at VSCRATCH+10
