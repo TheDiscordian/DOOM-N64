@@ -1602,7 +1602,19 @@ void R_DrawPlanes (void)
 	if (pl->minx > pl->maxx)
 	    continue;
 
-	
+#ifdef N64
+	// GPU port Phase 3: the baked mesh leaves (DL_DrawMeshLeaves) draw the FLOORS
+	// when mesh-floors are on, so suppress the existing floor-visplane emit -- the
+	// mesh floors become the sole floor source (and the per-frame visplane
+	// tessellation they replace is the CPU cost Phase 3 targets). A floor visplane
+	// sits below the eye (height < viewz); ceilings (height >= viewz) + sky stay on
+	// the existing path (mesh ceilings are a later slice). NOTE slice-1: a raised
+	// floor above the eye is mis-classified as a ceiling here -- a known edge case.
+	if (n64_rdp_mesh && pl->picnum != skyflatnum && pl->height < viewz)
+	    continue;
+#endif
+
+
 	// sky flat
 	if (pl->picnum == skyflatnum)
 	{
