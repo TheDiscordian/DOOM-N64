@@ -1,7 +1,19 @@
 GPU-PORT mesh wall validation (same-session, run-bench.sh, 4117-frame E1M1 demo)
   full-RDP (per-column capture):  avg=20094 p95=40544 max=53452  (49.7 / 24.6 fps)
-  mesh+Z+suppression (static):    avg=16429 p95=27040 max=166454 (60.8 / 36.9 fps)
-  delta: avg -18.2%, p95 -33.3%   (max spike = one-time P_BakeWorldMesh at level load)
-ROMs: /tmp/mesh-timing.z64 (9449cbd...), /tmp/rdp-timing.z64
-Occlusion: FIXED by Z-buffer (e61c096); mesh displayed via fill-suppression (01537be).
-Remaining wall defect: close/grazing texture smear = no near-plane clip in DL_MeshDrawWalls.
+  mesh+Z+suppression (pre-clip):  avg=16429 p95=27040 max=166454 (60.8 / 36.9 fps)
+  mesh+Z FINAL (shipped, clips):  avg=16769 p95=28256 max=168013 (59.6 / 35.3 fps)
+  FINAL delta vs full-RDP: avg -16.6%, p95 -30.3%
+  clips cost vs pre-clip:  avg +2.1%, p95 +4.5% (near-plane clip emits straddlers
+                           that were dropped + per-wall clip math -- correctness trade)
+  also beats the planes-only ship (18908/30624): avg -11.3%, p95 -7.7%
+  (max spike = one-time P_BakeWorldMesh at level load, excluded from p95)
+ROMs: /tmp/mesh-final.z64 (final), /tmp/mesh-timing.z64 (pre-clip), /tmp/rdp-timing.z64
+Shipped wall phase on perf/rdp-renderer (NO PR):
+  e61c096 Z-buffer occlusion | 01537be display mesh (fill suppression)
+  473c512 perspective screen-edge clip (smear fix) | 1c73638 near-plane clip
+Remaining wall fidelity gaps (NOT occlusion/perf):
+  - texture S offset + T pegging not threaded (bake ignores textureoffset/rowoffset
+    + ML_DONTPEG* -> walls with offsets/bottom-peg mis-align vs software). UNCONFIRMED
+    visible; needs a clean A/B.
+  - grazing-angle S-precision smear (pre-existing, also hit the per-column path).
+Next perf lever: Phase 3 baked leaf-fan floors/ceilings (the plane tail).
