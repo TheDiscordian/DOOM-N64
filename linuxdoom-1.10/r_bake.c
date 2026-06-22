@@ -1,10 +1,12 @@
 // r_bake.c -- static world-space mesh bake (GPU port). See r_bake.h / Docs/GPU_PORT_PLAN.md.
 #include <libdragon.h>          // debugf
 #include "doomdef.h"
+#include "doomdata.h"    // NF_SUBSECTOR
 #include "z_zone.h"
-#include "r_state.h"     // lines, sides, sectors, numlines
+#include "r_state.h"     // lines, sides, sectors, nodes, subsectors, segs, num*
 #include "r_bake.h"
 #include <string.h>      // memset (visibility gate)
+#include <math.h>        // sqrt (leaf-bake validation probe)
 
 bake_wall_t*    bake_walls    = NULL;
 int             bake_numwalls = 0;
@@ -27,6 +29,225 @@ static void bake_quad (bake_wall_t* arr, int* n,
     w->x1 = x1; w->y1 = y1; w->x2 = x2; w->y2 = y2;
     w->zbot = zbot; w->ztop = ztop;
     w->texture = (short)tex; w->light = (short)light; w->line = (short)line;
+}
+
+// ===========================================================================
+// Floor/ceiling LEAF bake -- one convex polygon per BSP subsector.
+//
+// Vanilla nodes have no minisegs, so a subsector's segs only cover its WALL edges;
+// the boundary that runs along a BSP partition line has NO seg. A seg/centroid fan
+// would therefore gap along every partition edge. Instead, build each leaf's true
+// convex polygon by descending the BSP tree from the root and Sutherland-Hodgman
+// clipping a map-bounds quad by the partition half-plane of each branch taken; the
+// polygon that reaches a leaf IS that subsector's convex region.
+// ===========================================================================
+bake_leaf_t*    bake_leaves       = NULL;
+int             bake_numleaves    = 0;
+fixed_t       (*bake_leaf_verts)[2] = NULL;
+int             bake_numleafverts = 0;
+
+#define BAKE_LEAF_MAXV  48      // clipped-leaf vertex cap (BSP depth + the 4 bound edges)
+#define BAKE_MAXDEPTH   64      // BSP recursion guard
+
+typedef struct { double x, y; } bdpt_t;
+
+static int      bake_leafvert_cap = 0;
+static bdpt_t   bake_polypool[BAKE_MAXDEPTH][BAKE_LEAF_MAXV];  // per-depth scratch (flat stack)
+
+// Clip convex poly (n verts, map units) to ONE node partition half-plane.
+// R_PointOnSide: f(P) = (Py-ny)*ndx - (Px-nx)*ndy ; the front side (child 0) is f<0.
+static int bake_clip (const bdpt_t* in, int n, const node_t* nd, int keepFront, bdpt_t* out)
+{
+    double nx  = (double)nd->x  * (1.0 / 65536.0), ny  = (double)nd->y  * (1.0 / 65536.0);
+    double ndx = (double)nd->dx * (1.0 / 65536.0), ndy = (double)nd->dy * (1.0 / 65536.0);
+    int    i, m = 0;
+    for (i = 0; i < n; i++)
+    {
+        const bdpt_t* A = &in[i];
+        const bdpt_t* B = &in[(i + 1) % n];
+        double fA = (A->y - ny) * ndx - (A->x - nx) * ndy;
+        double fB = (B->y - ny) * ndx - (B->x - nx) * ndy;
+        int    inA = keepFront ? (fA <= 0.0) : (fA >= 0.0);
+        int    inB = keepFront ? (fB <= 0.0) : (fB >= 0.0);
+        if (inA && m < BAKE_LEAF_MAXV)
+            out[m++] = *A;
+        if (inA != inB && m < BAKE_LEAF_MAXV)
+        {
+            double t = fA / (fA - fB);
+            out[m].x = A->x + t * (B->x - A->x);
+            out[m].y = A->y + t * (B->y - A->y);
+            m++;
+        }
+    }
+    return m;
+}
+
+// Commit the clipped polygon of subsector ss into the leaf table + vert pool.
+static void bake_store_leaf (int ss, const bdpt_t* poly, int n)
+{
+    bake_leaf_t* lf;
+    sector_t*    sec;
+    int          k;
+
+    if ((unsigned)ss >= (unsigned)numsubsectors) return;
+    lf = &bake_leaves[ss];
+    if (lf->numverts != 0) return;                  // each leaf is reached once; guard anyway
+    if (n < 3 || subsectors[ss].numlines <= 0) return;
+    sec = subsectors[ss].sector;
+    if (!sec) sec = segs[subsectors[ss].firstline].frontsector;
+    if (!sec) return;
+    if (bake_numleafverts + n > bake_leafvert_cap)
+    {
+        debugf ("P_BakeLeafFans: WARN leaf-vert pool full (cap %d) at ss %d\n",
+                bake_leafvert_cap, ss);
+        return;
+    }
+    lf->firstvert  = bake_numleafverts;
+    lf->numverts   = (short)n;
+    lf->sector     = (short)(sec - sectors);
+    lf->floorpic   = (short)sec->floorpic;
+    lf->ceilingpic = (short)sec->ceilingpic;
+    for (k = 0; k < n; k++)
+    {
+        bake_leaf_verts[bake_numleafverts][0] = (fixed_t)(poly[k].x * 65536.0);
+        bake_leaf_verts[bake_numleafverts][1] = (fixed_t)(poly[k].y * 65536.0);
+        bake_numleafverts++;
+    }
+}
+
+// Recurse the BSP tree, clipping the running convex polygon by each branch's
+// partition. front-clip uses bake_polypool[depth]; after the front subtree returns
+// that scratch is free, so the back-clip reuses it (the parent `poly` is untouched).
+static void bake_leaf_walk (int bspnum, const bdpt_t* poly, int n, int depth)
+{
+    const node_t* nd;
+    bdpt_t*       buf;
+    int           m;
+
+    if (bspnum & NF_SUBSECTOR)
+    {
+        bake_store_leaf ((bspnum == -1) ? 0 : (bspnum & ~NF_SUBSECTOR), poly, n);
+        return;
+    }
+    if (bspnum < 0 || bspnum >= numnodes || depth >= BAKE_MAXDEPTH) return;
+    nd  = &nodes[bspnum];
+    buf = bake_polypool[depth];
+
+    m = bake_clip (poly, n, nd, 1, buf);            // FRONT half-space -> child 0
+    if (m >= 3) bake_leaf_walk (nd->children[0], buf, m, depth + 1);
+    m = bake_clip (poly, n, nd, 0, buf);            // BACK half-space  -> child 1
+    if (m >= 3) bake_leaf_walk (nd->children[1], buf, m, depth + 1);
+}
+
+// Validation helpers (capture-independent correctness check; map units).
+static int bake_leaf_convex_ok (const bake_leaf_t* lf)
+{
+    int i, n = lf->numverts, base = lf->firstvert, sign = 0;
+    for (i = 0; i < n; i++)
+    {
+        double ax = bake_leaf_verts[base + i][0] / 65536.0;
+        double ay = bake_leaf_verts[base + i][1] / 65536.0;
+        double bx = bake_leaf_verts[base + (i + 1) % n][0] / 65536.0;
+        double by = bake_leaf_verts[base + (i + 1) % n][1] / 65536.0;
+        double cx = bake_leaf_verts[base + (i + 2) % n][0] / 65536.0;
+        double cy = bake_leaf_verts[base + (i + 2) % n][1] / 65536.0;
+        double cr = (bx - ax) * (cy - by) - (by - ay) * (cx - bx);
+        if (cr >  0.5) { if (sign < 0) return 0; sign =  1; }
+        else if (cr < -0.5) { if (sign > 0) return 0; sign = -1; }
+    }
+    return 1;
+}
+
+// How far (map units) a point lies OUTSIDE a convex leaf -- max perpendicular
+// distance past any edge, 0 if inside. Winding sign taken from the polygon area, so
+// it works for CW or CCW. Used to tell nodebuilder rounding (a unit or two) from a
+// real clip error (segs far outside = wrong-side clip).
+static double bake_pt_outside_dist (const bake_leaf_t* lf, double px, double py)
+{
+    int    i, n = lf->numverts, base = lf->firstvert, ccw;
+    double area2 = 0.0, worst = 0.0;
+    for (i = 0; i < n; i++)
+    {
+        double ax = bake_leaf_verts[base + i][0] / 65536.0;
+        double ay = bake_leaf_verts[base + i][1] / 65536.0;
+        double bx = bake_leaf_verts[base + (i + 1) % n][0] / 65536.0;
+        double by = bake_leaf_verts[base + (i + 1) % n][1] / 65536.0;
+        area2 += ax * by - bx * ay;
+    }
+    ccw = (area2 > 0.0) ? 1 : -1;
+    for (i = 0; i < n; i++)
+    {
+        double ax = bake_leaf_verts[base + i][0] / 65536.0;
+        double ay = bake_leaf_verts[base + i][1] / 65536.0;
+        double bx = bake_leaf_verts[base + (i + 1) % n][0] / 65536.0;
+        double by = bake_leaf_verts[base + (i + 1) % n][1] / 65536.0;
+        double ex = bx - ax, ey = by - ay;
+        double len = sqrt (ex * ex + ey * ey);
+        double cr, sdist;
+        if (len < 1e-6) continue;
+        cr    = ex * (py - ay) - ey * (px - ax);    // >0 == left of edge
+        sdist = (cr / len) * ccw;                    // >0 == inside side
+        if (-sdist > worst) worst = -sdist;          // outside amount past this edge
+    }
+    return worst;
+}
+
+//
+// P_BakeLeafFans -- build the convex floor/ceiling polygon for every subsector and
+// validate it numerically (convexity + every seg endpoint inside-or-on its leaf, which
+// proves the clip kept the RIGHT side and the non-seg partition edges closed the leaf).
+// Z is not stored: per-frame transform reads live sector heights. PU_LEVEL.
+//
+static void P_BakeLeafFans (void)
+{
+    bdpt_t quad[4];
+    int    root, ss;
+    int    filled = 0, empty = 0, nonconvex = 0, segout = 0, maxv = 0;
+    double worstseg = 0.0;
+
+    bake_leaves = NULL; bake_numleaves = 0;
+    bake_leaf_verts = NULL; bake_numleafverts = 0; bake_leafvert_cap = 0;
+    if (numsubsectors <= 0)
+        return;
+
+    bake_leaves = Z_Malloc (sizeof(bake_leaf_t) * numsubsectors, PU_LEVEL, NULL);
+    memset (bake_leaves, 0, sizeof(bake_leaf_t) * numsubsectors);   // numverts=0 => empty slot
+    bake_leafvert_cap = numsubsectors * 16;                          // generous avg; overflow guarded
+    bake_leaf_verts   = Z_Malloc (sizeof(fixed_t) * 2 * bake_leafvert_cap, PU_LEVEL, NULL);
+
+    // Map-bounds quad (int16 map range) -- the root polygon the partitions carve down.
+    quad[0].x = -32768.0; quad[0].y = -32768.0;
+    quad[1].x =  32767.0; quad[1].y = -32768.0;
+    quad[2].x =  32767.0; quad[2].y =  32767.0;
+    quad[3].x = -32768.0; quad[3].y =  32767.0;
+
+    root = (numnodes > 0) ? (numnodes - 1) : -1;    // -1 == single-subsector map
+    bake_leaf_walk (root, quad, 4, 0);
+    bake_numleaves = numsubsectors;                 // slot count; some may be empty
+
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        const bake_leaf_t* lf  = &bake_leaves[ss];
+        const subsector_t* sub = &subsectors[ss];
+        int s;
+        if (lf->numverts == 0) { empty++; continue; }
+        filled++;
+        if (lf->numverts > maxv) maxv = lf->numverts;
+        if (!bake_leaf_convex_ok (lf)) nonconvex++;
+        for (s = 0; s < sub->numlines; s++)
+        {
+            const seg_t* sg = &segs[sub->firstline + s];
+            double d1 = bake_pt_outside_dist (lf, sg->v1->x / 65536.0, sg->v1->y / 65536.0);
+            double d2 = bake_pt_outside_dist (lf, sg->v2->x / 65536.0, sg->v2->y / 65536.0);
+            double d  = (d1 > d2) ? d1 : d2;
+            if (d > worstseg) worstseg = d;
+            if (d > 1.0) { segout++; break; }
+        }
+    }
+    debugf ("P_BakeLeafFans: %d subsectors, %d filled, %d empty, maxverts=%d, "
+            "nonconvex=%d, seg-outside(>1u)=%d worst=%dunits, vpool %d/%d\n",
+            numsubsectors, filled, empty, maxv, nonconvex, segout,
+            (int)(worstseg + 0.5), bake_numleafverts, bake_leafvert_cap);
 }
 
 //
@@ -120,6 +341,9 @@ void P_BakeWorldMesh (void)
 
     debugf ("P_BakeWorldMesh: baked %d wall quads (of %d linedefs)\n",
             bake_numwalls, numlines);
+
+    // Floor/ceiling convex leaf polygons (Phase 3 foundation; render wiring is next).
+    P_BakeLeafFans ();
 }
 
 //
