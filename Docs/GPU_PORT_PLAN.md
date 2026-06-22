@@ -117,18 +117,35 @@ won't initially, vs today's per-column projection.)
   trapezoid tessellation) — but **fix BAKEFAN to count the CLOSED hull**, not the
   open `numsegs-2`. Validate int16 map-coord range. Resolve "opaque tris ordered
   with no Z" on paper (answer: cull's back-to-front order via the non-Z rdpq path).
-- **Phase 1 — Bake + render the start subsector's single-sided walls** via the
-  hand-rolled transform behind `BENCH_FORCE_MESH=1` / `DL_MeshRouteOn()`; A/B the
-  start-room frame vs the software reference. Proves bake XY + transform + viewz
-  handling + combiner coexistence + the side-effect re-emit on the smallest surface.
-  (Resolve the key-clear/keyed-present integration here — Phase 1 is only isolatable
-  once the mesh quads share the present blit correctly.)
-- **Phase 2 — All walls** (top/mid/bottom, two-sided) driven by the cull walk; keep
-  the clip-array walk, drop only the fill; re-emit drawsegs + ML_MAPPED. Verify
-  sprites still occlude on a sprite-heavy frame.
-- **Phase 3 — Baked leaf-fan floors/ceilings** (close each leaf to its hull;
-  validate with PLANE_GEOM_TRACE, not the eye; reproduce per-band/corner plane
-  lighting). Sky stays CPU.
+- **Phase 1 — Bake + render the start subsector's single-sided walls** ✅ DONE.
+- **Phase 2 — All walls** ✅ DONE + VALIDATED (2026-06-22). Bake (`r_bake.c`
+  `P_BakeWorldMesh`, 491 quads on E1M1) + per-frame transform/cull/draw
+  (`DL_MeshDrawWalls`). Opaque occlusion via a **Z-buffer** (`e61c096`) — baking at
+  sidedef (not seg) granularity loses the BSP split that makes painter's order valid,
+  so whole quads mutually overlap → Z required (§Correction at top). SW fill suppressed
+  in the seg loop (`mesh_route`, `01537be`) so the mesh actually displays (the present
+  blits CI8 over the RDP — un-suppressed SW walls hid the mesh). Perspective screen-edge
+  clip (`473c512`, killed the close-wall texture shear) + near-plane clip of straddlers
+  (`1c73638`). **Measured: avg 16769µs / p95 28256µs = −16.6% / −30.3% vs full-RDP
+  per-column; beats the planes-only ship too.** OPEN (fidelity, not occlusion/perf):
+  texture `textureoffset`/`rowoffset`/`ML_DONTPEG*` not threaded (S=0, top-pegged →
+  misaligns vs software); grazing-angle S-precision smear.
+- **Phase 3 — Baked leaf-fan floors/ceilings** (NEXT). ⚠️ **THE HARD PART = closing
+  each subsector leaf to its convex polygon.** Vanilla nodes have NO minisegs, so
+  `segs[firstline..]` only cover the leaf's *wall* edges — the boundary that runs along
+  a BSP **partition line** has no seg. A centroid/seg fan therefore GAPS along every
+  partition edge (a scout suggested this — it is WRONG). Correct bake: walk the BSP
+  tree from the root; at each node accumulate the partition half-plane for the
+  front/back branch taken; at each `NF_SUBSECTOR` leaf, **Sutherland-Hodgman clip a
+  map-bounds quad by the accumulated half-planes** to get the true convex leaf polygon
+  (`node_t`/partition in r_defs.h + p_setup.c node load; R_RenderBSPNode descent in
+  r_bsp.c is the traversal model). Then fan-triangulate that closed polygon. Per frame:
+  mark visible subsectors during the cull walk (mirror `R_MeshMarkLine`/`bake_linevis`),
+  re-read live `sector->floorheight`/`ceilingheight` (doors/lifts move every tic — do
+  NOT cache the screen Y), transform corners, reuse the existing RDP plane-poly emit
+  (`DL_EmitPlanePoly`/`DL_FlushPlanePolys`, gouraud per-corner light, perspective on).
+  Skip `picnum==skyflatnum` leaves (sky stays on the CPU column path). Validate with a
+  geometry trace + A/B, not the eye.
 - **Phase 4 — Moving sectors:** the `T_MovePlane` dirty-mark + per-frame Z-patch;
   A/B a frame mid door/lift animation.
 - **Phase 5 — Transparent midtex + flash/colormap + end-state sweep:** masked
