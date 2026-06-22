@@ -2513,7 +2513,10 @@ int DL_PlanePolyOn(void)
 
 int DL_AnyRouteOn(void)
 {
-    return DL_WallRouteOn() || DL_PlaneRouteOn();
+    // Mesh walls also key-clear: their suppressed CPU columns must hold the key so
+    // the RDP mesh shows through the present, even in a mesh-walls-only config (no
+    // routed planes). Gating on walls/planes alone would leave the clear unarmed.
+    return DL_WallRouteOn() || DL_PlaneRouteOn() || DL_MeshRouteOn();
 }
 
 // --- per-record draw (the validated Stage-2 band/T/S machinery) -------------

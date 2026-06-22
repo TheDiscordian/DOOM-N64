@@ -299,6 +299,13 @@ void R_RenderSegLoop (void)
     // Masked mid-textures stay CPU (Stage 5); sky is a visplane drawn by
     // R_DrawPlanes (Stage 4), so the seg loop's wall tiers never carry sky.
     int			rdp_route = 0;
+    // GPU port: mesh_route suppresses the CPU wall fill WITHOUT the per-column RDP
+    // capture -- the static world mesh (DL_MeshDrawWalls, after the BSP walk) draws
+    // these walls on the RDP through the Z-buffer instead. Suppressed columns keep
+    // the key index (I_N64KeyClearView) so the mesh shows through the keyed present;
+    // ALL clip/visplane bookkeeping stays on the CPU exactly as the software path,
+    // since floors + sprites still consume it. Mutually exclusive with rdp_route.
+    int			mesh_route = 0;
 
     // Kill-switch FIRST, inline, before any cross-TU call. With the flag OFF
     // this short-circuits to the pre-RDP software seg loop with ZERO added
@@ -311,6 +318,10 @@ void R_RenderSegLoop (void)
     {
 	rdp_route = 1;
 	DL_RouteBeginSeg();
+    }
+    else if (n64_use_rdp_renderer && DL_MeshRouteOn())
+    {
+	mesh_route = 1;     // mesh draws these walls; suppress the CPU fill (no capture)
     }
 #if defined(DL_DEBUG_TRACE) && DL_DEBUG_TRACE
     // Diagnostic builds only (DL_TRACE=1): log every seg-loop invocation with
@@ -391,8 +402,9 @@ void R_RenderSegLoop (void)
 	    // itself; the masked path (R_RenderMaskedSegRange) computes its own
 	    // iscale/colormap later from maskedtexturecol. The zero-pixel
 	    // colfunc calls a routed mid tier can still make (yl > yh) return
-	    // at their count check before reading any of these.
-	    if (!rdp_route)
+	    // at their count check before reading any of these. mesh_route also
+	    // suppresses the fill, so its columns need none of this either.
+	    if (!rdp_route && !mesh_route)
 #endif
 	    {
 	    // calculate lighting
@@ -427,6 +439,11 @@ void R_RenderSegLoop (void)
 	    {
 		DL_RouteCapture(DL_TIER_MID, l_rw_x, yl, yh, l_rw_scale,
 				texturecolumn, (const void* const*)l_walllights);
+	    }
+	    else if (mesh_route && yl <= yh)
+	    {
+		// mesh draws this column on the RDP; suppress the CPU fill so the
+		// column keeps the key index and the mesh shows through the present.
 	    }
 	    else
 #endif
@@ -465,6 +482,10 @@ void R_RenderSegLoop (void)
 			DL_RouteCapture(DL_TIER_TOP, l_rw_x, yl, mid, l_rw_scale,
 					texturecolumn,
 					(const void* const*)l_walllights);
+		    }
+		    else if (mesh_route)
+		    {
+		        // mesh draws this top tier; suppress the CPU fill.
 		    }
 		    else
 #endif
@@ -515,6 +536,10 @@ void R_RenderSegLoop (void)
 			DL_RouteCapture(DL_TIER_BOT, l_rw_x, mid, yh, l_rw_scale,
 					texturecolumn,
 					(const void* const*)l_walllights);
+		    }
+		    else if (mesh_route)
+		    {
+		        // mesh draws this bottom tier; suppress the CPU fill.
 		    }
 		    else
 #endif
