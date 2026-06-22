@@ -2401,12 +2401,40 @@ void DL_MeshDrawWalls(void)
         fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);    // depth at v2
         fixed_t lA, lB;
         float   invwA, invwB, scA, scB, sxA, sxB, topf, botf, dxf, dyf;
+        float   sLen, sA, sB;
         int     xa, xb, lvl;
         rdp_wall_t w;
 
         if (bake_linevis && !bake_linevis[bw->line]) continue;  // BSP-occlusion gate
         if (dA < nearz && dB < nearz) continue;     // both behind near plane
-        if (dA < nearz || dB < nearz) continue;     // straddles -- clip is a TODO
+
+        // S runs 0..sLen (1 map unit = 1 texel) from corner A to corner B.
+        dxf  = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
+        dyf  = (float)(bw->y2 - bw->y1) * (1.0f / 65536.0f);
+        sLen = sqrtf(dxf * dxf + dyf * dyf);
+        sA   = 0.0f;
+        sB   = sLen;
+
+        // Near-plane CLIP the straddling corner: slide it along the edge to depth
+        // == nearz instead of dropping the whole wall (a dropped straddler flickers
+        // as a hole when the player hugs a wall). depth, the view-space XY, and S are
+        // all linear in the edge parameter u, so interpolate them at the crossing.
+        if (dA < nearz)
+        {
+            float u = (float)(nearz - dA) / (float)(dB - dA);
+            txa += (fixed_t)(u * (float)(txb - txa));
+            tya += (fixed_t)(u * (float)(tyb - tya));
+            dA   = nearz;
+            sA   = u * sLen;
+        }
+        else if (dB < nearz)
+        {
+            float u = (float)(nearz - dB) / (float)(dA - dB);
+            txb += (fixed_t)(u * (float)(txa - txb));
+            tyb += (fixed_t)(u * (float)(tya - tyb));
+            dB   = nearz;
+            sB   = sLen - u * sLen;
+        }
 
         lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
         lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
@@ -2423,8 +2451,6 @@ void DL_MeshDrawWalls(void)
 
         topf = (float)bw->ztop * (1.0f / 65536.0f) - viewzf;
         botf = (float)bw->zbot * (1.0f / 65536.0f) - viewzf;
-        dxf = (float)(bw->x2 - bw->x1) * (1.0f / 65536.0f);
-        dyf = (float)(bw->y2 - bw->y1) * (1.0f / 65536.0f);
 
         // Perspective-correct SCREEN-EDGE clip. The naive version clamped screen x
         // (xa/xb) but kept the off-screen corner's S/invw/Y -> a wall spanning past a
@@ -2432,10 +2458,9 @@ void DL_MeshDrawWalls(void)
         // smear). invw, S*invw, and screen Y are ALL linear in screen x for a planar
         // wall quad, so clip each edge by lerping every attribute at the clip x.
         {
-            float sLen = sqrtf(dxf * dxf + dyf * dyf);
             float ytA  = (float)centery - topf * scA, ybA = (float)centery - botf * scA;
             float ytB  = (float)centery - topf * scB, ybB = (float)centery - botf * scB;
-            float siA  = 0.0f * invwA, siB = sLen * invwB;  // S*invw at each corner
+            float siA  = sA * invwA, siB = sB * invwB;      // S*invw at each (clipped) corner
             float dsx  = sxB - sxA;
             float tL   = (sxA < 0.0f) ? (0.0f - sxA) / dsx : 0.0f;
             float tR   = (sxB > (float)(SCREENWIDTH - 1))
