@@ -50,6 +50,11 @@ extern int            bake_numleaves;
 extern fixed_t      (*bake_leaf_verts)[2]; // shared convex-polygon vertex pool (map x,y)
 extern int            bake_numleafverts;
 
+// Per-subsector visibility, set during the BSP walk (R_Subsector marks each leaf it
+// reaches) and consumed by DL_MeshDrawLeaves so only visible leaves transform/draw.
+// PU_LEVEL, sized numsubsectors. Reset each frame (R_MeshResetLeafVis).
+extern byte*          bake_leafvis;
+
 // Per-linedef visibility, set by the BSP walk (R_StoreWallRange marks a line whose
 // seg survives the solidsegs occlusion) and consumed by DL_MeshDrawWalls so only
 // occlusion-surviving walls emit. PU_LEVEL, sized numlines. Reset each frame.
@@ -63,5 +68,9 @@ void P_BakeWorldMesh (void);
 // before the BSP walk); R_MeshMarkLine flags a linedef visible (called from the walk).
 void R_MeshResetVis (void);
 void R_MeshMarkLine (int lineidx);
+
+// Per-subsector visibility gate for the floor/ceiling leaf fans (Phase 3).
+void R_MeshResetLeafVis (void);
+void R_MeshMarkSubsector (int ssidx);
 
 #endif

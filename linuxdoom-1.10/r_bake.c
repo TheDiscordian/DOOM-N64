@@ -45,6 +45,7 @@ bake_leaf_t*    bake_leaves       = NULL;
 int             bake_numleaves    = 0;
 fixed_t       (*bake_leaf_verts)[2] = NULL;
 int             bake_numleafverts = 0;
+byte*           bake_leafvis      = NULL;    // per-subsector visibility (PU_LEVEL)
 
 #define BAKE_LEAF_MAXV  48      // clipped-leaf vertex cap (BSP depth + the 4 bound edges)
 #define BAKE_MAXDEPTH   64      // BSP recursion guard
@@ -207,6 +208,7 @@ static void P_BakeLeafFans (void)
 
     bake_leaves = NULL; bake_numleaves = 0;
     bake_leaf_verts = NULL; bake_numleafverts = 0; bake_leafvert_cap = 0;
+    bake_leafvis = NULL;
     if (numsubsectors <= 0)
         return;
 
@@ -214,6 +216,8 @@ static void P_BakeLeafFans (void)
     memset (bake_leaves, 0, sizeof(bake_leaf_t) * numsubsectors);   // numverts=0 => empty slot
     bake_leafvert_cap = numsubsectors * 16;                          // generous avg; overflow guarded
     bake_leaf_verts   = Z_Malloc (sizeof(fixed_t) * 2 * bake_leafvert_cap, PU_LEVEL, NULL);
+    bake_leafvis      = Z_Malloc (numsubsectors, PU_LEVEL, NULL);
+    memset (bake_leafvis, 0, numsubsectors);
 
     // Map-bounds quad (int16 map range) -- the root polygon the partitions carve down.
     quad[0].x = -32768.0; quad[0].y = -32768.0;
@@ -364,4 +368,21 @@ void R_MeshMarkLine (int lineidx)
 {
     if (bake_linevis && (unsigned)lineidx < (unsigned)bake_numlines)
         bake_linevis[lineidx] = 1;
+}
+
+//
+// R_MeshResetLeafVis / R_MeshMarkSubsector -- per-subsector visibility for the floor/
+// ceiling leaf fans, mirroring the wall line-vis. Reset before the BSP walk; R_Subsector
+// marks each leaf it reaches so DL_MeshDrawLeaves transforms only visible leaves.
+//
+void R_MeshResetLeafVis (void)
+{
+    if (bake_leafvis)
+        memset (bake_leafvis, 0, numsubsectors);
+}
+
+void R_MeshMarkSubsector (int ssidx)
+{
+    if (bake_leafvis && (unsigned)ssidx < (unsigned)numsubsectors)
+        bake_leafvis[ssidx] = 1;
 }

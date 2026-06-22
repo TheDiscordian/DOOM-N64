@@ -39,6 +39,7 @@ rcsid[] = "$Id: r_bsp.c,v 1.4 1997/02/03 22:45:12 b1 Exp $";
 // State.
 #include "doomstat.h"
 #include "r_state.h"
+#include "r_bake.h"         // R_MeshMarkSubsector (GPU-port leaf visibility)
 
 //#include "r_local.h"
 
@@ -531,6 +532,10 @@ void R_Subsector (int num)
     frontsector = sub->sector;
     count = sub->numlines;
     line = &segs[sub->firstline];
+
+    // GPU port: this subsector survived the node prune + solidsegs occlusion, so its
+    // floor/ceiling leaf is (conservatively) visible -- mark it for DL_MeshDrawLeaves.
+    R_MeshMarkSubsector (num);
 
 #ifdef PVS_PROBE
     // Count-only PVS probe: this subsector was VISITED (survived the R_CheckBBox

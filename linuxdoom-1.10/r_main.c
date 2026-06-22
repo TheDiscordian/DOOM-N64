@@ -1082,6 +1082,7 @@ void R_RenderPlayerView (player_t* player)
     // per-column fill and back, so the wall raster cost is attributed
     // separately (the RDP renderer offloads SEG_RASTER, keeps BSP_WALK).
     R_MeshResetVis ();      // GPU port: clear per-line vis before the walk re-marks it
+    R_MeshResetLeafVis ();  // GPU port: clear per-subsector vis (floor/ceiling leaves)
 #ifdef N64_BENCH
     N64Bench_PhaseBegin(BPH_BSP_WALK);
     R_RenderBSPNode (numnodes-1);
