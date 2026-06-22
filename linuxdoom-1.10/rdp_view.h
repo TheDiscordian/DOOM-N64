@@ -258,6 +258,9 @@ int DL_WallRouteOn(void);
 // gates it (n64_rdp_mesh, set by BENCH_FORCE_MESH).
 extern int n64_rdp_mesh;
 extern int n64_rdp_mesh_floors; // Phase 3 floor leaves (BENCH_FORCE_MESH_FLOORS); OFF = perf loss
+#ifdef BENCH_FORCE_MESH_RSP
+extern int n64_rdp_mesh_rsp;    // RSP port (BENCH_FORCE_MESH_RSP); Phase 0 = DMA loopback probe only
+#endif
 extern int dl_zbuf_attached;    // set by i_video each frame (1 = z-image attached)
 int  DL_MeshRouteOn(void);
 void DL_MeshDrawWalls(void);

@@ -121,6 +121,13 @@ endif
 #   Docs/GPU_PORT_PLAN.md.
 ifeq ($(BENCH_FORCE_MESH),1)
 CFLAGS += -DBENCH_FORCE_MESH=1
+#   BENCH_FORCE_MESH_RSP=1    -> RSP port (Docs/RSP_PORT_PLAN.md). Phase 0 is a
+#   DMA-loopback PROBE only: it registers the rsp_dlwall overlay and round-trips
+#   bake_wall_t RDRAM->DMEM->RDRAM, logging "RSP-LOOPBACK: ... memcmp=0". It does
+#   NOT change the render path -- de-risks overlay/DMA/cache coherency for the math.
+ifeq ($(BENCH_FORCE_MESH_RSP),1)
+CFLAGS += -DBENCH_FORCE_MESH_RSP=1
+endif
 endif
 endif
 # BENCH_FORCE_SHOW_FPS=1: pin the on-screen SHOW-FPS counter ON at startup
@@ -283,6 +290,22 @@ DOOM_PLATFORM_SRCS = \
 
 DOOM_SRCS = $(DOOM_COMMON_SRCS) $(DOOM_PLATFORM_SRCS)
 OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)
+
+# RSP port (Docs/RSP_PORT_PLAN.md): the rsp_dlwall overlay is only linked when
+# BENCH_FORCE_MESH_RSP=1. Without the flag the .o is never built or linked, so the
+# default ROM stays byte-identical. The n64.mk %.o:%.S rule auto-detects the "rsp"
+# prefix and builds it as RSP ucode (the DEFINE_RSP_UCODE symbols resolve from here).
+#
+# IMPORTANT: the source MUST live under rsp/ (a DASH-FREE path), NOT linuxdoom-1.10/.
+# n64.mk derives the ucode symbol prefix with $(subst .,_,$(subst /,_,...)) but does
+# NOT substitute '-', while objcopy's _binary_* symbols mangle BOTH '.' and '-' to '_'.
+# A build path containing '-' (e.g. build/linuxdoom-1.10/) makes the two disagree, so
+# --redefine-sym silently no-ops and rsp_dlwall_text_start stays undefined at link.
+# build/rsp/rsp_dlwall.o => prefix build_rsp_rsp_dlwall, which matches. (Cannot fix in
+# n64.mk -- libdragon is read-only.)
+ifeq ($(BENCH_FORCE_MESH_RSP),1)
+OBJS += $(BUILD_DIR)/rsp/rsp_dlwall.o
+endif
 
 # Hot TUs at -O3 (appended after n64.mk's -O2; last -O wins).
 # Renderer (round 1), plus game logic, sound mixer, and MUS synth (round 2).

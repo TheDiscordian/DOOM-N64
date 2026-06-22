@@ -2224,6 +2224,12 @@ void D_DoomMain (void)
     n64_rdp_mesh_floors = 1;
     debugf("BENCH: MESH floors ON (baked leaf fans; perf-loss experiment)\n");
 #endif
+#ifdef BENCH_FORCE_MESH_RSP
+    // RSP port Phase 0: enable the one-time DMA-loopback probe (Docs/RSP_PORT_PLAN.md).
+    // Probe only -- does NOT change the mesh render path; logs RSP-LOOPBACK result.
+    n64_rdp_mesh_rsp = 1;
+    debugf("BENCH: MESH RSP ON (Phase 0 DMA-loopback probe)\n");
+#endif
 #endif
 #else
     n64_use_rdp_renderer = 0;

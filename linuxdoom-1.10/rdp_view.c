@@ -28,6 +28,10 @@
 
 #include <stdint.h>
 #include <string.h>
+#ifdef BENCH_FORCE_MESH_RSP
+#include <stdlib.h>             // free (RSP loopback probe)
+#include <malloc.h>             // memalign (cache-line aligned DMA buffers, RSP probe)
+#endif
 #include <math.h>
 
 #include <libdragon.h>
@@ -2363,6 +2367,35 @@ int n64_rdp_mesh_floors = 0;// BENCH_FORCE_MESH_FLOORS gate -- Phase 3 floor lea
 int dl_wall_z       = 0;    // mesh wall pass: draw with the Z-buffer (set in DL_Flush)
 int dl_zbuf_attached = 0;   // set by i_video each frame: 1 iff a z-image is attached
 
+// RSP wall-transform port (BENCH_FORCE_MESH_RSP gate; set in d_main.c). Phase 0 is a
+// DMA-loopback PROBE only -- it does NOT change the DL_MeshDrawWalls render path. It
+// de-risks overlay registration + 8-byte DMA alignment + cache coherency before any
+// transform math is written. See Docs/RSP_PORT_PLAN.md.
+//
+// EVERYTHING RSP-specific below is gated on BENCH_FORCE_MESH_RSP so the default build
+// neither links the rsp_dlwall overlay nor references its assembler symbols -- the
+// default ROM stays byte-identical. The flag (Makefile) also adds the overlay .o to
+// the ELF prereqs only when set.
+// The whole block is compiled out without the flag: no global storage, no overlay
+// reference -> the default ROM is byte-identical (verified by an A/B md5 of the
+// no-flag build). Nothing references n64_rdp_mesh_rsp without the flag, so the
+// header's extern is just an unused declaration there (no link symbol needed).
+#ifdef BENCH_FORCE_MESH_RSP
+int n64_rdp_mesh_rsp = 0;
+
+// The Phase 0 loopback overlay (rsp/rsp_dlwall.S). DEFINE_RSP_UCODE makes the
+// assembler-emitted rsp_dlwall_{text,data,meta}_* symbols available as an
+// rsp_ucode_t named rsp_dlwall, ready for rspq_overlay_register.
+DEFINE_RSP_UCODE(rsp_dlwall);
+
+// Overlay ID assigned by rspq_overlay_register (preshifted by 28; 0 = unregistered).
+static uint32_t rsp_dlwall_ovl_id = 0;
+
+// rspq command index for DLWallCmd_Loopback (must match the RSPQ_DefineCommand order
+// in rsp/rsp_dlwall.S -- it is the first and only command, index 0).
+#define DLWALL_CMD_LOOPBACK 0
+#endif
+
 // Map a record's per-edge INV_W (== 1/depth in map units, see dl_invw_k) to a
 // z-buffer depth in [0,1] (near = small). Z = depth / 32768 (the map extent),
 // clamped. Used only on the mesh wall pass (dl_wall_z).
@@ -2378,6 +2411,92 @@ int DL_MeshRouteOn(void)
         && bake_walls != NULL && bake_numwalls > 0;
 }
 
+// =====================================================================
+//  RSP PORT -- PHASE 0: DMA loopback probe. See Docs/RSP_PORT_PLAN.md Sec 4.
+// =====================================================================
+// Proves the rsp_dlwall overlay registers and round-trips bake_wall_t records
+// RDRAM->DMEM->RDRAM byte-identically. Runs ONCE (first DL_MeshDrawWalls call
+// under n64_rdp_mesh_rsp). Does NOT touch the render path -- pure log probe.
+//
+// Coherency mirrors the production plan: the source buffer is cache-flushed
+// (data_cache_hit_writeback) before the RSP reads it, and the destination is
+// invalidated (data_cache_hit_invalidate) after rspq_wait before the CPU reads
+// it back. Buffers are cache-line (16B) aligned so the writeback/invalidate hit
+// whole lines and the DMA's 8-byte alignment requirement is met.
+#ifdef BENCH_FORCE_MESH_RSP
+static void DL_RSPLoopbackProbe(void)
+{
+    static int registered = 0;
+    static int probed = 0;
+    uint32_t   ovl_id;
+    int        n, bytes;
+    void      *src, *dst;
+
+    if (probed)
+        return;
+    probed = 1;
+
+    if (!bake_walls || bake_numwalls <= 0)
+    {
+        debugf("RSP-LOOPBACK: SKIP (no baked walls)\n");
+        return;
+    }
+
+    // Register the overlay exactly once.
+    if (!registered)
+    {
+        ovl_id = rspq_overlay_register(&rsp_dlwall);
+        rsp_dlwall_ovl_id = ovl_id;
+        registered = 1;
+        debugf("RSP-LOOPBACK: overlay registered, id=0x%08lx\n",
+               (unsigned long)ovl_id);
+    }
+
+    // Loopback the first N records. Cap the byte count so it fits the RSP's 1 KiB
+    // DMEM scratch (LOOP_SCRATCH in rsp_dlwall.S) AND the 12-bit DMA width, and keep
+    // it 8-byte aligned. 32 * 28B = 896B < 1024.
+    n = bake_numwalls;
+    if (n > 32) n = 32;
+    bytes = n * (int)sizeof(bake_wall_t);
+    bytes = (bytes + 7) & ~7;                 // round up to 8-byte DMA granule
+
+    src = memalign(16, bytes);
+    dst = memalign(16, bytes);
+    if (!src || !dst)
+    {
+        if (src) free(src);
+        if (dst) free(dst);
+        debugf("RSP-LOOPBACK: SKIP (alloc failed)\n");
+        return;
+    }
+
+    memcpy(src, bake_walls, n * sizeof(bake_wall_t));
+    memset(dst, 0xA5, bytes);                 // poison so a no-op DMA can't pass
+
+    // Flush src so the RSP DMA reads CPU-written bytes; flush dst's poison too so a
+    // stale cached line can't masquerade as the round-tripped result on read-back.
+    data_cache_hit_writeback(src, bytes);
+    data_cache_hit_writeback(dst, bytes);
+
+    // Issue the loopback: a0 low-24 = (bytes-1) DMA size word (height==1),
+    // a1 = RDRAM src, a2 = RDRAM dst. Then block until the RSP finishes.
+    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_LOOPBACK,
+               (uint32_t)(bytes - 1),
+               PhysicalAddr(src),
+               PhysicalAddr(dst));
+    rspq_wait();
+
+    // Invalidate dst so the CPU re-reads the RSP-written bytes, not stale cache.
+    data_cache_hit_invalidate(dst, bytes);
+
+    int diff = memcmp(src, dst, n * sizeof(bake_wall_t));
+    debugf("RSP-LOOPBACK: N=%d bytes=%d memcmp=%d\n", n, bytes, diff ? diff : 0);
+
+    free(src);
+    free(dst);
+}
+#endif // BENCH_FORCE_MESH_RSP
+
 void DL_MeshDrawWalls(void)
 {
     int     i, nrec = 0;
@@ -2391,6 +2510,12 @@ void DL_MeshDrawWalls(void)
 
     if (!DL_MeshRouteOn())
         return;
+
+    // RSP port Phase 0: one-time DMA-loopback probe (logs only, no render effect).
+#ifdef BENCH_FORCE_MESH_RSP
+    if (n64_rdp_mesh_rsp)
+        DL_RSPLoopbackProbe();
+#endif
 
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
     vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
