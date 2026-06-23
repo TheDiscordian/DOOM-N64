@@ -41,6 +41,10 @@ rcsid[] = "$Id: r_things.c,v 1.5 1997/02/03 16:47:56 b1 Exp $";
 
 #include "doomstat.h"
 
+#ifdef N64_BENCH
+#include <libdragon.h>          // debugf -> ISViewer (sprite RDP-eligibility probe)
+#endif
+
 
 
 #define MINZ				(FRACUNIT*4)
@@ -1002,6 +1006,30 @@ void R_DrawSprite (vissprite_t* spr)
 		
     mfloorclip = clipbot;
     mceilingclip = cliptop;
+
+#ifdef N64_BENCH
+    // Stage 5 go/no-go: count sprites that a flat RDP quad could draw -- a NORMAL
+    // sprite (real colormap, no MF_TRANSLATION) whose every column is fully UNCLIPPED
+    // by walls (clipbot==viewheight && cliptop==-1). Those can be one alpha-keyed quad
+    // drawn over the walls (z-free, correct); clipped/fuzz/translated sprites stay CPU.
+    // The eligible fraction is the ceiling on what the sprite RDP port can offload.
+    {
+	static unsigned long spr_total = 0, spr_elig = 0;
+	int elig = (spr->colormap != NULL) && !(spr->mobjflags & MF_TRANSLATION);
+	if (elig)
+	{
+	    int xx;
+	    for (xx = spr->x1; xx <= spr->x2; xx++)
+		if (clipbot[xx] != viewheight || cliptop[xx] != -1) { elig = 0; break; }
+	}
+	spr_total++;
+	if (elig) spr_elig++;
+	if ((spr_total & 1023) == 0)
+	    debugf("SPR-ELIG total=%lu eligible=%lu pct=%lu\n",
+		   spr_total, spr_elig, spr_elig * 100 / spr_total);
+    }
+#endif
+
     R_DrawVisSprite (spr, spr->x1, spr->x2);
 }
 
