@@ -121,6 +121,12 @@ endif
 #   Docs/GPU_PORT_PLAN.md.
 ifeq ($(BENCH_FORCE_MESH),1)
 CFLAGS += -DBENCH_FORCE_MESH=1
+#   BENCH_FORCE_MESH_FLOORS=1 -> GPU port Phase 3: baked floor/ceiling leaf fans on the
+#   RDP (replacing the per-frame visplane tessellation). Needs the Z-buffer (occlude vs
+#   walls). Nested under BENCH_FORCE_MESH.
+ifeq ($(BENCH_FORCE_MESH_FLOORS),1)
+CFLAGS += -DBENCH_FORCE_MESH_FLOORS=1
+endif
 #   BENCH_FORCE_MESH_RSP=1    -> RSP port (Docs/RSP_PORT_PLAN.md). Phase 0 is a
 #   DMA-loopback PROBE only: it registers the rsp_dlwall overlay and round-trips
 #   bake_wall_t RDRAM->DMEM->RDRAM, logging "RSP-LOOPBACK: ... memcmp=0". It does

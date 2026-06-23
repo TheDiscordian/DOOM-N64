@@ -4294,7 +4294,7 @@ static void DL_DrawMeshLeaves(void)
 {
     fixed_t vcos, vsin;
     float   viewzf;
-    int     ss, drew = 0;
+    int     ss, drew = 0, surf;
 
     if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
         return;
@@ -4312,9 +4312,15 @@ static void DL_DrawMeshLeaves(void)
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
     }
 
-    // Pass 1: collect visible non-sky leaves + their DISTINCT floor flats, so each
-    // flat is uploaded to TMEM exactly ONCE this frame (the per-leaf upload spiked
-    // dlbuild to 150ms). Pass 2 then walks per flat.
+    // surf 0 = floor, surf 1 = ceiling. Same leaf polygon, drawn at the sector's
+    // floor/ceiling height with the floor/ceiling flat. Both passes share the Z-buffer
+    // (already paid) so adding ceilings costs only their tris, and lets us suppress the
+    // ceiling visplanes too (r_plane.c) -- the whole per-frame tessellation goes away.
+    for (surf = 0; surf < 2; surf++)
+    {
+    // Pass 1: collect visible non-sky leaves + their DISTINCT flats, so each flat is
+    // uploaded to TMEM exactly ONCE this frame (the per-leaf upload spiked dlbuild to
+    // 150ms). Pass 2 then walks per flat.
     {
         static int vis[2048];
         static int flats[256];
@@ -4324,12 +4330,13 @@ static void DL_DrawMeshLeaves(void)
         {
             bake_leaf_t* lf = &bake_leaves[ss];
             int fl, j, seen;
+            int pic = surf ? lf->ceilingpic : lf->floorpic;
             if (!bake_leafvis[ss]) continue;
             if (lf->numverts < 3 || lf->numverts > DL_LEAF_MAXV) continue;
-            if (lf->floorpic == skyflatnum) continue;       // sky floor stays CPU
+            if (pic == skyflatnum) continue;                // sky stays CPU
             if (nvis >= 2048) break;
             vis[nvis++] = ss;
-            fl = flattranslation[lf->floorpic];
+            fl = flattranslation[pic];
             seen = 0;
             for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
             if (!seen && nflat < 256) flats[nflat++] = fl;
@@ -4356,10 +4363,12 @@ static void DL_DrawMeshLeaves(void)
                 int          n, i, lvl, ubias, vbias, bad = 0;
                 uint32_t     prim;
 
-                if (flattranslation[lf->floorpic] != flatidx) continue;  // a different flat
+                if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx)
+                    continue;                               // a different flat
                 n   = lf->numverts;
                 sec = &sectors[lf->sector];
-                hf  = (float)sec->floorheight * (1.0f / 65536.0f) - viewzf;
+                hf  = (float)(surf ? sec->ceilingheight : sec->floorheight)
+                      * (1.0f / 65536.0f) - viewzf;
 
                 umin = 1.0e30f; vmin = 1.0e30f;
                 for (i = 0; i < n; i++)
@@ -4418,12 +4427,13 @@ static void DL_DrawMeshLeaves(void)
             }
         }
     }
+    }
 
     dl_leaf_tris = drew;
     {
         static unsigned lf_n = 0;
         if ((lf_n++ & 511) == 0)
-            debugf("MESH: leaf floor tris=%d\n", dl_leaf_tris);
+            debugf("MESH: leaf tris=%d (floor+ceil)\n", dl_leaf_tris);
     }
 }
 
