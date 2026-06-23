@@ -2821,15 +2821,22 @@ static void DL_RSPBatchProbe(void)
     vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
 
     // ---- pack every wall's input + the folded vis byte ----
+    // Most baked walls fail the BSP-occlusion gate each frame (~30 of ~475 visible on
+    // E1M1). The RSP checks BWI_vis BEFORE reading the heights (rsp_dlwall.S:584) and
+    // zeroes a skipped slot, and DL_MeshDrawWalls re-gates on bake_linevis before
+    // reading batch_out -- so a culled wall's geometry/height fields are never read.
+    // Skip the two sector-height lookups (the per-wall cost) for culled walls.
     for (i = 0; i < bake_numwalls; i++) {
         const bake_wall_t* bw = &bake_walls[i];
-        fixed_t ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
-                                      : sectors[bw->ztop_sec].floorheight;
-        fixed_t zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
-                                      : sectors[bw->zbot_sec].floorheight;
-        int vis = 1;
-        if (bake_linevis && !bake_linevis[bw->line]) vis = 0;
-        if (ztopz <= zbotz) vis = 0;
+        fixed_t ztopz = 0, zbotz = 0;
+        int vis = (bake_linevis && !bake_linevis[bw->line]) ? 0 : 1;
+        if (vis) {
+            ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                                  : sectors[bw->ztop_sec].floorheight;
+            zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                                  : sectors[bw->zbot_sec].floorheight;
+            if (ztopz <= zbotz) vis = 0;
+        }
         batch_in[i].x1 = bw->x1; batch_in[i].y1 = bw->y1;
         batch_in[i].x2 = bw->x2; batch_in[i].y2 = bw->y2;
         batch_in[i].ztop = ztopz; batch_in[i].zbot = zbotz;
