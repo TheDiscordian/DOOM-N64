@@ -317,15 +317,20 @@ void P_BakeWorldMesh (void)
     // sector carrying that tag (remote doors, switched lifts, raised floors). A
     // false positive (e.g. a light-only trigger) only renders a few extra walls in
     // software -- safe; a MISSED mover would ghost, so err toward exclusion.
-    // FULL-MESH (Z-buffer) MODE re-includes doors/movers: with the Z-buffer on
-    // (n64_rdp_mesh_floors) the mesh occludes correctly via depth and the colour-clear
-    // kills the ghost, so the movable walls go on the RDP too -- their software fill
-    // (seg_rast) comes off the CPU for NO extra Z payment (the Z is already paid for the
-    // floor leaves). This is the amortisation test: one Z cost, many CPU costs deleted.
+    // WALL-Z MODE re-includes doors/movers: with the wall Z-buffer on, the mesh
+    // occludes the moving walls correctly via depth and the per-frame colour-clear
+    // (ace12f2) kills the ghost, so the movable walls go on the RDP too -- their
+    // software fill (seg_rast) comes off the CPU for NO extra Z payment (the Z is
+    // already cleared every mesh frame). Door motion otherwise spikes seg_rast: the
+    // door's own faces + track sides render software, and an opening door reveals more
+    // geometry. dl_wall_z is now on for EVERY mesh build (4c6424d, not just floors), so
+    // gate on n64_rdp_mesh -- only the no-Z / non-mesh path still needs the exclusion.
     extern int n64_rdp_mesh_floors;
+    extern int n64_rdp_mesh;
+    (void)n64_rdp_mesh_floors;
     bake_sector_movable = Z_Malloc (numsectors, PU_STATIC, NULL);
     memset (bake_sector_movable, 0, numsectors);
-    if (!n64_rdp_mesh_floors)
+    if (!n64_rdp_mesh)
     for (i = 0; i < numlines; i++)
     {
         line_t* ld = &lines[i];
