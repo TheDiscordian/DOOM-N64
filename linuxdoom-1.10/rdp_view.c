@@ -2782,6 +2782,10 @@ static void DL_RSPBatchProbe(void)
     // context of the worst-sx wall this frame (for the residual-class log)
     int    wsx_i = -1, wsx_clip = 0; fixed_t wsx_dA = 0, wsx_dB = 0;
     int    n_clipped = 0, n_clip_mism = 0;
+    // The per-wall CPU reference + compare below is DIAGNOSTIC only (batch_out is
+    // already filled by the RSP). Off by default = the real offload: pack, dispatch,
+    // DMA back, done. Set to 1 (rebuild) to re-confirm RSP-vs-CPU agreement.
+    static int dl_rsp_verify = 0;
 
     if (!bake_walls || bake_numwalls <= 0)
         return;
@@ -2843,6 +2847,10 @@ static void DL_RSPBatchProbe(void)
                PhysicalAddr(batch_out), (uint32_t)bake_numwalls);
     rspq_wait();
     data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+
+    // Real offload: batch_out is ready -- skip the CPU reference recompute below
+    // (the per-frame double-work that masked the dlbuild win). Diagnostics only.
+    if (!dl_rsp_verify) { batch_frame++; return; }
 
     // ---- per-wall CPU reference + compare ----
     for (i = 0; i < bake_numwalls; i++) {
@@ -3067,34 +3075,16 @@ void DL_MeshDrawWalls(void)
             sB   = sLen - u * sLen;
         }
 
-        lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
-        lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
-
-        invwA = 65536.0f / (float)dA;               // == 1/depth_mapunits (dl_invw_k)
-        invwB = 65536.0f / (float)dB;
-        scA   = (float)centerx * invwA;             // px per map-unit height at v1
-        scB   = (float)centerx * invwB;
-
-        sxA = (float)centerx - (float)lA * (1.0f / 65536.0f) * scA;
-        sxB = (float)centerx - (float)lB * (1.0f / 65536.0f) * scB;
-        if (sxB <= sxA) continue;                   // back-facing / degenerate
-        if (sxB <= 0.0f || sxA >= (float)(SCREENWIDTH - 1)) continue;  // fully off-screen
-
-        topf = (float)ztopz * (1.0f / 65536.0f) - viewzf;
-        botf = (float)zbotz * (1.0f / 65536.0f) - viewzf;
-
-        // Screen Y of the top/bottom edge at each corner (CPU path).
-        ytA = (float)centery - topf * scA; ybA = (float)centery - botf * scA;
-        ytB = (float)centery - topf * scB; ybB = (float)centery - botf * scB;
-
 #ifdef BENCH_FORCE_MESH_RSP
-        // RSP CUTOVER (n64_rdp_mesh_rsp): render off the RSP's transform output --
-        // batch_out[] is already filled by DL_RSPBatchProbe at the top of this
-        // function. Override the per-corner geometry (the expensive divide + sx +
-        // screen-Y the RSP computed) with the RSP values; S stays CPU (cheap). The
-        // RSP near-clips/back-face/off-screen exactly as the CPU, so ro->emit is the
-        // authoritative draw flag. invw/sx/y are 16.16 -> float by /65536. Guarded by
-        // the compile flag (rsp_bwall_out_t/batch_out exist only in RSP builds).
+        // RSP CUTOVER (n64_rdp_mesh_rsp), Step B = the actual offload: when the RSP
+        // transform is authoritative, SKIP the CPU projection entirely (the two
+        // 65536/depth divides + the lat/sc/sx/screen-Y mults) and read the per-corner
+        // geometry straight from batch_out[] (filled by DL_RSPBatchProbe at the top).
+        // ro->emit is the authoritative draw flag (the RSP near-clips / back-face /
+        // off-screen culls exactly as the CPU else-branch below). S stays CPU (sA/sB
+        // above); dA/dB (the painter sort key) and ztopz/zbotz (downstream pegging) are
+        // already resolved above the projection. 16.16 -> float via /65536. Guarded by
+        // the flag (rsp_bwall_out_t/batch_out exist only in RSP builds).
         if (n64_rdp_mesh_rsp)
         {
             const rsp_bwall_out_t* ro = &batch_out[i];
@@ -3105,7 +3095,29 @@ void DL_MeshDrawWalls(void)
             ytA   = (float)ro->ytA   * k; ybA   = (float)ro->ybA   * k;
             ytB   = (float)ro->ytB   * k; ybB   = (float)ro->ybB   * k;
         }
+        else
 #endif
+        {
+            lA = FixedMul(tya, vcos) - FixedMul(txa, vsin);
+            lB = FixedMul(tyb, vcos) - FixedMul(txb, vsin);
+
+            invwA = 65536.0f / (float)dA;           // == 1/depth_mapunits (dl_invw_k)
+            invwB = 65536.0f / (float)dB;
+            scA   = (float)centerx * invwA;         // px per map-unit height at v1
+            scB   = (float)centerx * invwB;
+
+            sxA = (float)centerx - (float)lA * (1.0f / 65536.0f) * scA;
+            sxB = (float)centerx - (float)lB * (1.0f / 65536.0f) * scB;
+            if (sxB <= sxA) continue;               // back-facing / degenerate
+            if (sxB <= 0.0f || sxA >= (float)(SCREENWIDTH - 1)) continue;  // off-screen
+
+            topf = (float)ztopz * (1.0f / 65536.0f) - viewzf;
+            botf = (float)zbotz * (1.0f / 65536.0f) - viewzf;
+
+            // Screen Y of the top/bottom edge at each corner (CPU path).
+            ytA = (float)centery - topf * scA; ybA = (float)centery - botf * scA;
+            ytB = (float)centery - topf * scB; ybB = (float)centery - botf * scB;
+        }
 
         // Perspective-correct SCREEN-EDGE clip. The naive version clamped screen x
         // (xa/xb) but kept the off-screen corner's S/invw/Y -> a wall spanning past a
