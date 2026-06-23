@@ -4318,6 +4318,11 @@ static void DL_DrawMeshLeaves(void)
     fixed_t vcos, vsin;
     float   viewzf;
     int     ss, drew = 0, surf;
+    // Per-frame projection cache shared by the floor + ceiling passes (see below).
+    static float*         leaf_proj = NULL;     // 6 floats/pool-vert: cx,sc,cu,cv,cw,cz
+    static int            leaf_proj_cap = 0;
+    static unsigned char* leaf_cull = NULL;     // [numsubsectors]: 1 = skip this frame
+    static int            leaf_cull_cap = 0;
 
     if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
         return;
@@ -4335,10 +4340,84 @@ static void DL_DrawMeshLeaves(void)
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
     }
 
-    // surf 0 = floor, surf 1 = ceiling. Same leaf polygon, drawn at the sector's
-    // floor/ceiling height with the floor/ceiling flat. Both passes share the Z-buffer
-    // (already paid) so adding ceilings costs only their tris, and lets us suppress the
-    // ceiling visplanes too (r_plane.c) -- the whole per-frame tessellation goes away.
+    // Floor and ceiling share the SAME leaf polygon, so the per-vertex XY projection
+    // (the 65536/depth divide, sc, screen-x, u/v, invw, z) is IDENTICAL for both --
+    // only cy (the height term) differs. Transform each visible leaf's vertices ONCE
+    // here into a per-frame cache keyed by leaf vertex-pool index, then both surface
+    // passes below read it back + recompute the cheap cy. Halves the leaf transform
+    // (the float divide especially) for every non-sky-ceiling subsector.
+    {
+        extern int bake_numleafverts;
+        if (bake_numleafverts > leaf_proj_cap)
+        {
+            if (leaf_proj) Z_Free(leaf_proj);
+            leaf_proj_cap = bake_numleafverts;
+            leaf_proj = (float*)Z_Malloc(sizeof(float) * 6 * leaf_proj_cap, PU_STATIC, NULL);
+        }
+        if (numsubsectors > leaf_cull_cap)
+        {
+            if (leaf_cull) Z_Free(leaf_cull);
+            leaf_cull_cap = numsubsectors;
+            leaf_cull = (unsigned char*)Z_Malloc(numsubsectors, PU_STATIC, NULL);
+        }
+        if (!leaf_proj || !leaf_cull)
+            return;                         // alloc failed -> skip the floor mesh this frame
+    }
+
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        bake_leaf_t* lf = &bake_leaves[ss];
+        int     n = lf->numverts, i, ubias, vbias, bad = 0;
+        float   umin = 1.0e30f, vmin = 1.0e30f;
+
+        leaf_cull[ss] = 1;                              // default: not drawable this frame
+        if (!bake_leafvis[ss]) continue;
+        if (n < 3 || n > DL_LEAF_MAXV) continue;
+        if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum)
+            continue;                                   // both surfaces sky -> never drawn
+
+        for (i = 0; i < n; i++)
+        {
+            int     pv = lf->firstvert + i;
+            fixed_t wx = bake_leaf_verts[pv][0];
+            fixed_t wy = bake_leaf_verts[pv][1];
+            fixed_t tx = wx - viewx, ty = wy - viewy;
+            fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+            fixed_t lat;
+            float   invw, sc, sx, u, v, *pr;
+            if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: cull
+            lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+            invw = 65536.0f / (float)depth;
+            sc   = (float)centerx * invw;
+            sx   = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+            // X-only off-screen cull (cy is per-surface, checked in the draw pass).
+            if (sx < -2048.0f || sx > (float)SCREENWIDTH + 2048.0f) { bad = 1; break; }
+            u = (float)(wx >> FRACBITS);                // world-aligned flat texel (64-period)
+            v = (float)(wy >> FRACBITS);
+            pr = &leaf_proj[6 * pv];
+            pr[0] = sx; pr[1] = sc; pr[2] = u; pr[3] = v;
+            pr[4] = invw; pr[5] = DL_WallZ(invw);
+            if (u < umin) umin = u;
+            if (v < vmin) vmin = v;
+        }
+        if (bad) continue;
+
+        // Whole-64 period bias (mask-6 S wrap = sampling-identical); V halved for the
+        // 64->32 decimated tile. Both surfaces share these, so bake them in now.
+        ubias = IFLOOR(umin / 64.0f) * 64;
+        vbias = IFLOOR(vmin / 64.0f) * 64;
+        for (i = 0; i < n; i++)
+        {
+            float* pr = &leaf_proj[6 * (lf->firstvert + i)];
+            pr[2] -= (float)ubias;
+            pr[3]  = (pr[3] - (float)vbias) * 0.5f;
+        }
+        leaf_cull[ss] = 0;                              // transformed OK -> drawable
+    }
+
+    // surf 0 = floor, surf 1 = ceiling. Same leaf polygon at the sector's floor/ceiling
+    // height + flat. Both passes share the Z-buffer (already paid) so adding ceilings
+    // costs only their tris, and lets us suppress the ceiling visplanes too (r_plane.c).
     for (surf = 0; surf < 2; surf++)
     {
     // Pass 1: collect visible non-sky leaves + their DISTINCT flats, so each flat is
@@ -4354,9 +4433,8 @@ static void DL_DrawMeshLeaves(void)
             bake_leaf_t* lf = &bake_leaves[ss];
             int fl, j, seen;
             int pic = surf ? lf->ceilingpic : lf->floorpic;
-            if (!bake_leafvis[ss]) continue;
-            if (lf->numverts < 3 || lf->numverts > DL_LEAF_MAXV) continue;
-            if (pic == skyflatnum) continue;                // sky stays CPU
+            if (leaf_cull[ss]) continue;                // not visible / culled in xform pass
+            if (pic == skyflatnum) continue;            // sky stays CPU
             if (nvis >= 2048) break;
             vis[nvis++] = ss;
             fl = flattranslation[pic];
@@ -4380,58 +4458,28 @@ static void DL_DrawMeshLeaves(void)
             {
                 bake_leaf_t* lf = &bake_leaves[vis[vi]];
                 sector_t*    sec;
-                float        hf, umin, vmin;
-                float        cx[DL_LEAF_MAXV], cy[DL_LEAF_MAXV], cz[DL_LEAF_MAXV];
-                float        cu[DL_LEAF_MAXV], cv[DL_LEAF_MAXV], cw[DL_LEAF_MAXV];
-                int          n, i, lvl, ubias, vbias, bad = 0;
+                float        hf, cy[DL_LEAF_MAXV];
+                int          n, i, lvl, bad = 0;
                 uint32_t     prim;
 
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx)
-                    continue;                               // a different flat
+                    continue;                           // a different flat
                 n   = lf->numverts;
                 sec = &sectors[lf->sector];
                 hf  = (float)(surf ? sec->ceilingheight : sec->floorheight)
                       * (1.0f / 65536.0f) - viewzf;
 
-                umin = 1.0e30f; vmin = 1.0e30f;
+                // cy is the only per-surface term: recompute it (cheap) from the cached
+                // sc, and cull a leaf whose height projects far off-screen (a degenerate
+                // huge tri would stall the RDP -- the leaf path has no per-edge clip).
                 for (i = 0; i < n; i++)
                 {
-                    fixed_t wx = bake_leaf_verts[lf->firstvert + i][0];
-                    fixed_t wy = bake_leaf_verts[lf->firstvert + i][1];
-                    fixed_t tx = wx - viewx, ty = wy - viewy;
-                    fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
-                    fixed_t lat;
-                    float   invw, sc, u, v;
-                    if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: cull
-                    lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
-                    invw = 65536.0f / (float)depth;
-                    sc   = (float)centerx * invw;
-                    cx[i] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+                    float sc = leaf_proj[6 * (lf->firstvert + i) + 1];
                     cy[i] = (float)centery - hf * sc;
-                    // Not screen-clipped yet: cull a leaf projecting far off-screen so a
-                    // degenerate huge triangle can't stall the RDP (per-edge clip next).
-                    if (cx[i] < -2048.0f || cx[i] > (float)SCREENWIDTH + 2048.0f ||
-                        cy[i] < -2048.0f || cy[i] > (float)SCREENHEIGHT + 2048.0f)
+                    if (cy[i] < -2048.0f || cy[i] > (float)SCREENHEIGHT + 2048.0f)
                     { bad = 1; break; }
-                    cz[i] = DL_WallZ(invw);
-                    cw[i] = invw;
-                    u = (float)(wx >> FRACBITS);    // world-aligned flat texel (64-period)
-                    v = (float)(wy >> FRACBITS);
-                    cu[i] = u; cv[i] = v;
-                    if (u < umin) umin = u;
-                    if (v < vmin) vmin = v;
                 }
                 if (bad) continue;
-
-                // Whole-64 period bias (mask-6 S wrap = sampling-identical); V halved
-                // for the 64->32 decimated tile.
-                ubias = IFLOOR(umin / 64.0f) * 64;
-                vbias = IFLOOR(vmin / 64.0f) * 64;
-                for (i = 0; i < n; i++)
-                {
-                    cu[i] -= (float)ubias;
-                    cv[i]  = (cv[i] - (float)vbias) * 0.5f;
-                }
 
                 lvl = (255 - sec->lightlevel) >> 3;
                 if (lvl < 0) lvl = 0;
@@ -4441,9 +4489,12 @@ static void DL_DrawMeshLeaves(void)
 
                 for (i = 1; i < n - 1; i++)
                 {
-                    float t0[6] = { cx[0],   cy[0],   cz[0],   cu[0],   cv[0],   cw[0]   };
-                    float t1[6] = { cx[i],   cy[i],   cz[i],   cu[i],   cv[i],   cw[i]   };
-                    float t2[6] = { cx[i+1], cy[i+1], cz[i+1], cu[i+1], cv[i+1], cw[i+1] };
+                    float* p0 = &leaf_proj[6 * (lf->firstvert + 0)];
+                    float* pa = &leaf_proj[6 * (lf->firstvert + i)];
+                    float* pb = &leaf_proj[6 * (lf->firstvert + i + 1)];
+                    float t0[6] = { p0[0], cy[0],   p0[5], p0[2], p0[3], p0[4] };
+                    float t1[6] = { pa[0], cy[i],   pa[5], pa[2], pa[3], pa[4] };
+                    float t2[6] = { pb[0], cy[i+1], pb[5], pb[2], pb[3], pb[4] };
                     rdpq_triangle(&TRIFMT_ZBUF_TEX, t0, t1, t2);
                     drew++;
                 }
