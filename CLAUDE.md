@@ -143,21 +143,12 @@ pull — fixed in `0951cb3`).
   (p95 12960), with audio spiking to ~13000µs on the worst frames. Fingerprint
   (drawsegs=14 visplanes=8 vissprites=4 mean) drift means a real behaviour change.
 
-## Repro gotcha: "HUD flickers after death" is AFTER RESPAWN, not the corpse state
-The reported HUD/status-bar flicker happens **after the player respawns**, NOT while
-the corpse is on the ground. In single-player, dying + respawning **reloads the level**
-(`G_DoReborn`, g_game.c: `!netgame` -> `gameaction = ga_loadlevel`). So the bug is a
-**post-level-reload** state, reached only after kill -> reborn -> reload -> play resumes.
-
-A forced-death bench probe that only zeroes health and pins the corpse (never setting
-`playerstate = PST_REBORN`) tests the WRONG state and CANNOT reproduce this — it sits in
-the dead state forever. (This was mis-built twice; hours wasted.) A correct probe MUST
-**revive**: kill at tic T, then set `players[consoleplayer].playerstate = PST_REBORN` a
-few tics later so `ga_loadlevel` fires and play resumes — only then does the flicker
-appear. Suspected cause: `ST_Start`'s `st_firsttime` 2-frame ping-pong bar refresh
-(st_stuff.c N64 block) is consumed during the reload/wipe, leaving one CI8 buffer stale
-once normal drawing resumes -> the bar alternates. Verify the buffer divergence in the
-POST-resume frames, not the dead frames.
+## Past bugs — read before re-diagnosing
+Diagnosed bugs (symptom, dead ends already ruled out, root cause, repro, fix) live in
+[`Docs/PAST_BUGS.md`](Docs/PAST_BUGS.md). Check it before chasing a renderer/HUD bug — it
+exists so we don't run the same circles twice. (E.g. "HUD flickers after death" is a
+post-RESPAWN bug — single-player respawn reloads the level — so a forced-death probe MUST
+revive the player; a kill-only corpse probe tests the wrong state.)
 
 ## Capture & comparison reliability
 - **Software (RDP-off) output is deterministic — capture the reference ONCE and
