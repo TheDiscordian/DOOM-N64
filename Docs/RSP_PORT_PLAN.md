@@ -83,3 +83,35 @@ combiner/TLUT (set by `DL_Flush` after our ucode; our ucode issues no RDP comman
 cap (`DL_WALL_ARENA=512`).
 
 ## 6. First code = the Phase 0 loopback in `rsp_dlwall.S`.
+
+## 7. Phase 3 RESULT (Step B landed, `180b68d`) — offload works, but it's SYNC-BOUND
+The cutover is real now: `DL_MeshDrawWalls` skips the CPU projection (the two
+`65536/depth` divides + lat/sc/sx/screen-Y) under `n64_rdp_mesh_rsp` and renders straight
+off `batch_out`; `DL_RSPBatchProbe` is transform-only (the per-frame CPU-reference recompute
+is gated behind `dl_rsp_verify`, default 0). Render is identical to Phase 3a and the prior
+`emit_disagree=0` agreement holds.
+
+**Measured (BENCH_FORCE_MESH_RSP, E1M1 bench):** `dlbuild` mean 2931->2232us (-24%), p95
+8800->6432us. The projection genuinely left the CPU. **But total frame time is a NET LOSS:**
+avg 19783 vs pure-CPU-walls 17901, p95 33632 vs 30816, and min-frame 6000->9882us — a FIXED
+~1.9ms/frame overhead was added that swamps the ~700us the projection saved.
+
+**Root cause = synchronous dispatch.** `DL_RSPBatchProbe` does `rspq_write(... BATCH ...)`
+then `rspq_wait()` immediately — the CPU dispatches the transform and then BLOCKS on it, so
+there is zero CPU/RSP overlap. On top of the wait, every frame it (a) packs all `bake_numwalls`
+(~475 on E1M1) wall inputs even though only ~30 are visible, (b) `memset(batch_out, 0xA5, ...)`
+poisons the whole out arena (a diagnostic), and (c) writeback `batch_in` + invalidate
+`batch_out` across all 475 walls. That pack+coherency+wait is the ~1.9ms.
+
+**To make the offload WIN (next work, in order):**
+1. **Async overlap** — split `DL_RSPBatchProbe` into dispatch (pack + `rspq_write`, NO wait)
+   called early, and a collect (`rspq_wait` + invalidate) called just before the per-wall
+   loop reads `batch_out`. Do the CPU-side S (`sLen`/`sOff`/near-clip) + any other per-frame
+   prep in the window between, so the RSP transform overlaps real CPU work instead of stalling
+   it. This is the keystone — the whole point of the idle RSP.
+2. **Drop the per-frame `0xA5` poison** (diagnostic only) and **pack only BSP-visible walls**
+   (vis is already computed CPU-side) so the pack + coherency cost scales with ~30 drawn walls,
+   not ~475 baked ones.
+3. Re-measure: the offload only justifies itself once total beats the pure-CPU path, not just
+   `dlbuild` in isolation (measuring one phase in isolation hid the dispatch cost — same trap
+   as the early Z-buffer "loss").

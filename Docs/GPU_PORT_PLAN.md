@@ -158,3 +158,27 @@ won't initially, vs today's per-column projection.)
 - `BAKEFAN` closed-hull tri count vs the current trapezoid tessellation.
 - int16 posA range across the map (start room is safe; map-wide overflow possible).
 - The realized per-quad transform cost vs today's per-column projection.
+
+## Mesh-build perf lever map (verified 2026-06-23, BENCH_FORCE_MESH E1M1)
+Default mesh build baseline avg ~17.9k / p95 ~30.8k us. Per-phase tail (p95): `dlbuild`
+~9.8k (25%) > `bsp_walk` ~7.3k > `seg_rast` ~4.6k > `audio`/`planes`/`hud` ~4k each >
+`present`. What's actually movable, checked against the code (not guessed):
+- **`dlbuild` (the dominant lever) = ~95% EMIT, ~3-5% wall transform.** The emit's
+  LOAD_TILE/autosync thrash is **already fixed** — the Stage-3 per-texture dedup collapsed
+  it from ~150 band uploads/frame to ~30 (`mean_uploads=30`; the "~7.5ms" comment at
+  rdp_view.c:3555 is the historical PRE-dedup number). No cheap emit win remains. The real
+  `dlbuild` reduction is the **RSP transform port** (move projection to the idle RSP) — see
+  Docs/RSP_PORT_PLAN.md §7: Step B offloads it but is sync-bound; async overlap is the win.
+- **Floor leaves: the transform IS the lever (unlike walls).** Leaves have many verts so
+  the `65536/depth` divide dominates. Sharing the floor+ceiling projection (one transform,
+  not two — `df533b8`) cut floor-mesh `dlbuild` -25% / p95 -28%, moving floor-as-mesh from a
+  clear loss to ~parity. `BENCH_FORCE_MESH_FLOORS` still off by default pending the RSP win.
+- **Wall occlusion: the Z-buffer is the fix, and it's nearly free** — the z-image was already
+  allocated + cleared every mesh frame; `dl_wall_z` just needed decoupling from the floors
+  flag (`4c6424d`). Painter's nearest-corner sort can't be correct on overlapping-depth walls.
+- **`present` (~3.5ms) is irreducible** — the keyed CI8 blit + `display_get` vsync wait; not
+  a bug. **`bsp_walk`**: a precomputed-facing backface-skip before `R_AddLine` is the only
+  cheap candidate, but uncertain (DOOM already span-culls; risks dropping visible walls).
+- **Method note:** measuring one phase in isolation hides cross-phase cost (the RSP offload
+  dropped `dlbuild` but added more wait; the Z-buffer "loss" was the same trap). Always check
+  TOTAL frame time, not the single phase you touched.
