@@ -2837,7 +2837,10 @@ static void DL_RSPBatchProbe(void)
     }
 
     // ---- coherency: flush inputs + view block, poison + flush outputs ----
-    memset(batch_out, 0xA5, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
+    // The 0xA5 poison only exists so the verify-compare can spot cells the RSP failed
+    // to write; it's a 30KB/frame memset that's pure waste in the real offload.
+    if (dl_rsp_verify)
+        memset(batch_out, 0xA5, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
     data_cache_hit_writeback(vb, sizeof *vb);
     data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_in_t)));
     data_cache_hit_writeback(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
