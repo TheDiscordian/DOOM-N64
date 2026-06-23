@@ -179,6 +179,13 @@ Default mesh build baseline avg ~17.9k / p95 ~30.8k us. Per-phase tail (p95): `d
 - **`present` (~3.5ms) is irreducible** — the keyed CI8 blit + `display_get` vsync wait; not
   a bug. **`bsp_walk`**: a precomputed-facing backface-skip before `R_AddLine` is the only
   cheap candidate, but uncertain (DOOM already span-culls; risks dropping visible walls).
+- **`seg_rast` + DOOR MOTION (`3f19228`):** door/mover walls were excluded from the bake
+  (no-Z ghost era) and rendered software, so door MOTION spiked seg_rast to 12-17k us on the
+  worst frames. Now that wall-Z is on by default, re-including them in the Z-mesh (gate the
+  exclusion on `n64_rdp_mesh`, not the floors flag) killed those spikes (16867->6945,
+  12859->2927) and dropped seg_rast mean 2645->1587us; total -3.2% avg. The residual seg_rast
+  is the BSP-occlusion setup for visible segs (needed for the mesh's vis gate) -- only the big
+  BSP-walk-as-visibility replacement reduces that further.
 - **Method note:** measuring one phase in isolation hides cross-phase cost (the RSP offload
   dropped `dlbuild` but added more wait; the Z-buffer "loss" was the same trap). Always check
   TOTAL frame time, not the single phase you touched.
