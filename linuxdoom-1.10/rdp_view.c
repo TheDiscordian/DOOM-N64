@@ -2760,6 +2760,13 @@ static rsp_bwall_out_t batch_out_buf[DL_WALL_ARENA] __attribute__((aligned(16)))
 static rsp_bwall_in_t  *batch_in  = batch_in_buf;
 static rsp_bwall_out_t *batch_out = batch_out_buf;
 
+// COMPACTION: only the BSP-visible walls are packed (densely, slots 0..batch_nvis-1)
+// and dispatched, so the pack + cache-coherency + RSP loop scale with the ~30 drawn
+// walls, not the ~475 baked ones. batch_vislist[j] = the original bake_walls index of
+// dense slot j; consumers (DL_MeshDrawWalls + the dl_rsp_verify compare) walk the list.
+static int batch_vislist[DL_WALL_ARENA];
+static int batch_nvis = 0;
+
 // Worst deltas observed across the whole run (for the end-of-demo report).
 static float  batch_run_worst_sx   = 0.0f;
 static float  batch_run_worst_sy   = 0.0f;
@@ -2769,7 +2776,7 @@ static unsigned batch_frame = 0;
 
 static void DL_RSPBatchProbe(void)
 {
-    int i;
+    int i, jv;
     fixed_t vcos, vsin;
     const fixed_t nearz = 4 << FRACBITS;
     float viewzf;
@@ -2820,64 +2827,71 @@ static void DL_RSPBatchProbe(void)
     vb->vcos = vcos;   vb->vsin = vsin;
     vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
 
-    // ---- pack every wall's input + the folded vis byte ----
-    // Most baked walls fail the BSP-occlusion gate each frame (~30 of ~475 visible on
-    // E1M1). The RSP checks BWI_vis BEFORE reading the heights (rsp_dlwall.S:584) and
-    // zeroes a skipped slot, and DL_MeshDrawWalls re-gates on bake_linevis before
-    // reading batch_out -- so a culled wall's geometry/height fields are never read.
-    // Skip the two sector-height lookups (the per-wall cost) for culled walls.
+    // ---- COMPACTION: pack ONLY the BSP-visible walls, densely ----
+    // Most baked walls fail the occlusion gate each frame (~30 of ~475 on E1M1). Pack
+    // only the survivors into slots 0..batch_nvis-1 and record their original index in
+    // batch_vislist[]. The CPU pre-applies the vis gate (bake_linevis && ztop>zbot) that
+    // the RSP used to fold, so every packed wall has vis=1; the RSP still does its own
+    // near-clip / back-face / off-screen culls (BWO_emit). The pack + coherency + RSP
+    // loop now scale with the drawn set, not the whole bake.
+    batch_nvis = 0;
     for (i = 0; i < bake_numwalls; i++) {
         const bake_wall_t* bw = &bake_walls[i];
-        fixed_t ztopz = 0, zbotz = 0;
-        int vis = (bake_linevis && !bake_linevis[bw->line]) ? 0 : 1;
-        if (vis) {
-            ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
-                                  : sectors[bw->ztop_sec].floorheight;
-            zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
-                                  : sectors[bw->zbot_sec].floorheight;
-            if (ztopz <= zbotz) vis = 0;
-        }
-        batch_in[i].x1 = bw->x1; batch_in[i].y1 = bw->y1;
-        batch_in[i].x2 = bw->x2; batch_in[i].y2 = bw->y2;
-        batch_in[i].ztop = ztopz; batch_in[i].zbot = zbotz;
-        batch_in[i].vis = vis; batch_in[i].pad0 = 0;
+        fixed_t ztopz, zbotz;
+        int j;
+        if (bake_linevis && !bake_linevis[bw->line]) continue;      // BSP-occluded
+        ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                              : sectors[bw->ztop_sec].floorheight;
+        zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                              : sectors[bw->zbot_sec].floorheight;
+        if (ztopz <= zbotz) continue;                               // step closed
+        j = batch_nvis++;
+        batch_vislist[j] = i;
+        batch_in[j].x1 = bw->x1; batch_in[j].y1 = bw->y1;
+        batch_in[j].x2 = bw->x2; batch_in[j].y2 = bw->y2;
+        batch_in[j].ztop = ztopz; batch_in[j].zbot = zbotz;
+        batch_in[j].vis = 1; batch_in[j].pad0 = 0;
     }
 
     // ---- coherency: flush inputs + view block, poison + flush outputs ----
-    // The 0xA5 poison only exists so the verify-compare can spot cells the RSP failed
-    // to write; it's a 30KB/frame memset that's pure waste in the real offload.
+    // Only the dense [0,batch_nvis) range is live this frame. The 0xA5 poison only
+    // exists so the verify-compare can spot cells the RSP failed to write; pure waste
+    // in the real offload.
     if (dl_rsp_verify)
-        memset(batch_out, 0xA5, (size_t)bake_numwalls * sizeof(rsp_bwall_out_t));
+        memset(batch_out, 0xA5, (size_t)batch_nvis * sizeof(rsp_bwall_out_t));
     data_cache_hit_writeback(vb, sizeof *vb);
-    data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_in_t)));
-    data_cache_hit_writeback(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+    if (batch_nvis > 0) {
+        data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_in_t)));
+        data_cache_hit_writeback(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
 
-    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
-               PhysicalAddr(vb), PhysicalAddr(batch_in),
-               PhysicalAddr(batch_out), (uint32_t)bake_numwalls);
-    rspq_wait();
-    data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+        rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
+                   PhysicalAddr(vb), PhysicalAddr(batch_in),
+                   PhysicalAddr(batch_out), (uint32_t)batch_nvis);
+        rspq_wait();
+        data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
+    }
 
     // Real offload: batch_out is ready -- skip the CPU reference recompute below
     // (the per-frame double-work that masked the dlbuild win). Diagnostics only.
     if (!dl_rsp_verify) { batch_frame++; return; }
 
-    // ---- per-wall CPU reference + compare ----
-    for (i = 0; i < bake_numwalls; i++) {
+    // ---- per-wall CPU reference + compare (over the dense vis-list) ----
+    for (jv = 0; jv < batch_nvis; jv++) {
+        int i = batch_vislist[jv];
         const bake_wall_t* bw = &bake_walls[i];
-        const rsp_bwall_out_t* ro = &batch_out[i];
+        const rsp_bwall_out_t* ro = &batch_out[jv];
         fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
         fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
         fixed_t dA  = FixedMul(txa, vcos) + FixedMul(tya, vsin);
         fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);
-        fixed_t ztopz = batch_in[i].ztop, zbotz = batch_in[i].zbot;
+        fixed_t ztopz = batch_in[jv].ztop, zbotz = batch_in[jv].zbot;
         fixed_t dA_raw = dA, dB_raw = dB;
         int cpu_emit = 1, clipped = 0;
         float invwA, invwB, scA, scB, sxA, sxB, topf, botf;
         float ytA, ybA, ytB, ybB;
 
         // ---- CPU emit decision, mirroring DL_MeshDrawWalls up to the off-screen test ----
-        if (!batch_in[i].vis) cpu_emit = 0;
+        if (!batch_in[jv].vis) cpu_emit = 0;
         else if (dA < nearz && dB < nearz) cpu_emit = 0;
 
         if (cpu_emit) {
@@ -2994,7 +3008,7 @@ static void DL_RSPBatchProbe(void)
 
 void DL_MeshDrawWalls(void)
 {
-    int     i, nrec = 0;
+    int     i, idx, loopn, nrec = 0;
     fixed_t vcos, vsin;
     float   viewzf;
     const fixed_t nearz = 4 << FRACBITS;
@@ -3021,8 +3035,21 @@ void DL_MeshDrawWalls(void)
     vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
     viewzf = (float)viewz * (1.0f / 65536.0f);
 
-    for (i = 0; i < bake_numwalls; i++)
+    // The RSP path walks only the dense vis-list (batch_nvis walls packed by
+    // DL_RSPBatchProbe); the CPU path walks every baked wall and vis-gates inline.
+#ifdef BENCH_FORCE_MESH_RSP
+    loopn = n64_rdp_mesh_rsp ? batch_nvis : bake_numwalls;
+#else
+    loopn = bake_numwalls;
+#endif
+    for (idx = 0; idx < loopn; idx++)
     {
+#ifdef BENCH_FORCE_MESH_RSP
+        i = n64_rdp_mesh_rsp ? batch_vislist[idx] : idx;
+#else
+        i = idx;
+#endif
+        {
         const bake_wall_t* bw = &bake_walls[i];
         fixed_t txa = bw->x1 - viewx, tya = bw->y1 - viewy;
         fixed_t txb = bw->x2 - viewx, tyb = bw->y2 - viewy;
@@ -3097,7 +3124,7 @@ void DL_MeshDrawWalls(void)
         // the flag (rsp_bwall_out_t/batch_out exist only in RSP builds).
         if (n64_rdp_mesh_rsp)
         {
-            const rsp_bwall_out_t* ro = &batch_out[i];
+            const rsp_bwall_out_t* ro = &batch_out[idx];   // dense vis-list slot
             const float k = 1.0f / 65536.0f;
             if (!ro->emit) continue;
             invwA = (float)ro->invwA * k; invwB = (float)ro->invwB * k;
@@ -3205,6 +3232,7 @@ void DL_MeshDrawWalls(void)
             mdepth[nrec] = (dA < dB) ? dA : dB;     // nearest corner = sort key
             nrec++;
         }
+        }   // close the per-wall block opened after the vis-list index resolve
     }
 
     // Painter's order (no Z-buffer): emit FAR-to-NEAR so a nearer wall overwrites a
