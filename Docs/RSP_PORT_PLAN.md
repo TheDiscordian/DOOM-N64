@@ -103,15 +103,21 @@ there is zero CPU/RSP overlap. On top of the wait, every frame it (a) packs all 
 poisons the whole out arena (a diagnostic), and (c) writeback `batch_in` + invalidate
 `batch_out` across all 475 walls. That pack+coherency+wait is the ~1.9ms.
 
-**To make the offload WIN (next work, in order):**
-1. **Async overlap** — split `DL_RSPBatchProbe` into dispatch (pack + `rspq_write`, NO wait)
-   called early, and a collect (`rspq_wait` + invalidate) called just before the per-wall
-   loop reads `batch_out`. Do the CPU-side S (`sLen`/`sOff`/near-clip) + any other per-frame
-   prep in the window between, so the RSP transform overlaps real CPU work instead of stalling
-   it. This is the keystone — the whole point of the idle RSP.
-2. **Drop the per-frame `0xA5` poison** (diagnostic only) and **pack only BSP-visible walls**
-   (vis is already computed CPU-side) so the pack + coherency cost scales with ~30 drawn walls,
-   not ~475 baked ones.
-3. Re-measure: the offload only justifies itself once total beats the pure-CPU path, not just
-   `dlbuild` in isolation (measuring one phase in isolation hid the dispatch cost — same trap
-   as the early Z-buffer "loss").
+**To make the offload WIN — progress + the remaining lever:**
+- DONE `b43c9cc`: dropped the per-frame `0xA5` output poison (diagnostic only) → −1700us/frame.
+- DONE `8950cfa`: skip the sector-height lookups in the pack for BSP-culled walls.
+- These took the RSP path from +17% to +4% over pure-CPU. The remaining ~1.9ms is structural.
+
+**The lever is COMPACTION, not async overlap.** Re-analysis: the fixed overhead is the
+per-frame pack + cache-coherency + RSP loop over ALL ~475 baked walls. Async overlap (dispatch
+early, wait late, CPU prep between) can only hide the CPU-side prep of the ~30 DRAWN walls — a
+provably small window vs the 475-wall RSP round-trip — so it is NOT the lever. The win is to
+**dispatch only the BSP-visible walls** (~30, not 475): build a dense vis-list in
+`DL_RSPBatchProbe`, pack + `rspq_write` only `nvis`, and have the consumers index the dense
+`batch_out[j]` via the vis-list — `DL_MeshDrawWalls`'s RSP draw loop AND the `dl_rsp_verify`
+compare loop both currently index `batch_out[i]` by original wall index, so both must switch to
+the vis-list. That cuts pack + coherency + RSP loop ~15×. No visual A/B is needed: correctness
+is verified by `dl_rsp_verify=1` → `emit_disagree=0` (the RSP emits exactly the CPU's wall set)
+plus the bench total.
+- Re-measure rule: total must beat the pure-CPU path, not just `dlbuild` in isolation (measuring
+  one phase hid the dispatch cost — same trap as the early Z-buffer "loss").
