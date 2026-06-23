@@ -3012,6 +3012,7 @@ void DL_MeshDrawWalls(void)
         fixed_t dB  = FixedMul(txb, vcos) + FixedMul(tyb, vsin);    // depth at v2
         fixed_t lA, lB;
         float   invwA, invwB, scA, scB, sxA, sxB, topf, botf, dxf, dyf;
+        float   ytA, ybA, ytB, ybB;     // screen Y of top/bot edge at each corner
         float   sLen, sA, sB;
         int     xa, xb, lvl;
         fixed_t ztopz, zbotz;
@@ -3082,14 +3083,36 @@ void DL_MeshDrawWalls(void)
         topf = (float)ztopz * (1.0f / 65536.0f) - viewzf;
         botf = (float)zbotz * (1.0f / 65536.0f) - viewzf;
 
+        // Screen Y of the top/bottom edge at each corner (CPU path).
+        ytA = (float)centery - topf * scA; ybA = (float)centery - botf * scA;
+        ytB = (float)centery - topf * scB; ybB = (float)centery - botf * scB;
+
+#ifdef BENCH_FORCE_MESH_RSP
+        // RSP CUTOVER (n64_rdp_mesh_rsp): render off the RSP's transform output --
+        // batch_out[] is already filled by DL_RSPBatchProbe at the top of this
+        // function. Override the per-corner geometry (the expensive divide + sx +
+        // screen-Y the RSP computed) with the RSP values; S stays CPU (cheap). The
+        // RSP near-clips/back-face/off-screen exactly as the CPU, so ro->emit is the
+        // authoritative draw flag. invw/sx/y are 16.16 -> float by /65536. Guarded by
+        // the compile flag (rsp_bwall_out_t/batch_out exist only in RSP builds).
+        if (n64_rdp_mesh_rsp)
+        {
+            const rsp_bwall_out_t* ro = &batch_out[i];
+            const float k = 1.0f / 65536.0f;
+            if (!ro->emit) continue;
+            invwA = (float)ro->invwA * k; invwB = (float)ro->invwB * k;
+            sxA   = (float)ro->sxA   * k; sxB   = (float)ro->sxB   * k;
+            ytA   = (float)ro->ytA   * k; ybA   = (float)ro->ybA   * k;
+            ytB   = (float)ro->ytB   * k; ybB   = (float)ro->ybB   * k;
+        }
+#endif
+
         // Perspective-correct SCREEN-EDGE clip. The naive version clamped screen x
         // (xa/xb) but kept the off-screen corner's S/invw/Y -> a wall spanning past a
         // screen edge had its texture SHEARED across the visible span (the close-wall
         // smear). invw, S*invw, and screen Y are ALL linear in screen x for a planar
         // wall quad, so clip each edge by lerping every attribute at the clip x.
         {
-            float ytA  = (float)centery - topf * scA, ybA = (float)centery - botf * scA;
-            float ytB  = (float)centery - topf * scB, ybB = (float)centery - botf * scB;
             float siA  = sA * invwA, siB = sB * invwB;      // S*invw at each (clipped) corner
             float dsx  = sxB - sxA;
             float tL   = (sxA < 0.0f) ? (0.0f - sxA) / dsx : 0.0f;
