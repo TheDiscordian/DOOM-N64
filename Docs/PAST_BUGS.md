@@ -55,13 +55,29 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 - **Resolution:** FIXED (st_stuff.c refresh mask + ST_doRefresh sync, i_video_n64.c
   `I_N64SyncRegionToOtherBuffer`).
 
-## OPEN: mesh walls render geometry that is behind them (usually mid-screen)
+## FIXED: mesh walls render geometry that is behind them (usually mid-screen)
 - **Symptom (Ryan):** some geometry, usually in the middle, renders what's behind it.
-- **Root cause:** the wall painter's-order sort (`DL_MeshDrawWalls`, sort key =
-  min-corner depth) is imperfect for walls with crossing/overlapping depth — the classic
-  case a Z-buffer exists to solve. Worse at the low corpse viewpoint.
-- **Resolution:** OPEN. Proper fix is exact per-pixel occlusion = the Z-buffer (the full
-  mesh + Z direction). A no-Z painter's sort cannot be fully correct here.
+- **Root cause:** `DL_MeshDrawWalls` painted walls in painter's order sorted by the
+  NEAREST corner depth (`min(dA,dB)`). That key is only an approximation: two walls whose
+  depth ranges overlap mis-order in the columns where the far-by-nearest-corner wall is
+  actually in front, so it gets overwritten and the geometry behind it shows through.
+  Worse at the low corpse viewpoint. The Z-buffer infrastructure already existed
+  (`dl_zbuf`, allocated + attached + `rdpq_clear_z` every mesh frame, i_video_n64.c) but
+  `dl_wall_z` gated wall z-test on `n64_rdp_mesh_floors` too -- on the wrong premise that
+  "walls alone occlude correctly via the painter's sort" (rdp_view.c comment). The user's
+  report disproves that premise.
+- **Fix:** `dl_wall_z = n64_rdp_mesh && dl_zbuf_attached` (rdp_view.c) -- enable per-pixel
+  wall z-test/write whenever the z-image is attached, independent of the floors flag. The
+  z-image is already cleared every mesh frame, so only the per-pixel z cost is added: avg
+  17513->17901us (+2.2%), p95 29664->30816us (+3.9%) on the E1M1 mesh bench.
+- **Verify limitation:** the artifact is viewpoint-dependent and the frozen BENCH_MARK
+  frames (every 128) do not land on a viewpoint that exhibits it prominently, so a clean
+  static A/B can't show the specific before/after (the diff at markers is dominated by
+  capture present-timing + sub-pixel edge sampling). What WAS confirmed from the captures:
+  the wall-z build introduces no regression / z-fighting across the inspected frames. The
+  fix is mechanically the correct one for the described class (per-pixel z-test prevents a
+  far wall overwriting a near one). Final visual confirmation is the interactive/normal run.
+- **Resolution:** FIXED (rdp_view.c `dl_wall_z` decoupled from the floors flag).
 
 ## FIXED: camera-pan ghost — whole view trails as the camera moves
 - **Symptom:** a trailing ghost of the whole view while moving (worst on doors). Hard

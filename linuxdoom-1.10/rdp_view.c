@@ -4477,11 +4477,15 @@ void DL_Flush(void)
 {
     int ti;
 
-    // The Z-buffer is only needed so the floor leaves occlude against walls; walls
-    // alone occlude correctly + FREE via the painter's-order sort. So z-test only when
-    // mesh FLOORS are on -- otherwise the wall z-emit is pure cost (~+1200us) for no
-    // benefit. Gating it here keeps the default mesh build at the wall-only perf.
-    dl_wall_z = n64_rdp_mesh && n64_rdp_mesh_floors && dl_zbuf_attached;
+    // Walls need the Z-buffer for correct opaque occlusion: the painter's-order sort
+    // in DL_MeshDrawWalls keys on each wall's NEAREST corner, which is only an
+    // approximation of true depth. Two walls whose depth ranges overlap mis-order in
+    // the columns where the far-by-nearest-corner wall is actually in front -- it gets
+    // overwritten and the geometry behind it shows through (Ryan's "geometry in the
+    // middle renders what's behind it"). Z-test fixes it per pixel. The z-image is
+    // already attached + cleared every mesh frame (i_video_n64.c), and the RDP sits
+    // idle (rdpbusy ~5us), so the per-pixel z cost barely touches the CPU-bound frame.
+    dl_wall_z = n64_rdp_mesh && dl_zbuf_attached;
 
 #if DL_DEBUG_TRACE
     dl_present_no++;
