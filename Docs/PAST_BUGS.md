@@ -4,6 +4,22 @@ A log of bugs that cost real time to diagnose, so we don't run the same circles 
 Each entry: **Symptom**, **Wrong turns** (dead ends already ruled out — do not retry),
 **Root cause**, **Repro**, **Resolution** (commit, or OPEN). Newest first.
 
+## Demo timeline (E1M1 bench demo) — STOP re-deriving this
+The standard bench demo (`bench/run-bench.sh`, `BENCH_FORCE_MESH`) DOES die and respawn
+on its own. Exact bench FRAME numbers (= `N64Bench_FrameNo()`, the capture-marker space):
+
+| Event | bench frame | leveltime (tic) | playerstate |
+|---|---|---|---|
+| level start (alive) | 0 | 0 | LIVE, health 100 |
+| **player dies** | **3120** | 1594 | DEAD, health 0 |
+| **reborn pressed** | **3212** | 1640 | REBORN |
+| **level reloads** (single-player respawn = ga_loadlevel) | **3213** | 0 (reset) | LIVE, health 100 |
+| demo ends | ~4117 | — | — |
+
+So: pre-death play = frames 0–3120, corpse = 3120–3212, **post-respawn play = 3213→end**.
+The "HUD flicker after death" lives in the post-3213 frames. Capture markers fire every
+128 frames, so the post-respawn markers are 3328, 3456, 3584, 3712, 3840, 3968, 4096.
+
 Renderer context: `perf/rdp-renderer`, the GPU-port mesh renderer (`n64_rdp_mesh`,
 `BENCH_FORCE_MESH`). Walls occlude via a painter's-order depth sort (no Z-buffer by
 default); floors/sprites are still CPU; the keyed CI8 present blits the software buffer
