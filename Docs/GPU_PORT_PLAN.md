@@ -167,8 +167,12 @@ Default mesh build baseline avg ~17.9k / p95 ~30.8k us. Per-phase tail (p95): `d
   LOAD_TILE/autosync thrash is **already fixed** — the Stage-3 per-texture dedup collapsed
   it from ~150 band uploads/frame to ~30 (`mean_uploads=30`; the "~7.5ms" comment at
   rdp_view.c:3555 is the historical PRE-dedup number). No cheap emit win remains. The real
-  `dlbuild` reduction is the **RSP transform port** (move projection to the idle RSP) — see
-  Docs/RSP_PORT_PLAN.md §7: Step B offloads it but is sync-bound; async overlap is the win.
+  `dlbuild` reduction is the **RSP transform port** (move projection to the idle RSP), which
+  now WINS once the dispatch processes only the ~30 visible walls (compaction, `1d4fef1`):
+  RSP-mesh-walls beat pure-CPU-mesh-walls avg −6.0% / p95 −6.2%. Still gated behind
+  `BENCH_FORCE_MESH_RSP`; banking it in the default build is the default-on call (the
+  fixed-point transform differs ~1px sub-pixel from CPU float, emit decisions agree). See
+  Docs/RSP_PORT_PLAN.md §7.
 - **Floor leaves: the transform IS the lever (unlike walls).** Leaves have many verts so
   the `65536/depth` divide dominates. Sharing the floor+ceiling projection (one transform,
   not two — `df533b8`) cut floor-mesh `dlbuild` -25% / p95 -28%, moving floor-as-mesh from a

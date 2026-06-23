@@ -108,16 +108,23 @@ poisons the whole out arena (a diagnostic), and (c) writeback `batch_in` + inval
 - DONE `8950cfa`: skip the sector-height lookups in the pack for BSP-culled walls.
 - These took the RSP path from +17% to +4% over pure-CPU. The remaining ~1.9ms is structural.
 
-**The lever is COMPACTION, not async overlap.** Re-analysis: the fixed overhead is the
-per-frame pack + cache-coherency + RSP loop over ALL ~475 baked walls. Async overlap (dispatch
-early, wait late, CPU prep between) can only hide the CPU-side prep of the ~30 DRAWN walls — a
-provably small window vs the 475-wall RSP round-trip — so it is NOT the lever. The win is to
-**dispatch only the BSP-visible walls** (~30, not 475): build a dense vis-list in
-`DL_RSPBatchProbe`, pack + `rspq_write` only `nvis`, and have the consumers index the dense
-`batch_out[j]` via the vis-list — `DL_MeshDrawWalls`'s RSP draw loop AND the `dl_rsp_verify`
-compare loop both currently index `batch_out[i]` by original wall index, so both must switch to
-the vis-list. That cuts pack + coherency + RSP loop ~15×. No visual A/B is needed: correctness
-is verified by `dl_rsp_verify=1` → `emit_disagree=0` (the RSP emits exactly the CPU's wall set)
-plus the bench total.
-- Re-measure rule: total must beat the pure-CPU path, not just `dlbuild` in isolation (measuring
-  one phase hid the dispatch cost — same trap as the early Z-buffer "loss").
+**The lever was COMPACTION, not async overlap — and it LANDED as a WIN (`1d4fef1`).** The fixed
+overhead was the per-frame pack + cache-coherency + RSP loop over ALL ~475 baked walls; async
+overlap could only hide the ~30-wall CPU prep (a provably small window vs the 475-wall round-trip)
+so it was never the lever. `DL_RSPBatchProbe` now builds a dense vis-list (walls passing
+`bake_linevis && ztop>zbot` packed into slots `0..batch_nvis-1`, `batch_vislist[j]` = original
+index) and packs + flushes + `rspq_write`s only `nvis` (~30). `DL_MeshDrawWalls`'s RSP draw loop
+and the `dl_rsp_verify` compare loop both walk the vis-list, reading the dense `batch_out[j]`. The
+per-wall RSP transform is unchanged, so it's render-equivalent by construction.
+
+**Result — the offload now BEATS pure-CPU walls:** avg 17901→16823us (−6.0%), p95 30816→28896
+(−6.2%), min frame back to ~6000us (the dispatch overhead is gone), 59.4 fps. dlbuild mean
+2931→2383us. Verified with `dl_rsp_verify=1`: `walls=30`, `cpu_emit==rsp_emit`, `emit_disagree=0`
+every frame; residual `mismatch` is sub-pixel fixed-point-vs-float (~1px, emit decisions agree).
+- Re-measure rule (confirmed by this saga): total must beat the pure-CPU path, not just `dlbuild`
+  in isolation — measuring one phase hid the dispatch cost (same trap as the early Z-buffer "loss").
+
+**Still GATED behind `BENCH_FORCE_MESH_RSP`.** To bank the −6% in the shipped build, the RSP path
+must go default-on — a Ryan call, since the fixed-point transform differs from the CPU float path
+by ~1px sub-pixel (emit decisions agree, so no walls appear/vanish). Next: extend the same
+compaction to the floor-leaf transform (Phase 4), then evaluate default-on.
