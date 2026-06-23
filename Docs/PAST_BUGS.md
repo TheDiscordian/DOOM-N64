@@ -4,22 +4,6 @@ A log of bugs that cost real time to diagnose, so we don't run the same circles 
 Each entry: **Symptom**, **Wrong turns** (dead ends already ruled out — do not retry),
 **Root cause**, **Repro**, **Resolution** (commit, or OPEN). Newest first.
 
-## Demo timeline (E1M1 bench demo) — STOP re-deriving this
-The standard bench demo (`bench/run-bench.sh`, `BENCH_FORCE_MESH`) DOES die and respawn
-on its own. Exact bench FRAME numbers (= `N64Bench_FrameNo()`, the capture-marker space):
-
-| Event | bench frame | leveltime (tic) | playerstate |
-|---|---|---|---|
-| level start (alive) | 0 | 0 | LIVE, health 100 |
-| **player dies** | **3120** | 1594 | DEAD, health 0 |
-| **reborn pressed** | **3212** | 1640 | REBORN |
-| **level reloads** (single-player respawn = ga_loadlevel) | **3213** | 0 (reset) | LIVE, health 100 |
-| demo ends | ~4117 | — | — |
-
-So: pre-death play = frames 0–3120, corpse = 3120–3212, **post-respawn play = 3213→end**.
-The "HUD flicker after death" lives in the post-3213 frames. Capture markers fire every
-128 frames, so the post-respawn markers are 3328, 3456, 3584, 3712, 3840, 3968, 4096.
-
 Renderer context: `perf/rdp-renderer`, the GPU-port mesh renderer (`n64_rdp_mesh`,
 `BENCH_FORCE_MESH`). Walls occlude via a painter's-order depth sort (no Z-buffer by
 default); floors/sprites are still CPU; the keyed CI8 present blits the software buffer
@@ -27,33 +11,49 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
-## OPEN: HUD/status-bar flickers after death
-- **Symptom:** the status bar flickers badly once the player dies. Ryan: "ONLY after
-  death, maybe it just needs to be redrawn after respawn".
+## FIXED: HUD/status-bar shimmers after death (post-respawn arms-number flicker)
+- **Symptom:** the status bar flickers once the player dies. Ryan: "ONLY after death,
+  maybe it just needs to be redrawn after respawn". Localised: the **arms-number digits**
+  (the grey "2 3 4 / 5 6 7" grid, x=111-138 y=172-187) shimmer between grey shades at
+  present rate. Single-player respawn **reloads the level** (`G_DoReborn`, g_game.c:
+  `!netgame` -> `gameaction = ga_loadlevel`), so the trigger is the post-reload melt-WIPE,
+  and it appears once play resumes -- NOT in the corpse/dead state.
+- **Root cause:** the two CI8 software buffers (i_video_n64.c, `doom_screen8[2]`) are
+  ping-ponged each present and the bar is rebuilt per-buffer only when a widget VALUE
+  changes (st_lib tracks `oldinum[idx]` per buffer). The arms-number patches have
+  transparent edge pixels that show the bar background, which a full `ST_refreshBackground`
+  builds via a transient scratch (`screens[BG]`) whose arms recess holds frame-dependent
+  content. On a reload the two buffers get their full refresh on DIFFERENT frames (the
+  melt-WIPE runs inside one `D_Display`, splitting the refreshes across pre/post-melt and
+  different scratch states), so they FREEZE with slightly different greys at the digit
+  edges (37 px, ~12-36 grey-level swing). Post-respawn the arms value is static (pistol
+  only, no pickups), so no widget ever redraws and it never self-corrects.
 - **Wrong turns (do NOT retry):**
-  - It is NOT the corpse/dead state. The bug is **after RESPAWN**. Single-player respawn
-    **reloads the level** (`G_DoReborn`, g_game.c: `!netgame` -> `gameaction = ga_loadlevel`),
-    so the bug state is post-level-reload, after play resumes.
-  - A forced-death bench probe that only zeroes health and pins the corpse (never
-    `playerstate = PST_REBORN`) tests the WRONG state and **cannot reproduce it**. Built
-    this twice; hours wasted. A correct probe MUST revive: kill at tic T, set
-    `players[consoleplayer].playerstate = PST_REBORN` ~70 tics later (one-shot — statics
-    survive the reload, else infinite death-reload loop), then inspect the POST-RESUME
-    frames, not the dead frames.
-  - The bar widget layer is sound on its own: `STlib_drawNum` redraws every frame;
-    multicon/binicon track per-buffer via `oldinum[idx]`/`I_N64DrawBufferIndex()`; the
-    dead face is pinned (no idle-glance). `ST_Start` (called on respawn via
-    P_SpawnPlayer->PST_REBORN, p_mobj.c:715) re-creates widgets + sets `st_firsttime`.
-- **Suspected root cause:** `ST_Start`'s `st_firsttime` arms a 2-frame ping-pong bar
-  refresh (st_stuff.c N64 block: `st_n64_refresh_left = 2`). On a level reload the refresh
-  is consumed during the reload/melt-WIPE (only ~1 CI8 buffer drawn before the wipe takes
-  over), so once normal drawing resumes the *other* CI8 buffer still holds a stale bar ->
-  the bar alternates every present. The fix is to **re-arm the full bar refresh into both
-  CI8 buffers AFTER the wipe completes / play resumes**, not during the reload.
-- **Repro:** `BENCH_FORCE_DEATH=<tic>` build (p_tick.c kill+revive one-shot) + the
-  per-buffer bar-CRC `BARDIFF` probe (i_video_n64.c). Divergence in the POST-reload frames
-  (second pass through low `leveltime`) confirms it.
-- **Resolution:** OPEN.
+  - Forcing BOTH CI8 buffers to `ST_doRefresh` does NOT fix it -- both refresh, but from
+    different transient scratch states, so they still differ. PROVEN: a per-buffer refresh
+    MASK vs the old `st_n64_refresh_left=2` 2-frame counter gave **byte-identical** 37px
+    divergence (A/B, BARDIFF unchanged). A `d_main.c wipe_just_ended` post-wipe re-arm was
+    likewise inert. The refresh path is not the lever; the per-buffer DIVERGENCE is.
+  - It is NOT a stale-whole-bar swap. BARDIFF (CI8[0] vs CI8[1] over the bottom 32 rows)
+    showed only 37px differ, ALL on the arms digits -- the rest of the bar is identical
+    between buffers. The "flicker" is the arms digits shimmering, not a gross bar alternation.
+  - A forced-death probe that only zeroes health and pins the corpse (never
+    `playerstate = PST_REBORN`) tests the WRONG state. The natural E1M1 demo already dies
+    (~frame 3120) and reborns (~3212, reload ~3213) -- use it, no forced death needed.
+- **Fix:** `ST_doRefresh` now mirrors the just-built bar onto the OTHER CI8 buffer
+  (`I_N64SyncRegionToOtherBuffer(ST_Y, ST_HEIGHT)`, i_video_n64.c), so both buffers are
+  byte-identical regardless of which transient scratch each was built from; static widgets
+  keep them matched. Paired with a per-buffer refresh MASK (st_stuff.c, replacing the
+  fragile 2-frame counter) so a full-refresh+sync is GUARANTEED to run on a frame AFTER the
+  melt settles -- the counter could spend both refreshes pre-melt, leaving the first
+  post-melt frame a diff-draw that re-leaks scratch before any sync (the sync alone, on the
+  old counter, regressed back to 37px).
+- **Repro/verify:** BARDIFF probe (CI8[0] vs CI8[1], bottom 32 rows) over the post-respawn
+  window. Pre-fix = 145 frames of `nd=37` at x=111-138; post-fix = MATCH (the only residual
+  is 2 transient single-frame blips in the FACE region x=151-168 -- normal per-buffer
+  1-frame animation lag, present in ordinary play, not the bug).
+- **Resolution:** FIXED (st_stuff.c refresh mask + ST_doRefresh sync, i_video_n64.c
+  `I_N64SyncRegionToOtherBuffer`).
 
 ## OPEN: mesh walls render geometry that is behind them (usually mid-screen)
 - **Symptom (Ryan):** some geometry, usually in the middle, renders what's behind it.

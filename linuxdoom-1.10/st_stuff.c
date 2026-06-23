@@ -1098,6 +1098,17 @@ void ST_doRefresh(void)
     // and refresh all widgets
     ST_drawWidgets(true);
 
+#ifdef N64
+    // A full refresh rebuilds the bar from a transient scratch whose holes hold
+    // frame-dependent content, so after a level reload the two CI8 buffers can
+    // freeze in slightly different bar states (post-respawn HUD shimmer, see
+    // Docs/PAST_BUGS.md). Mirror the just-drawn bar onto the other CI8 buffer so
+    // both are byte-identical; static widgets never redraw, so they stay matched.
+    {
+	void I_N64SyncRegionToOtherBuffer(int y0, int rows);
+	I_N64SyncRegionToOtherBuffer(ST_Y, ST_HEIGHT);
+    }
+#endif
 }
 
 void ST_diffDraw(void)
@@ -1113,18 +1124,26 @@ void ST_Drawer (boolean fullscreen, boolean refresh)
     st_firsttime = st_firsttime || refresh;
 
 #ifdef N64
-    // screens[0] is ping-ponged each present, so a refresh (status-bar
-    // background + forced widget redraw) must land in both CI8 buffers before
-    // per-buffer diff drawing resumes.
+    // screens[0] is ping-ponged each present, so a full refresh (which rebuilds the
+    // bar AND mirrors it to the other CI8 buffer via ST_doRefresh ->
+    // I_N64SyncRegionToOtherBuffer) must run on a frame AFTER any melt-WIPE settles.
+    //
+    // A frame COUNT (the old st_n64_refresh_left=2) is fragile: on a level reload the
+    // melt-WIPE loop runs inside one D_Display, so the two counted refreshes can both
+    // land BEFORE the melt; the first post-melt frame then falls to a diff-draw, which
+    // re-leaks per-buffer scratch into the bar before any sync -> the post-respawn HUD
+    // shimmer comes back (see Docs/PAST_BUGS.md). Track a per-buffer MASK instead: keep
+    // forcing a full refresh+sync until EVERY CI8 buffer has actually been drawn this
+    // cycle, so a post-melt full refresh+sync is guaranteed and is the last word.
     {
-	static int st_n64_refresh_left;
-
+	int I_N64DrawBufferIndex(void);
+	static int st_n64_refresh_mask;
 	if (st_firsttime)
-	    st_n64_refresh_left = 2;
-	if (st_n64_refresh_left)
+	    st_n64_refresh_mask = 0x3;          // both CI8 buffers (i_video_n64.c: 2) need it
+	if (st_n64_refresh_mask)
 	{
 	    st_firsttime = true;
-	    st_n64_refresh_left--;
+	    st_n64_refresh_mask &= ~(1 << I_N64DrawBufferIndex());
 	}
     }
 #endif

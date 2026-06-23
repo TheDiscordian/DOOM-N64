@@ -768,6 +768,33 @@ int I_N64DrawBufferIndex(void)
     return n64_draw_idx;
 }
 
+// Copy `rows` rows starting at screen y=`y0` from the CURRENT CI8 draw buffer
+// to the OTHER CI8 buffer, forcing them byte-identical there.
+//
+// Used to resync the status bar after a level reload. The status bar is
+// rebuilt per-buffer only when a widget's value CHANGES (st_lib tracks
+// oldinum[idx] per buffer); a full ST_refreshBackground redraw is rebuilt
+// from a transient scratch (screens[BG]) whose holes hold frame-dependent
+// content, so the two buffers' bars can freeze in slightly different states
+// after a reborn (post-respawn HUD shimmer, Docs/PAST_BUGS.md). One buffer is
+// always correctly drawn; mirroring it onto the other guarantees they match,
+// and static widgets never redraw so they stay matched.
+void I_N64SyncRegionToOtherBuffer(int y0, int rows)
+{
+    int other = n64_draw_idx ^ 1;
+    int y1 = y0 + rows;
+    byte* src;
+    byte* dst;
+    if (y0 < 0) y0 = 0;
+    if (y1 > SCREENHEIGHT) y1 = SCREENHEIGHT;
+    if (y1 <= y0) return;
+    if (other < 0 || other >= N64_CI8_BUFFERS) return;
+    if (!doom_screen8[n64_draw_idx].buffer || !doom_screen8[other].buffer) return;
+    src = (byte*)doom_screen8[n64_draw_idx].buffer + y0 * SCREENWIDTH;
+    dst = (byte*)doom_screen8[other].buffer       + y0 * SCREENWIDTH;
+    memcpy(dst, src, (size_t)(y1 - y0) * SCREENWIDTH);
+}
+
 // Fired (under RDP interrupt) when the RDP has finished reading a CI8 buffer.
 // Marks it free and shows the framebuffer it was blitted into -- the same
 // display_show that rdpq_detach_show would have scheduled.
@@ -1572,6 +1599,7 @@ void I_FinishUpdate(void)
     N64Bench_PhaseSwitch(BPH_PRESENT, BPH_RDP_BUSY);
 #endif
     next_idx = n64_draw_idx ^ 1;
+
 #if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
     {
         // Count spin iterations to prove the buffer-flip RDP-busy wait is the ~0

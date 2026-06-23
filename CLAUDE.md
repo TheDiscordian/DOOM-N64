@@ -74,6 +74,12 @@ bench/scan-marks.sh /tmp/full-rdp-marks.z64 /tmp/cap/full 40 200   # -> /tmp/cap
 bench/ares-run.sh /tmp/full-rdp-marks.z64 120
 ```
 
+## Bench demo timeline (E1M1)
+The demo dies + respawns on its own. Bench frames (`N64Bench_FrameNo()`): death **3120**
+(lt 1594), reborn **3212** (lt 1640), level reload **3213** (lt resets to 0), demo ends
+~4117. Single-player respawn = `ga_loadlevel` (a full level RELOAD). Post-respawn play =
+frames **3213→end**; post-respawn capture markers: 3328/3456/3584/3712/3840/3968/4096.
+
 ## Renderer layout
 - The **RDP plane path** (runtime flag `n64_rdp_plane_ab`) renders floors **and**
   ceilings — both are visplanes through the same code: `R_DrawPlanes` loops every
