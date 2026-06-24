@@ -2360,6 +2360,11 @@ int DL_KeyedSpan(int* x0, int* y0, int* x1, int* y1)
 // 1/projection), screen_y = centery - (z-viewz)*centerx/depth.
 // Phase 1b scope: single-sided walls only, near-plane SKIP (no clip yet), NO cull.
 int n64_rdp_mesh = 0;       // BENCH_FORCE_MESH gate (set in d_main.c)
+int n64_rdp_mesh_cull = 0;  // BENCH_FORCE_MESH_CULL: the mesh's OWN visibility -- mark walls
+                            // by frustum (every wall in a frustum-visible subsector), not by
+                            // the BSP solidsegs occlusion. The wall Z-buffer handles overdraw,
+                            // so this is render-equivalent and is the first step toward
+                            // replacing the per-seg BSP occlusion walk. See GPU_PORT_PLAN.md.
 int n64_rdp_mesh_floors = 0;// BENCH_FORCE_MESH_FLOORS gate -- Phase 3 floor leaves; OFF by
                             // default: measured a PERF LOSS (mesh floors slower than the
                             // already-coalesced visplane path). Separate flag so the

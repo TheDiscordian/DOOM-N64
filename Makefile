@@ -127,6 +127,12 @@ CFLAGS += -DBENCH_FORCE_MESH=1
 ifeq ($(BENCH_FORCE_MESH_FLOORS),1)
 CFLAGS += -DBENCH_FORCE_MESH_FLOORS=1
 endif
+#   BENCH_FORCE_MESH_CULL=1 -> the mesh's OWN visibility: mark walls by frustum (every
+#   wall in a frustum-visible subsector) instead of the BSP solidsegs occlusion. Wall-Z
+#   handles overdraw. First step toward replacing the per-seg BSP occlusion walk.
+ifeq ($(BENCH_FORCE_MESH_CULL),1)
+CFLAGS += -DBENCH_FORCE_MESH_CULL=1
+endif
 #   RSP port (Docs/RSP_PORT_PLAN.md): the wall-transform offload is now DEFAULT-ON in
 #   the mesh build -- compaction made it beat the CPU transform -6% (render-equivalent,
 #   emit_disagree=0). Opt OUT for a CPU-mesh A/B with BENCH_FORCE_MESH_RSP=0.

@@ -593,6 +593,17 @@ void R_Subsector (int num)
 
     while (count--)
     {
+	// GPU port -- the mesh's OWN visibility (n64_rdp_mesh_cull): this subsector
+	// survived the node + solidsegs prune, so mark ALL its walls visible to the mesh
+	// by frustum, not by the per-column solidsegs occlusion R_AddLine derives. The
+	// wall Z-buffer discards the overdraw, so it's render-equivalent -- and it's what
+	// lets the per-seg occlusion walk eventually come off the CPU. R_AddLine still runs
+	// (software planes/sprites need its clip + drawsegs) until those are mesh-driven too.
+	{
+	    extern int n64_rdp_mesh_cull;
+	    if (n64_rdp_mesh_cull && line->linedef)
+		R_MeshMarkLine ((int)(line->linedef - lines));
+	}
 	R_AddLine (line);
 	line++;
     }
