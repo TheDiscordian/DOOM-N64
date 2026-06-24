@@ -32,9 +32,12 @@
     .data
 
 RSPQ_BeginOverlayHeader
-    RSPQ_DefineCommand DLWallCmd_Loopback, 12   # 0x00: (size, src, dst) = 3 words
-    RSPQ_DefineCommand DLWallCmd_Xform,    12   # 0x04: (viewblk, wall, out) = 3 words
-    RSPQ_DefineCommand DLWallCmd_Batch,    16   # 0x08: (viewblk, in, out, count) = 4 words
+    RSPQ_DefineCommand DLWallCmd_Loopback,  12   # 0x00: (size, src, dst) = 3 words
+    RSPQ_DefineCommand DLWallCmd_Xform,     12   # 0x04: (viewblk, wall, out) = 3 words
+    RSPQ_DefineCommand DLWallCmd_Batch,     16   # 0x08: (viewblk, in, out, count) = 4 words
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+    RSPQ_DefineCommand DLWallCmd_LeafBatch, 16   # 0x0C: (viewblk, in, out, vertcount) = 4 words
+#endif
 RSPQ_EndOverlayHeader
 
 # The overlay needs no persisted state across commands.
@@ -148,6 +151,19 @@ VSCRATCH: .ds.b 64
 BIN_BUF:  .ds.b BATCH_N * BWALL_IN_BYTES      # staged wall inputs (DMA'd in)
     .align 3
 BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back)
+
+# Phase 4 leaf transform REUSES BIN_BUF / BOUT_BUF / BATCH_STATE (no new DMEM -- DMEM is
+# at the cap). A leaf element is ONE vertex: in = (x,y) 8B; out = (cx, invw, emit) padded
+# to 16B. 8 verts/chunk fits BIN_BUF (8*8=64<=256) and BOUT_BUF (8*16=128<=512).
+# Layout MUST match rsp_bleaf_in_t / rsp_bleaf_out_t in rdp_view.c.
+#define BLI_x    0x00
+#define BLI_y    0x04
+#define BLEAF_IN_BYTES  8
+#define BLO_cx   0x00      /* screen-x, 16.16 (== wall sx) */
+#define BLO_invw 0x04      /* 65536/depth, 16.16 */
+#define BLO_emit 0x08      /* 1 = vertex in front of near plane, 0 = leaf must be culled */
+#define BLO_pad  0x0C
+#define BLEAF_OUT_BYTES 16
 
 # Batch loop bookkeeping (MUST be in .bss/DMEM -- the RSP scalar lw/sw only reach
 # DMEM 0x000-0xFFF; a .text/IMEM address here silently corrupts every load/store).
@@ -541,6 +557,188 @@ BatchChunkEmit:
 BatchDone:
     j    RSPQ_Loop
     nop
+
+
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+# ============================================================
+# DLWallCmd_LeafBatch (Phase 4): transform a flat array of LEAF VERTICES.
+#   a0 = view block RDRAM, a1 = in array (rsp_bleaf_in_t[]), a2 = out array
+#   (rsp_bleaf_out_t[]), a3 = vertex count. Mirrors DLWallCmd_Batch's chunked DMA
+#   loop but with leaf strides and XformLeaf. Reuses BIN_BUF/BOUT_BUF/BATCH_STATE.
+#   Runs under the default .set at (like DLWallCmd_Batch) -- bge/etc. need $at.
+# ============================================================
+DLWallCmd_LeafBatch:
+    # ---- DMA the view block in (once) ----
+    li   t0, DMA_SIZE(VIEWBLK_BYTES, 1) & 0xFFF
+    li   s4, %lo(VIEWBLK)
+    jal  DMAIn
+    move s0, a0                  # (delay) s0 = view block RDRAM addr
+    sw   a1, %lo(BS_inrd)
+    sw   a2, %lo(BS_outrd)
+    sw   a3, %lo(BS_remain)
+LeafChunkLoop:
+    lw   t4, %lo(BS_remain)
+    blez t4, LeafDone
+    nop
+    li   t5, BATCH_N
+    sltu t3, t4, t5
+    beqz t3, 1f
+    nop
+    move t5, t4
+1:  sw   t5, %lo(BS_chunk)
+    # ---- DMA this chunk of inputs in: chunk * BLEAF_IN_BYTES (8) ----
+    sll  t6, t5, 3
+    addiu t6, t6, -1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(BIN_BUF)
+    lw   s0, %lo(BS_inrd)
+    jal  DMAIn
+    nop
+    sw   zero, %lo(BS_idx)
+    li   t0, %lo(BIN_BUF)
+    sw   t0, %lo(BS_inptr)
+    li   t0, %lo(BOUT_BUF)
+    sw   t0, %lo(BS_outptr)
+LeafVertLoop:
+    lw   t0, %lo(BS_idx)
+    lw   t5, %lo(BS_chunk)
+    bge  t0, t5, LeafChunkEmit
+    nop
+    jal  XformLeaf               # BS_inptr -> BS_outptr (reads VIEWBLK)
+    nop
+    lw   t0, %lo(BS_idx)
+    addiu t0, t0, 1
+    sw   t0, %lo(BS_idx)
+    lw   t1, %lo(BS_inptr)
+    addiu t1, t1, BLEAF_IN_BYTES
+    sw   t1, %lo(BS_inptr)
+    lw   t1, %lo(BS_outptr)
+    addiu t1, t1, BLEAF_OUT_BYTES
+    sw   t1, %lo(BS_outptr)
+    j    LeafVertLoop
+    nop
+LeafChunkEmit:
+    lw   t5, %lo(BS_chunk)
+    sll  t6, t5, 4               # bytes = chunk * 16 (BLEAF_OUT_BYTES)
+    addiu t6, t6, -1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(BOUT_BUF)
+    lw   s0, %lo(BS_outrd)
+    jal  DMAOut
+    nop
+    lw   t5, %lo(BS_chunk)
+    lw   t1, %lo(BS_inrd)
+    sll  t6, t5, 3
+    addu t1, t1, t6
+    sw   t1, %lo(BS_inrd)
+    lw   t1, %lo(BS_outrd)
+    sll  t6, t5, 4
+    addu t1, t1, t6
+    sw   t1, %lo(BS_outrd)
+    lw   t1, %lo(BS_remain)
+    subu t1, t1, t5
+    j    LeafChunkLoop
+    sw   t1, %lo(BS_remain)      # (delay)
+LeafDone:
+    j    RSPQ_Loop
+    nop
+    .set at
+
+
+# ============================================================
+# XformLeaf : project ONE leaf vertex. A reduced XformWall corner-A path -- no
+#   2-corner, no near-clip slide, no heights/screen-Y, no back-face/off-screen.
+#   reads:  VIEWBLK, the vert at BS_inptr (BLI_x/BLI_y)
+#   writes: BS_outptr -> cx (== wall sx), invw, emit. The CPU derives sc=centerx*invw,
+#           z=DL_WallZ(invw), u/v, and cy per surface (DL_DrawMeshLeaves). A vert behind
+#           the near plane sets emit=0 -> the CPU culls the whole leaf (matches its
+#           "if depth < nearz: bad" cull). Reuses XW_* DMEM scratch + the helpers.
+# ============================================================
+    .set noat
+XformLeaf:
+    sw   ra, %lo(XW_ra)
+    lw   t8, %lo(BS_inptr)
+    lw   t9, %lo(BS_outptr)
+    sw   t8, %lo(XW_in)
+    sw   t9, %lo(XW_out)
+    # zero the 16B output slot
+    sw   zero, BLO_cx(t9)
+    sw   zero, BLO_invw(t9)
+    sw   zero, BLO_emit(t9)
+    sw   zero, BLO_pad(t9)
+    # ---- view-space tx/ty ----
+    lw   t0, BLI_x(t8)
+    lw   t1, BLI_y(t8)
+    lw   s1, %lo(VB_viewx)
+    lw   s2, %lo(VB_viewy)
+    sub  t0, t0, s1              # tx
+    sub  t1, t1, s2              # ty
+    sw   t0, %lo(XW_txa)
+    sw   t1, %lo(XW_tya)
+    # ---- depth = tx*vcos + ty*vsin ----
+    lw   s3, %lo(VB_vcos)
+    lw   s5, %lo(VB_vsin)
+    move a3, t0
+    jal  FixedMulVU
+    move s7, s3                  # (delay) tx*vcos
+    move s0, v1
+    move a3, t1
+    jal  FixedMulVU
+    move s7, s5                  # ty*vsin
+    add  s0, s0, v1             # depth
+    sw   s0, %lo(XW_dA)
+    # ---- cull if depth < nearz (leaf vert behind near plane) ----
+    li   t8, NEARZ
+    slt  t6, s0, t8
+    bnez t6, XL_skip
+    nop
+    # ---- lat = ty*vcos - tx*vsin ----
+    lw   t0, %lo(XW_txa)
+    lw   t1, %lo(XW_tya)
+    move a3, t1
+    jal  FixedMulVU
+    move s7, s3                  # ty*vcos
+    move s0, v1
+    move a3, t0
+    jal  FixedMulVU
+    move s7, s5                  # tx*vsin
+    sub  s0, s0, v1             # lat
+    sw   s0, %lo(XW_pad)         # park lat (reuse the wall scratch)
+    # ---- invw = FixedDiv(65536, depth) ; park recip(depth), reuse for the lat ratio ----
+    lw   a3, %lo(XW_dA)
+    jal  RecipFixVU
+    nop
+    li   a3, 0x10000
+    jal  FixedDivApply           # invw
+    nop
+    lw   t9, %lo(XW_out)
+    sw   v1, BLO_invw(t9)
+    # ---- cx = (centerx<<16) - centerx * FixedDiv(lat, depth) ----
+    lw   a3, %lo(XW_pad)         # lat
+    jal  FixedDivApply           # ratio = lat/depth (recip(depth) still parked)
+    nop
+    move a3, v1
+    lw   s7, %lo(VB_centerx)
+    jal  MulIntVU                # centerx * ratio
+    nop
+    lw   s3, %lo(VB_centerx)
+    sll  t7, s3, 16
+    sub  s0, t7, v1             # cx
+    lw   t9, %lo(XW_out)
+    sw   s0, BLO_cx(t9)
+    li   t0, 1
+    sw   t0, BLO_emit(t9)
+    lw   ra, %lo(XW_ra)
+    jr   ra
+    nop
+XL_skip:
+    lw   t9, %lo(XW_out)
+    sw   zero, BLO_emit(t9)
+    lw   ra, %lo(XW_ra)
+    jr   ra
+    nop
+    .set at
+#endif /* BENCH_FORCE_MESH_LEAF_RSP */
 
 
 # ============================================================

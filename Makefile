@@ -133,6 +133,14 @@ endif
 ifeq ($(BENCH_FORCE_MESH_CULL),1)
 CFLAGS += -DBENCH_FORCE_MESH_CULL=1
 endif
+#   BENCH_FORCE_MESH_LEAF_RSP=1 -> Phase 4: the floor-leaf vertex transform on the RSP
+#   (extends the wall offload to leaves). The ucode leaf command is #ifdef'd so the
+#   DEFAULT overlay stays byte-identical (a bigger overlay costs per-frame reload DMA).
+#   The flag must reach BOTH the CPU (CFLAGS) and the RSP assembly (RSPASFLAGS).
+ifeq ($(BENCH_FORCE_MESH_LEAF_RSP),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_RSP=1
+RSPASFLAGS += -DBENCH_FORCE_MESH_LEAF_RSP=1
+endif
 #   RSP port (Docs/RSP_PORT_PLAN.md): the wall-transform offload is now DEFAULT-ON in
 #   the mesh build -- compaction made it beat the CPU transform -6% (render-equivalent,
 #   emit_disagree=0). Opt OUT for a CPU-mesh A/B with BENCH_FORCE_MESH_RSP=0.
