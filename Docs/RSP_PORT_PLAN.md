@@ -170,7 +170,30 @@ were byte-identical with/without it (frame4 worst_cx=12331, worst_invw=7619 both
 the reciprocal is already converged; the residual is NOT reciprocal-iteration error. The
 ~1% lives downstream — the FixedDiv un-normalization (the NORMBIT `sh` shift + FIXEDDIV_SH
 16-bit truncation in FixedDivApply) and/or near-`nearz` verts (huge invw, tiny absolute
-error → big relative). Next investigation (a focused effort): instrument FixedDivApply's
-intermediate vs the exact ratio per vert to localize the lost bits; consider widening the
-FixedDiv result window past 16 bits, or computing cx = centerx*(1 - lat/depth) in a form
-less sensitive to the ratio's low bits. No cutover until cx holds < ~1px over the demo.
+error → big relative). Localized: the big cx errors are OFF-SCREEN verts (culled by the
+X-window test anyway); ON-SCREEN verts hold ~1px, so a cutover renders correctly.
+
+### 8.2 Phase 4 CUTOVER MEASURED — net LOSS, stays flagged-off (2026-06-24)
+Wired the cutover: `DL_RSPLeafXform()` dispatches all visible leaf verts to the RSP
+`DLWallCmd_LeafBatch` once per frame, then `DL_DrawMeshLeaves`'s pre-pass reads
+`leaf_out_buf[leaf_rsp_slot[pv]]` (cx, invw) instead of the CPU divide. Floors render
+correctly (frame-count identical, on-screen ~1px as predicted).
+
+**A/B (BENCH_FORCE_RDP+MESH+FLOORS, E1M1 demo, 4117 frames):**
+| build | avg µs | p95 µs |
+|---|---|---|
+| CPU-leaf (baseline) | 16638 | 30176 |
+| leaf-RSP cutover | 17463 | 34144 |
+
+**+5% avg / +13% p95 — a clear regression.** Root cause is the SAME as the pre-compaction
+wall RSP Step B: a SEPARATE per-frame dispatch is a SECOND full RSP round-trip (overlay
+reload + DMA + `rspq_wait` CPU stall) layered on top of the wall batch's round-trip. The
+leaf divide it offloads is cheaper than that sync cost, so it loses. Compaction can't save
+it the way it saved walls — the cost here is the second *barrier*, not the per-vert work.
+
+**Next lever (the real fix):** fold leaves into the EXISTING wall batch — one combined
+in-buffer, one `DLWallCmd_BATCH`-style dispatch, ONE `rspq_wait` for both walls and leaves
+— so floors-on-RSP rides the wall round-trip already being paid instead of adding its own.
+Only then can floors-on-RSP plausibly net ahead (and let the software visplanes go, opening
+the bsp_walk plane-clip work). Until then leaf-RSP stays behind BENCH_FORCE_MESH_LEAF_RSP,
+default-off. The cutover code is committed (working, correct) so the fold can build on it.

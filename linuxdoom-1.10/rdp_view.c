@@ -4394,16 +4394,29 @@ static int dl_leaf_tris = 0;
 #define DL_LEAF_VERT_MAX (DL_WALL_ARENA * 4)
 static rsp_bleaf_in_t  leaf_in_buf[DL_LEAF_VERT_MAX]  __attribute__((aligned(16)));
 static rsp_bleaf_out_t leaf_out_buf[DL_LEAF_VERT_MAX] __attribute__((aligned(16)));
-static int             leaf_pvmap[DL_LEAF_VERT_MAX];
-static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cull)
+static int*            leaf_rsp_slot = NULL;   // pv -> dense output slot, set this frame
+static int             leaf_rsp_slot_cap = 0;
+static int             leaf_rsp_nv = 0;        // verts dispatched this frame (0 = none)
+// Phase 4 cutover: dispatch every visible leaf's verts to the RSP, read back {cx, invw,
+// emit}; the pre-pass reads leaf_out_buf[leaf_rsp_slot[pv]] instead of the CPU divide.
+static void DL_RSPLeafXform(void)
 {
-    static unsigned lf_frame = 0;
+    extern int bake_numleafverts;
     static rsp_view_blk_t* vb = NULL;
     fixed_t vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
     fixed_t vsin = finesine[viewangle >> ANGLETOFINESHIFT];
-    int ss, i, nv = 0, mism = 0, emit_dis = 0, worst_cx = 0, worst_invw = 0;
+    int ss, i, nv = 0;
 
+    leaf_rsp_nv = 0;
+    if (rsp_dlwall_ovl_id == 0)
+        rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
     if (rsp_dlwall_ovl_id == 0) return;
+    if (bake_numleafverts > leaf_rsp_slot_cap) {
+        if (leaf_rsp_slot) Z_Free(leaf_rsp_slot);
+        leaf_rsp_slot_cap = bake_numleafverts;
+        leaf_rsp_slot = (int*)Z_Malloc(sizeof(int) * leaf_rsp_slot_cap, PU_STATIC, NULL);
+    }
+    if (!leaf_rsp_slot) return;
     if (!vb) vb = memalign(16, sizeof *vb);
     if (!vb) return;
     vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
@@ -4411,20 +4424,20 @@ static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cu
     vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
 
     for (ss = 0; ss < numsubsectors && nv < DL_LEAF_VERT_MAX; ss++) {
-        bake_leaf_t* lf;
-        int n;
-        if (leaf_cull[ss]) continue;
-        lf = &bake_leaves[ss];
-        n = lf->numverts;
+        bake_leaf_t* lf = &bake_leaves[ss];
+        int n = lf->numverts;
+        if (!bake_leafvis[ss]) continue;                    // SAME filter as the pre-pass
+        if (n < 3 || n > DL_LEAF_MAXV) continue;
+        if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
         for (i = 0; i < n && nv < DL_LEAF_VERT_MAX; i++) {
             int pv = lf->firstvert + i;
             leaf_in_buf[nv].x = bake_leaf_verts[pv][0];
             leaf_in_buf[nv].y = bake_leaf_verts[pv][1];
-            leaf_pvmap[nv] = pv;
+            leaf_rsp_slot[pv] = nv;
             nv++;
         }
     }
-    if (nv == 0) { lf_frame++; return; }
+    if (nv == 0) return;
 
     data_cache_hit_writeback(vb, sizeof *vb);
     data_cache_hit_writeback(leaf_in_buf,  (uint32_t)((size_t)nv * sizeof(rsp_bleaf_in_t)));
@@ -4434,44 +4447,7 @@ static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cu
                PhysicalAddr(leaf_out_buf), (uint32_t)nv);
     rspq_wait();
     data_cache_hit_invalidate(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
-
-    int worst_i = -1, worst_cx_on = 0, mism_on = 0, nv_on = 0;
-    for (i = 0; i < nv; i++) {
-        const rsp_bleaf_out_t* ro = &leaf_out_buf[i];
-        const float* pr = &leaf_proj[6 * leaf_pvmap[i]];
-        float rcx   = (float)ro->cx   * (1.0f / 65536.0f);
-        float rinvw = (float)ro->invw * (1.0f / 65536.0f);
-        float dcx   = fabsf(rcx - pr[0]);
-        double rel  = (pr[4] != 0.0f) ? (fabsf(rinvw - pr[4]) / fabsf(pr[4])) : 0.0;
-        if (!ro->emit) emit_dis++;          // CPU drew it (drawable leaf) yet RSP culled
-        if (dcx > 0.5f || rel > 0.01) mism++;
-        if ((int)(dcx * 1000.0f) > worst_cx)   { worst_cx = (int)(dcx * 1000.0f); worst_i = i; }
-        if ((int)(rel * 1e6)     > worst_invw) worst_invw = (int)(rel * 1e6);
-        // ON-SCREEN error is what actually matters: off-screen verts (|cx| way outside
-        // 0..SCREENWIDTH) get clipped, and a px shift there moves the on-screen edge
-        // sub-pixel. Track verts within a margin of the screen separately.
-        if (pr[0] > -64.0f && pr[0] < (float)SCREENWIDTH + 64.0f) {
-            nv_on++;
-            if (dcx > 0.5f) mism_on++;
-            if ((int)(dcx * 1000.0f) > worst_cx_on) worst_cx_on = (int)(dcx * 1000.0f);
-        }
-    }
-    if ((lf_frame % 256) == 0 || mism_on || emit_dis)
-        debugf("RSP-LEAF frame=%u verts=%d/on%d mism=%d/on%d emit_dis=%d worst_cx=%d/on%d(e-3) worst_invw=%d(e-6)\n",
-               lf_frame, nv, nv_on, mism, mism_on, emit_dis, worst_cx, worst_cx_on, worst_invw);
-    // Localize: dump the worst-cx vert's depth + CPU/RSP invw+cx so we can see if it's a
-    // near-nearz huge-invw vert (small depth) or a structural ratio error.
-    if (worst_i >= 0 && (lf_frame % 64) == 0) {
-        int pv = leaf_pvmap[worst_i];
-        fixed_t wx = bake_leaf_verts[pv][0], wy = bake_leaf_verts[pv][1];
-        fixed_t depth = FixedMul(wx - viewx, vcos) + FixedMul(wy - viewy, vsin);
-        const float* pr = &leaf_proj[6 * pv];
-        const rsp_bleaf_out_t* ro = &leaf_out_buf[worst_i];
-        debugf("RSP-LEAF-WORST frame=%u depth=%d(.16) cpu_invw=%d(.16) rsp_invw=%d(.16) "
-               "cpu_cx=%d(.8) rsp_cx=%d(.8)\n", lf_frame, (int)depth,
-               (int)(pr[4]*65536.0f), (int)ro->invw, (int)(pr[0]*256.0f), (int)((float)ro->cx/256.0f));
-    }
-    lf_frame++;
+    leaf_rsp_nv = nv;
 }
 #endif
 
@@ -4526,6 +4502,14 @@ static void DL_DrawMeshLeaves(void)
             return;                         // alloc failed -> skip the floor mesh this frame
     }
 
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+    // Phase 4 cutover: dispatch every visible leaf's verts to the RSP for the divide
+    // (cx, invw) BEFORE the pre-pass, which reads leaf_out_buf[leaf_rsp_slot[pv]] below.
+    DL_RSPLeafXform();
+    if (leaf_rsp_nv == 0)
+        return;                             // nothing visible -> no floors this frame
+#endif
+
     for (ss = 0; ss < numsubsectors; ss++)
     {
         bake_leaf_t* lf = &bake_leaves[ss];
@@ -4543,15 +4527,30 @@ static void DL_DrawMeshLeaves(void)
             int     pv = lf->firstvert + i;
             fixed_t wx = bake_leaf_verts[pv][0];
             fixed_t wy = bake_leaf_verts[pv][1];
-            fixed_t tx = wx - viewx, ty = wy - viewy;
-            fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
-            fixed_t lat;
             float   invw, sc, sx, u, v, *pr;
-            if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: cull
-            lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
-            invw = 65536.0f / (float)depth;
-            sc   = (float)centerx * invw;
-            sx   = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+            // CUTOVER: the RSP did the divide -- read cx + invw off batch_out (filled by
+            // DL_RSPLeafXform above, same vert set). emit=0 => behind near plane => cull
+            // the leaf (matches the CPU depth<nearz break). sc=centerx*invw stays CPU.
+            {
+                const rsp_bleaf_out_t* ro = &leaf_out_buf[leaf_rsp_slot[pv]];
+                if (!ro->emit) { bad = 1; break; }
+                sx   = (float)ro->cx   * (1.0f / 65536.0f);
+                invw = (float)ro->invw * (1.0f / 65536.0f);
+                sc   = (float)centerx * invw;
+            }
+#else
+            {
+                fixed_t tx = wx - viewx, ty = wy - viewy;
+                fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+                fixed_t lat;
+                if (depth < (4 << FRACBITS)) { bad = 1; break; }    // near plane: cull
+                lat  = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+                invw = 65536.0f / (float)depth;
+                sc   = (float)centerx * invw;
+                sx   = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+            }
+#endif
             // X-only off-screen cull (cy is per-surface, checked in the draw pass).
             if (sx < -2048.0f || sx > (float)SCREENWIDTH + 2048.0f) { bad = 1; break; }
             u = (float)(wx >> FRACBITS);                // world-aligned flat texel (64-period)
@@ -4576,11 +4575,6 @@ static void DL_DrawMeshLeaves(void)
         }
         leaf_cull[ss] = 0;                              // transformed OK -> drawable
     }
-
-#ifdef BENCH_FORCE_MESH_LEAF_RSP
-    // Phase 4 verify: RSP leaf-vertex transform vs the CPU leaf_proj just computed.
-    DL_RSPLeafProbe(leaf_proj, leaf_cull);
-#endif
 
     // surf 0 = floor, surf 1 = ceiling. Same leaf polygon at the sector's floor/ceiling
     // height + flat. Both passes share the Z-buffer (already paid) so adding ceilings
