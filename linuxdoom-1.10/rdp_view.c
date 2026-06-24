@@ -1027,6 +1027,20 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     if (tw < DL_MIN_TEX_W || tw > 512)
         return NULL;
 
+#if defined(N64_BENCH) && defined(DLBUILD_TRACE)
+    // TEMP diagnostic: log every block build that happens DURING rendering (frame > 0;
+    // builds at frame 0 are the R_PrecacheLevel prequant). A render-time build = a texture
+    // the precache missed -> the dlbuild first-touch spike. raw=0 => true first touch.
+    {
+        extern unsigned long N64Bench_FrameNo(void);
+        extern const char* R_TextureNameForNum(int texnum);
+        unsigned long bf = N64Bench_FrameNo();
+        debugf("DLBUILD-%s frame=%lu tex=%d name=%.8s raw=%d w=%d h=%d\n",
+               bf > 0 ? "LATE" : "PRECACHE",
+               bf, texnum, R_TextureNameForNum(texnum), slot->raw ? 1 : 0, tw, th);
+    }
+#endif
+
     // SELECTIVE CI4 STORE (fidelity-preserving load collapse). DETAILED wides stay
     // at FULL declared resolution; SAFE (low-horizontal-frequency) wides downsample
     // S (width) toward 64 so their CI4 row fits the TMEM half in fewer T-bands --
@@ -1294,7 +1308,13 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
 // and DL_InitCaches guards on dl_rowmajor_inited.
 void DL_PrequantTexture(int texnum)
 {
-    if (!n64_use_rdp_renderer || !n64_rdp_wall_ab)
+    // The MESH wall route (n64_rdp_mesh) draws through the SAME CI4 row-major blocks as
+    // the RDP wall route, but it sets n64_rdp_wall_ab=0 (mesh REPLACES that route). So
+    // guarding on wall_ab alone left the mesh build with the prequant fully DISABLED ->
+    // every wall texture quantised lazily on first sight (the area-transition dlbuild
+    // spike, e.g. E1M1's computer room = 7 textures / 154ms in one frame). Prequant when
+    // EITHER wall route is active.
+    if (!n64_use_rdp_renderer || (!n64_rdp_wall_ab && !n64_rdp_mesh))
         return;
     if (texnum < 0 || texnum >= numtextures)
         return;

@@ -733,6 +733,20 @@ int	R_TextureNumForName (char* name)
 }
 
 
+//
+// R_TextureNameForNum
+// The 8-char texture name for a texnum (NOT NUL-terminated; print with %.8s).
+// For diagnostics that only carry a texnum (DLBUILD_TRACE) where `textures` isn't
+// in scope. Returns "" out of range.
+//
+const char* R_TextureNameForNum (int texnum)
+{
+    if (texnum < 0 || texnum >= numtextures)
+	return "";
+    return textures[texnum]->name;
+}
+
+
 
 
 //

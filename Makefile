@@ -95,6 +95,15 @@ endif
 ifeq ($(DPLANES_PROBE),1)
 CFLAGS += -DDPLANES_PROBE=1
 endif
+# DLBUILD_TRACE=1: log every CI4 wall-block build (DL_RowMajorBlock) that happens
+# DURING rendering (N64Bench_FrameNo > 0; builds at frame 0 are the R_PrecacheLevel
+# prequant). A render-time build = a texture the precache MISSED -> a first-touch
+# dlbuild spike. Each hit prints `DLBUILD-LATE frame=N tex=I name=NAME raw=R w=.. h=..`
+# to the ISViewer log, so a dlbuild-spike frame can be traced to the exact textures.
+# Diagnostic only (debugf, no geometry change); OFF by default.
+ifeq ($(DLBUILD_TRACE),1)
+CFLAGS += -DDLBUILD_TRACE=1
+endif
 # BENCH_MP=<2|3|4>: scripted local split-screen bench with that many players.
 ifneq ($(BENCH_MP),)
 CFLAGS += -DN64_BENCH_MP=$(BENCH_MP)

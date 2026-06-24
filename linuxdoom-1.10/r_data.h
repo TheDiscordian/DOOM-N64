@@ -52,6 +52,11 @@ extern short**		texturecolumnlump;
 extern unsigned short**	texturecolumnofs;
 extern byte**		texturecomposite;
 
+// The 8-char texture name for a texnum (NOT NUL-terminated; print with %.8s). For
+// diagnostics that only see texnums (e.g. the DLBUILD_TRACE first-touch logger in
+// rdp_view.c) where the `textures` array isn't in scope. Returns "" if out of range.
+const char* R_TextureNameForNum(int texnum);
+
 // Per-tex column-lookup state resolved ONCE per seg/tier, so the per-column wall
 // raster (r_segs.c) avoids re-doing R_GetColumn's per-tex work every column:
 // the function call, the two scattered Z_Malloc array indexes
