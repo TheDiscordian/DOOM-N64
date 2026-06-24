@@ -128,3 +128,26 @@ every frame; residual `mismatch` is sub-pixel fixed-point-vs-float (~1px, emit d
 must go default-on — a Ryan call, since the fixed-point transform differs from the CPU float path
 by ~1px sub-pixel (emit decisions agree, so no walls appear/vanish). Next: extend the same
 compaction to the floor-leaf transform (Phase 4), then evaluate default-on.
+
+## 8. Phase 4 design — floor-leaf transform on the RSP (examined 2026-06-24)
+Goal: move the floor/ceiling leaf-vertex projection off the CPU (it's what makes floors-on a
+p95 loss). The leaf transform is the SAME per-vertex projection as a wall corner — project
+world XY → screen-x `cx`, scale `sc`, `invw`, depth `z` — only `cy = centery - hf*sc` (the
+per-surface height term) and the u/v bias stay CPU (cheap; this is the existing CPU
+transform-share `df533b8`).
+
+Concrete plan (mirrors the wall offload, behind a NEW flag e.g. BENCH_FORCE_MESH_LEAF_RSP so
+the DEFAULT rsp_dlwall ucode/build stays untouched until verified):
+- rsp_dlwall.S: add `DLWallCmd_LeafBatch` (a 4th RSPQ_DefineCommand). Element = ONE leaf
+  vertex (world x,y) → output {cx, sc, invw, z} (float-as-fixed, 1/65536 like the wall out).
+  Reuse the wall command's projection block + the `vrcp`+Newton reciprocal. DMA leaf verts in
+  in BATCH_N chunks through buffers sized like BIN_BUF/BOUT_BUF — WATCH DMEM (it's shared with
+  rspq state; the wall BIN/BOUT already sit near the cap, so the leaf buffers may need to
+  REUSE the wall ones, not add new ones).
+- rdp_view.c DL_DrawMeshLeaves: pack the visible leaves' verts into a dense input (the leaf
+  pre-pass from df533b8 already collects them), dispatch the LeafBatch, read back {cx,sc,invw,z}
+  per vert, and the draw loop applies cy+bias+emit (already split out). Verify with the same
+  dl_rsp_verify pattern (CPU-reference compare → emit/coord agreement).
+- Then floors-on should become a clear win (leaf dlbuild drops like wall dlbuild did), and it
+  can go default-on too — at which point the software visplanes are gone and R_StoreWallRange's
+  plane-clip work can start coming off the BSP walk (step toward the bsp_walk collapse).
