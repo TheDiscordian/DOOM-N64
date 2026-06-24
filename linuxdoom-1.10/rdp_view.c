@@ -4435,6 +4435,7 @@ static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cu
     rspq_wait();
     data_cache_hit_invalidate(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
 
+    int worst_i = -1, worst_cx_on = 0, mism_on = 0, nv_on = 0;
     for (i = 0; i < nv; i++) {
         const rsp_bleaf_out_t* ro = &leaf_out_buf[i];
         const float* pr = &leaf_proj[6 * leaf_pvmap[i]];
@@ -4444,12 +4445,32 @@ static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cu
         double rel  = (pr[4] != 0.0f) ? (fabsf(rinvw - pr[4]) / fabsf(pr[4])) : 0.0;
         if (!ro->emit) emit_dis++;          // CPU drew it (drawable leaf) yet RSP culled
         if (dcx > 0.5f || rel > 0.01) mism++;
-        if ((int)(dcx * 1000.0f) > worst_cx)   worst_cx   = (int)(dcx * 1000.0f);
+        if ((int)(dcx * 1000.0f) > worst_cx)   { worst_cx = (int)(dcx * 1000.0f); worst_i = i; }
         if ((int)(rel * 1e6)     > worst_invw) worst_invw = (int)(rel * 1e6);
+        // ON-SCREEN error is what actually matters: off-screen verts (|cx| way outside
+        // 0..SCREENWIDTH) get clipped, and a px shift there moves the on-screen edge
+        // sub-pixel. Track verts within a margin of the screen separately.
+        if (pr[0] > -64.0f && pr[0] < (float)SCREENWIDTH + 64.0f) {
+            nv_on++;
+            if (dcx > 0.5f) mism_on++;
+            if ((int)(dcx * 1000.0f) > worst_cx_on) worst_cx_on = (int)(dcx * 1000.0f);
+        }
     }
-    if ((lf_frame % 256) == 0 || mism || emit_dis)
-        debugf("RSP-LEAF frame=%u verts=%d mism=%d emit_dis=%d worst_cx=%d(e-3) worst_invw=%d(e-6)\n",
-               lf_frame, nv, mism, emit_dis, worst_cx, worst_invw);
+    if ((lf_frame % 256) == 0 || mism_on || emit_dis)
+        debugf("RSP-LEAF frame=%u verts=%d/on%d mism=%d/on%d emit_dis=%d worst_cx=%d/on%d(e-3) worst_invw=%d(e-6)\n",
+               lf_frame, nv, nv_on, mism, mism_on, emit_dis, worst_cx, worst_cx_on, worst_invw);
+    // Localize: dump the worst-cx vert's depth + CPU/RSP invw+cx so we can see if it's a
+    // near-nearz huge-invw vert (small depth) or a structural ratio error.
+    if (worst_i >= 0 && (lf_frame % 64) == 0) {
+        int pv = leaf_pvmap[worst_i];
+        fixed_t wx = bake_leaf_verts[pv][0], wy = bake_leaf_verts[pv][1];
+        fixed_t depth = FixedMul(wx - viewx, vcos) + FixedMul(wy - viewy, vsin);
+        const float* pr = &leaf_proj[6 * pv];
+        const rsp_bleaf_out_t* ro = &leaf_out_buf[worst_i];
+        debugf("RSP-LEAF-WORST frame=%u depth=%d(.16) cpu_invw=%d(.16) rsp_invw=%d(.16) "
+               "cpu_cx=%d(.8) rsp_cx=%d(.8)\n", lf_frame, (int)depth,
+               (int)(pr[4]*65536.0f), (int)ro->invw, (int)(pr[0]*256.0f), (int)((float)ro->cx/256.0f));
+    }
     lf_frame++;
 }
 #endif
