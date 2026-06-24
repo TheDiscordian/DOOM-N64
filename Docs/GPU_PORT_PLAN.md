@@ -293,3 +293,33 @@ REVISED lever priority (all TAIL, since mean is vsync-capped):
 The present CPU blit (~843us) is small and the path is delicate -- NOT worth touching.
 (Side note: RDPWAIT_PROBE=1 currently OOM-asserts at I_InitGraphics in the mesh build --
 a pre-existing diagnostic-only bit-rot, off by default; fix if that probe is needed.)
+
+### MEASURED bsp_walk breakdown (2026-06-24, BSPWALK_PROBE) -- mesh emit is #1
+Sub-bracketed the bsp_walk phase (BSPWALK_PROBE=1, call-site CP0 brackets, geometry
+fingerprint verified identical). The design-workflow GUESSED R_AddLine 35-50% dominant +
+DL_MeshDrawWalls a 5-15% residual. MEASURED (mesh-floors, E1M1; mean bsp_walk 3132us /
+tail 10311us), it's the opposite ranking:
+
+| bsp_walk sub-part | mean us (share) | tail us (share) | tail/mean |
+|---|---|---|---|
+| mesh (DL_MeshDrawWalls) | 1126 (36%) | 3728 (36%) | 3.3x |
+| addline_net (R_AddLine vis+setup, MINUS raster) | 874 (28%) | 3147 (31%) | 3.6x |
+| leftover (R_FindPlane + recursion glue) | ~745 (24%) | ~1417 (14%) | |
+| checkbbox (node cull) | 204 (6%) | 583 (6%) | |
+| sprite (R_AddSprites collect) | 187 (6%) | 436 (4%) | |
+| (segloop = 1895/seg_rast, EXCLUDED from bsp_walk) | | | |
+
+**The GPU wall emit (DL_MeshDrawWalls) is the #1 bsp_walk cost in BOTH mean and tail (~36%)**
+-- it is the per-wall emit/depth-sort + the wall RSP-transform `rspq_wait` (DL_RSPBatchProbe
+runs inside it). R_AddLine-as-visibility (addline_net) is a close #2 (~31% tail). Both scale
+~3.3-3.6x into the tail; checkbbox/sprite are minor. R_AddLine looked huge only before
+subtracting the SEG_RASTER column loop nested inside it (segloop 1895us, correctly in
+seg_rast not bsp_walk).
+
+REVISED tail levers (bsp_walk, the biggest tail phase):
+  1. mesh emit (~3.7ms tail) -- cut DL_MeshDrawWalls: the RSP-transform wait + per-wall
+     emit/sort. The end state is RSP-emits-triangles (no CPU emit/readback), the same path
+     the floor leaves need. BIGGEST single bsp_walk lever.
+  2. addline_net (~3.1ms tail) -- the R_AddLine-strip endgame (frustum+Z replacing the
+     per-seg solidsegs occlusion). Comparable to mesh, not the dominant cost the plan assumed.
+  3. checkbbox/sprite -- minor; not worth attacking alone.
