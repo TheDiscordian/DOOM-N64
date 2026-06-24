@@ -172,6 +172,14 @@ endif
 ifneq ($(BENCH_FORCE_MESH_RSP),0)
 MESH_RSP := 1
 CFLAGS += -DBENCH_FORCE_MESH_RSP=1
+#   BENCH_FORCE_MESH_RSP_EARLY=1 -> OVERLAP experiment (GPU_PORT_PLAN.md): dispatch the wall
+#   RSP transform for ALL baked walls BEFORE the BSP walk (which is ~3ms of pure CPU, no
+#   RSP/RDP), so the transform overlaps it and the consume-time rspq_wait drops toward 0.
+#   Trades the BSP-vis compaction (transform ~475 not ~30 walls) for the overlap -- net is
+#   unknown, A/B it. batch_in/out indexed by wall id, not dense vis-slot. Nested under MESH_RSP.
+ifeq ($(BENCH_FORCE_MESH_RSP_EARLY),1)
+CFLAGS += -DBENCH_FORCE_MESH_RSP_EARLY=1
+endif
 endif
 endif
 endif
