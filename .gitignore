@@ -78,3 +78,7 @@ bench/bench-baseline.pak
 bench/last-overlay.png
 *.eeprom
 *.pak
+
+# KEEP_ROM=1 footgun: bare ROM artifact from bench scripts
+/1
+*.z64
