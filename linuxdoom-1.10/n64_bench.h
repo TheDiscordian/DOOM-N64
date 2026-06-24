@@ -149,6 +149,32 @@ void N64Bench_SetDPlanes(uint32_t lump_tk, uint32_t fitter_tk, uint32_t unproj_t
                          uint32_t scan_cols, uint32_t nodes);
 #endif
 
+#ifdef BSPWALK_PROBE
+// Sub-bracket the `bsp_walk` BPH bracket (the ~2925us mean / ~9294us tail, the biggest
+// TAIL contributor) into its constituents so the optimizer attacks the real cost. CALL-SITE
+// CP0-tick brackets in r_bsp.c / r_segs.c / r_main.c accumulate per frame into these globals
+// (defined in r_main.c, extern'd here -- the PVS/BAKEFAN cross-TU pattern); N64Bench_SetBspWalk
+// latches them. addline = R_AddLine WHOLE (incl its nested R_ClipSolid/Pass -> R_StoreWallRange
+// -> R_RenderSegLoop); segloop = R_RenderSegLoop ALONE (the SEG_RASTER column loop, which nests
+// inside addline and is already attributed to seg_rast) -> reported addline_net = addline - segloop
+// is the per-seg bsp_walk visibility+setup work (the BSP-walk-as-visibility the GPU port deletes).
+// checkbbox = R_CheckBBox node-subtree cull; sprite = R_AddSprites collection; mesh =
+// DL_MeshDrawWalls (the GPU-port wall emit, charged to bsp_walk by the bracket). Time-only --
+// every bracket is a get_ticks pair around UNCHANGED code, so the geometry fingerprint is
+// unperturbed (verify drawsegs/vissprites/visplanes identical). OFF by default (BSPWALK_PROBE=1).
+#include <libdragon.h>          // get_ticks (flag-gated only)
+extern uint32_t bspw_addline_tk;
+extern uint32_t bspw_segloop_tk;
+extern uint32_t bspw_checkbbox_tk;
+extern uint32_t bspw_sprite_tk;
+extern uint32_t bspw_mesh_tk;
+extern uint32_t bspw_addline_calls;
+#define BWP_T0()       uint64_t _bwp_t0 = get_ticks()
+#define BWP_ACC(acc)   do { (acc) += (uint32_t)(get_ticks() - _bwp_t0); } while (0)
+void N64Bench_SetBspWalk(uint32_t addline_tk, uint32_t segloop_tk, uint32_t checkbbox_tk,
+                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t addline_calls);
+#endif
+
 // Called once per gametic from G_Ticker to advance scenario timing/phases.
 void N64Bench_TicHook(void);
 

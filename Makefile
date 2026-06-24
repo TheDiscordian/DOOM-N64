@@ -95,6 +95,22 @@ endif
 ifeq ($(DPLANES_PROBE),1)
 CFLAGS += -DDPLANES_PROBE=1
 endif
+# BSPWALK_PROBE=1: one-off time-only sub-bracket of the `bsp_walk` BPH bracket (the
+# biggest TAIL contributor, ~2925us mean / ~9294us p95). Every bench frame, call-site CP0
+# brackets in r_bsp.c / r_segs.c / r_main.c accumulate RAW ticks into DISJOINT counters --
+# R_AddLine whole (incl its nested clip+R_StoreWallRange+R_RenderSegLoop), R_RenderSegLoop
+# alone (the SEG_RASTER loop nested in R_AddLine -> SUBTRACTED, so addline_net = addline -
+# segloop is the per-seg BSP-walk-as-visibility + seg setup), R_CheckBBox node cull,
+# R_AddSprites collection, and DL_MeshDrawWalls (the GPU wall emit charged to bsp_walk) --
+# plus an R_AddLine call counter. N64Bench_SetBspWalk latches them; reports MEAN us per
+# sub-part on the BENCH_BSPWALK line (mean-only -- per-frame storage for a p95 would bloat
+# bench_frames[] BSS ~98KB and OOM the init heap), to split the bsp_walk cost across its
+# constituents so the optimizer attacks the real one. The walk body is timed in place but
+# NOT changed (the geometry fingerprint is unperturbed -- verify drawsegs/vissprites/
+# visplanes stay identical), so it is OFF by default -- pass BSPWALK_PROBE=1 on the make line.
+ifeq ($(BSPWALK_PROBE),1)
+CFLAGS += -DBSPWALK_PROBE=1
+endif
 # DLBUILD_TRACE=1: log every CI4 wall-block build (DL_RowMajorBlock) that happens
 # DURING rendering (N64Bench_FrameNo > 0; builds at frame 0 are the R_PrecacheLevel
 # prequant). A render-time build = a texture the precache MISSED -> a first-touch

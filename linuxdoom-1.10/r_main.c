@@ -79,6 +79,19 @@ int		pvs_frame_cullable = 0;
 int		bakefan_frame_tris = 0;
 #endif
 
+#ifdef BSPWALK_PROBE
+// Per-frame RAW CP0-tick accumulators for the `bsp_walk` sub-bracket probe (the call-site
+// brackets in r_bsp.c / r_segs.c / r_main.c add into these via BWP_ACC; the externs +
+// macros + setter live in n64_bench.h). Reset in R_SetupFrame, latched via
+// N64Bench_SetBspWalk at the SetCounts call site below. Time-only -- no geometry change.
+uint32_t	bspw_addline_tk = 0;
+uint32_t	bspw_segloop_tk = 0;
+uint32_t	bspw_checkbbox_tk = 0;
+uint32_t	bspw_sprite_tk = 0;
+uint32_t	bspw_mesh_tk = 0;
+uint32_t	bspw_addline_calls = 0;
+#endif
+
 
 
 
@@ -1003,6 +1016,13 @@ void R_SetupFrame (player_t* player)
     // before the BSP walk re-fills it in R_Subsector. Pure measurement.
     bakefan_frame_tris = 0;
 #endif
+
+#ifdef BSPWALK_PROBE
+    // Reset the bsp_walk sub-bracket tick accumulators before this frame's BSP walk
+    // re-fills them (call-site brackets in r_bsp.c / r_segs.c / r_main.c).
+    bspw_addline_tk = bspw_segloop_tk = bspw_checkbbox_tk = 0;
+    bspw_sprite_tk = bspw_mesh_tk = bspw_addline_calls = 0;
+#endif
 	
     if (player->fixedcolormap)
     {
@@ -1092,7 +1112,11 @@ void R_RenderPlayerView (player_t* player)
 
     // GPU port: emit the static-mesh walls into the same arena as the BSP walk,
     // before the present flush. Self-gates on DL_MeshRouteOn (n64_rdp_mesh).
+#ifdef BSPWALK_PROBE
+    { BWP_T0(); DL_MeshDrawWalls (); BWP_ACC(bspw_mesh_tk); }
+#else
     DL_MeshDrawWalls ();
+#endif
 
     // Mid-render NetUpdate keeps the net serviced during a long frame. In
     // 1p there is no net to service, so it only burns I_GetTime + joypad
@@ -1146,6 +1170,12 @@ void R_RenderPlayerView (player_t* player)
     // accumulated during this frame's BSP walk (r_bsp.c R_Subsector). Directly
     // A/B-able against BENCH_PLANETESS. Pure measurement -- perturbs no geometry.
     N64Bench_SetBakefanTris(bakefan_frame_tris);
+#endif
+#ifdef BSPWALK_PROBE
+    // Latch the bsp_walk sub-bracket tick accumulators (filled by the call-site brackets
+    // during this frame's BSP walk + DL_MeshDrawWalls). Time-only -- perturbs no geometry.
+    N64Bench_SetBspWalk(bspw_addline_tk, bspw_segloop_tk, bspw_checkbbox_tk,
+                        bspw_sprite_tk, bspw_mesh_tk, bspw_addline_calls);
 #endif
 #else
     R_DrawMasked ();

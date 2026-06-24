@@ -183,6 +183,22 @@ static uint32_t         cur_dpl_unproj_us;
 static uint32_t         cur_dpl_scan_cols;
 static uint32_t         cur_dpl_nodes;
 #endif
+#ifdef BSPWALK_PROBE
+// Sub-bracket of the `bsp_walk` BPH bracket (per-frame us, latched by N64Bench_SetBspWalk).
+static uint32_t         cur_bspw_addline_net_us;
+static uint32_t         cur_bspw_segloop_us;
+static uint32_t         cur_bspw_checkbbox_us;
+static uint32_t         cur_bspw_sprite_us;
+static uint32_t         cur_bspw_mesh_us;
+static uint32_t         cur_bspw_addline_calls;
+// Running totals across the measured frames. MEAN-ONLY (no per-frame array): adding 6
+// per-frame fields to bench_frames[BENCH_MAX_FRAMES] bloats BSS ~98KB and starves the
+// heap (surface/scratch malloc fails at I_InitGraphics -- same OOM RDPWAIT_PROBE hits).
+// The mean breakdown answers the headline (each sub-part's SHARE of bsp_walk).
+static unsigned long long bspw_addline_sum, bspw_segloop_sum, bspw_checkbbox_sum;
+static unsigned long long bspw_sprite_sum,  bspw_mesh_sum,    bspw_calls_sum;
+static unsigned long      bspw_nframes;
+#endif
 
 #ifdef RDPWAIT_PROBE
 // Async RDP/RDRAM stall attribution. The RDP-completion callback (I_N64BufferDone,
@@ -392,6 +408,10 @@ void N64Bench_LoopBegin(void)
     cur_dpl_lump_us = cur_dpl_fitter_us = cur_dpl_unproj_us = 0;
     cur_dpl_scan_cols = cur_dpl_nodes = 0;
 #endif
+#ifdef BSPWALK_PROBE
+    cur_bspw_addline_net_us = cur_bspw_segloop_us = cur_bspw_checkbbox_us = 0;
+    cur_bspw_sprite_us = cur_bspw_mesh_us = cur_bspw_addline_calls = 0;
+#endif
 #ifdef RDPWAIT_PROBE
     memset(cur_async_tk, 0, sizeof(cur_async_tk));
     cur_async_fires = 0;
@@ -575,6 +595,27 @@ void N64Bench_SetDPlanes(uint32_t lump_tk, uint32_t fitter_tk, uint32_t unproj_t
 }
 #endif
 
+#ifdef BSPWALK_PROBE
+// Latch the `bsp_walk` sub-bracket tick accumulators (call-site CP0 brackets in
+// r_bsp.c/r_segs.c/r_main.c), converting RAW CP0 ticks to us per frame. Called once
+// per frame at the SetCounts call site (r_main.c). addline_net = R_AddLine MINUS the
+// R_RenderSegLoop nested inside it (the SEG_RASTER column loop, already attributed to
+// seg_rast -- subtract so this is the per-seg bsp_walk work, not the raster). Clamp >=0.
+void N64Bench_SetBspWalk(uint32_t addline_tk, uint32_t segloop_tk, uint32_t checkbbox_tk,
+                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t addline_calls)
+{
+    uint32_t addline_net = (addline_tk > segloop_tk) ? (addline_tk - segloop_tk) : 0;
+    if (!loop_open)
+        return;
+    cur_bspw_addline_net_us = (uint32_t)TICKS_TO_US(addline_net);
+    cur_bspw_segloop_us     = (uint32_t)TICKS_TO_US(segloop_tk);
+    cur_bspw_checkbbox_us   = (uint32_t)TICKS_TO_US(checkbbox_tk);
+    cur_bspw_sprite_us      = (uint32_t)TICKS_TO_US(sprite_tk);
+    cur_bspw_mesh_us        = (uint32_t)TICKS_TO_US(mesh_tk);
+    cur_bspw_addline_calls  = addline_calls;
+}
+#endif
+
 void N64Bench_DisplayBegin(void)
 {
     if (!loop_open)
@@ -679,6 +720,18 @@ void N64Bench_LoopEnd(void)
         f->dpl_unproj_us = cur_dpl_unproj_us;
         f->dpl_scan_cols = cur_dpl_scan_cols;
         f->dpl_nodes     = cur_dpl_nodes;
+#endif
+#ifdef BSPWALK_PROBE
+        // MEAN-ONLY running totals (no per-frame array -- see the bspw_*_sum note). Same
+        // frame set as the official bench_frames commit (this block), so bspw_nframes
+        // tracks bench_frame_count.
+        bspw_addline_sum  += cur_bspw_addline_net_us;
+        bspw_segloop_sum  += cur_bspw_segloop_us;
+        bspw_checkbbox_sum+= cur_bspw_checkbbox_us;
+        bspw_sprite_sum   += cur_bspw_sprite_us;
+        bspw_mesh_sum     += cur_bspw_mesh_us;
+        bspw_calls_sum    += cur_bspw_addline_calls;
+        bspw_nframes++;
 #endif
 #ifdef RDPWAIT_PROBE
         for (i = 0; i < BPH_COUNT; i++)
@@ -1274,6 +1327,25 @@ static void N64Bench_ReportPhases(void)
            (unsigned long)(dpl_unproj_sum / bench_frame_count), N64Bench_DPlanesP95(2),
            (unsigned long)(dpl_scan_cols_sum / bench_frame_count),
            (unsigned long)(dpl_nodes_sum     / bench_frame_count));
+#endif
+#ifdef BSPWALK_PROBE
+    // Sub-bracket of the `bsp_walk` BPH bracket: mean + EXACT p95 us per constituent.
+    // addline_net (the per-seg BSP-walk-as-visibility + seg setup, EXCLUDING the
+    // R_RenderSegLoop raster nested inside it) + checkbbox + sprite + mesh ~= the
+    // BENCH_PHASE name=bsp_walk mean (residual = R_FindPlane + recursion glue +
+    // get_ticks overhead). segloop is shown for validation (it is attributed to
+    // seg_rast, NOT bsp_walk). addline_calls = R_AddLine entries (reject-ratio vs
+    // drawsegs). Read directly against the bsp_walk BENCH_PHASE/BENCH_TAIL lines.
+    if (bspw_nframes)
+    debugf("BENCH_BSPWALK addline_mean=%lu checkbbox_mean=%lu sprite_mean=%lu mesh_mean=%lu "
+           "segloop_mean=%lu addline_calls_mean=%lu nframes=%lu\n",
+           (unsigned long)(bspw_addline_sum  / bspw_nframes),
+           (unsigned long)(bspw_checkbbox_sum / bspw_nframes),
+           (unsigned long)(bspw_sprite_sum   / bspw_nframes),
+           (unsigned long)(bspw_mesh_sum     / bspw_nframes),
+           (unsigned long)(bspw_segloop_sum  / bspw_nframes),
+           (unsigned long)(bspw_calls_sum    / bspw_nframes),
+           bspw_nframes);
 #endif
 #ifdef BAKEFAN_PROBE
     // DECISIVE go/no-go for the native offline-baked RDP renderer (per-subsector

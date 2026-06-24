@@ -62,6 +62,13 @@ extern int	pvs_frame_cullable;
 extern int	bakefan_frame_tris;
 #endif
 
+#ifdef BSPWALK_PROBE
+// `bsp_walk` sub-bracket probe: n64_bench.h supplies the BWP_T0/BWP_ACC CP0-tick
+// macros + the extern accumulators (defined in r_main.c). Call-site brackets below
+// time R_AddSprites, R_AddLine (whole, +call count), and R_CheckBBox.
+#include "n64_bench.h"
+#endif
+
 
 
 seg_t*		curline;
@@ -589,7 +596,11 @@ void R_Subsector (int num)
     }
 #endif
 
+#ifdef BSPWALK_PROBE
+    { BWP_T0(); R_AddSprites (frontsector); BWP_ACC(bspw_sprite_tk); }
+#else
     R_AddSprites (frontsector);
+#endif
 
     while (count--)
     {
@@ -604,7 +615,11 @@ void R_Subsector (int num)
 	    if (n64_rdp_mesh_cull && line->linedef)
 		R_MeshMarkLine ((int)(line->linedef - lines));
 	}
+#ifdef BSPWALK_PROBE
+	{ BWP_T0(); R_AddLine (line); BWP_ACC(bspw_addline_tk); bspw_addline_calls++; }
+#else
 	R_AddLine (line);
+#endif
 	line++;
     }
 }
@@ -641,8 +656,19 @@ void R_RenderBSPNode (int bspnum)
     R_RenderBSPNode (bsp->children[side]); 
 
     // Possibly divide back space.
-    if (R_CheckBBox (bsp->bbox[side^1]))	
+#ifdef BSPWALK_PROBE
+    {
+	int _bwp_vis;
+	BWP_T0();
+	_bwp_vis = R_CheckBBox (bsp->bbox[side^1]);
+	BWP_ACC(bspw_checkbbox_tk);
+	if (_bwp_vis)
+	    R_RenderBSPNode (bsp->children[side^1]);
+    }
+#else
+    if (R_CheckBBox (bsp->bbox[side^1]))
 	R_RenderBSPNode (bsp->children[side^1]);
+#endif
 }
 
 

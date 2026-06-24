@@ -984,9 +984,16 @@ R_StoreWallRange
     if (markfloor)
 	floorplane = R_CheckPlane (floorplane, rw_x, rw_stopx-1);
 
+#ifdef BSPWALK_PROBE
+    // The SEG_RASTER column loop nested inside R_AddLine. Timed here so the bsp_walk
+    // probe can SUBTRACT it from R_AddLine (it is already attributed to seg_rast, not
+    // bsp_walk) -> addline_net = addline - segloop is the per-seg bsp_walk work.
+    { BWP_T0(); R_RenderSegLoop (); BWP_ACC(bspw_segloop_tk); }
+#else
     R_RenderSegLoop ();
+#endif
 
-    
+
     // save sprite clipping info
     if ( ((ds_p->silhouette & SIL_TOP) || maskedtexture)
 	 && !ds_p->sprtopclip)
