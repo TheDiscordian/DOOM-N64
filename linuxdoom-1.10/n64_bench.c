@@ -113,6 +113,14 @@ typedef struct
     uint32_t dpl_scan_cols;  // deviation-scan column iterations this frame
     uint32_t dpl_nodes;      // R_EmitIslandRuns invocations this frame
 #endif
+#ifdef BSPWALK_PROBE
+    // Per-frame us for the bsp_walk sub-brackets, for the TAIL breakdown ONLY (uint16_t
+    // to keep the bench_frames[] BSS bloat to ~32KB; the MEAN comes from running sums).
+    uint16_t bspw_addline_net_us;
+    uint16_t bspw_checkbbox_us;
+    uint16_t bspw_sprite_us;
+    uint16_t bspw_mesh_us;
+#endif
 #ifdef RDPWAIT_PROBE
     uint32_t async_us[BPH_COUNT];  // async RDP-completion interrupt us charged to
                                    // each open phase this frame (where the DP
@@ -732,6 +740,11 @@ void N64Bench_LoopEnd(void)
         bspw_mesh_sum     += cur_bspw_mesh_us;
         bspw_calls_sum    += cur_bspw_addline_calls;
         bspw_nframes++;
+        // Per-frame copy for the TAIL breakdown (the report's tail loop sums these).
+        f->bspw_addline_net_us = (uint16_t)cur_bspw_addline_net_us;
+        f->bspw_checkbbox_us   = (uint16_t)cur_bspw_checkbbox_us;
+        f->bspw_sprite_us      = (uint16_t)cur_bspw_sprite_us;
+        f->bspw_mesh_us        = (uint16_t)cur_bspw_mesh_us;
 #endif
 #ifdef RDPWAIT_PROBE
         for (i = 0; i < BPH_COUNT; i++)
@@ -1185,6 +1198,9 @@ static void N64Bench_ReportPhases(void)
     unsigned long long t_total_sum = 0, t_leftover_sum = 0;
     unsigned long long t_viss_sum = 0, t_ds_sum = 0, t_vp_sum = 0;
     unsigned long t_tics_frames = 0;
+#ifdef BSPWALK_PROBE
+    unsigned long long t_bspw_addline = 0, t_bspw_checkbbox = 0, t_bspw_sprite = 0, t_bspw_mesh = 0;
+#endif
 
     // worst-N frames by total (indices), simple insertion sort, descending.
     unsigned long worst_idx[BENCH_WORST_N];
@@ -1250,6 +1266,12 @@ static void N64Bench_ReportPhases(void)
             t_total_sum += f->total_us;
             for (p = 0; p < BPH_COUNT; p++) t_phase_sum[p] += f->phase_us[p];
             t_leftover_sum += leftover;
+#ifdef BSPWALK_PROBE
+            t_bspw_addline  += f->bspw_addline_net_us;
+            t_bspw_checkbbox+= f->bspw_checkbbox_us;
+            t_bspw_sprite   += f->bspw_sprite_us;
+            t_bspw_mesh     += f->bspw_mesh_us;
+#endif
             t_viss_sum += f->vissprites;
             t_ds_sum   += f->drawsegs;
             t_vp_sum   += f->visplanes;
@@ -1346,6 +1368,16 @@ static void N64Bench_ReportPhases(void)
            (unsigned long)(bspw_segloop_sum  / bspw_nframes),
            (unsigned long)(bspw_calls_sum    / bspw_nframes),
            bspw_nframes);
+    // TAIL breakdown (worst-5% frames by total) -- the proportions that actually matter,
+    // since the mean is vsync-bound. mesh's RSP-wait is ~constant; addline/checkbbox/sprite
+    // scale with the geometry that grows in the tail, so the split flips vs the mean.
+    if (tail_n)
+    debugf("BENCH_BSPWALK_TAIL addline=%lu checkbbox=%lu sprite=%lu mesh=%lu tail_n=%lu\n",
+           (unsigned long)(t_bspw_addline  / tail_n),
+           (unsigned long)(t_bspw_checkbbox / tail_n),
+           (unsigned long)(t_bspw_sprite   / tail_n),
+           (unsigned long)(t_bspw_mesh     / tail_n),
+           tail_n);
 #endif
 #ifdef BAKEFAN_PROBE
     // DECISIVE go/no-go for the native offline-baked RDP renderer (per-subsector
