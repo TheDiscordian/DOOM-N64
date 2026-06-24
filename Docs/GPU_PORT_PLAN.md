@@ -323,3 +323,24 @@ REVISED tail levers (bsp_walk, the biggest tail phase):
   2. addline_net (~3.1ms tail) -- the R_AddLine-strip endgame (frustum+Z replacing the
      per-seg solidsegs occlusion). Comparable to mesh, not the dominant cost the plan assumed.
   3. checkbbox/sprite -- minor; not worth attacking alone.
+
+### Mesh #1-lever decomposed: it's the RSP readback STALL (2026-06-24, BSPWALK_PROBE)
+mesh_rspwait sub-bracket (DL_RSPBatchProbe = wall pack+dispatch+rspq_wait): mesh_mean 1128us,
+of which **mesh_rspwait 776us (69%)** -- the CPU STALLING on the wall RSP transform. CPU
+emit/sort is only ~352us. mesh-cpu A/B (BENCH_FORCE_MESH_RSP=0, CPU transform) = +2.4% avg /
++4.4% p95 WORSE, so the RSP transform is NET-POSITIVE (CPU transform ~1183us > RSP round-trip
+776us); reverting LOSES. The 776us is the cost of reading transformed verts back to the CPU.
+
+Two ways to attack it:
+  A. RSP-EMITS-TRIANGLES (keystone): the RSP transforms AND writes the rdpq_triangle commands
+     (edge coeffs + persp-tex + Z) -> CPU never reads batch_out, never waits. Removes BOTH the
+     776us stall AND the 352us emit. Feasible (tiny3d does it) but a multi-session ucode rewrite
+     (and tiny3d itself is NO-GO: it resets combiner/TLUT, stomping DOOM CI4 -- must hand-roll).
+  B. OVERLAP THE TRANSFORM (bounded): rspq_wait is a full-queue drain so it can't overlap LATER
+     RDP work -- BUT the BSP walk is ~3ms of PURE CPU with zero RSP/RDP activity. Dispatch the
+     wall transform BEFORE the BSP walk, consume at DL_MeshDrawWalls -> the RSP transforms during
+     that window, wait ~0. CATCH: early dispatch can't use the BSP-vis compaction (vis unknown
+     until the walk ends), so it transforms ALL ~475 walls not the ~30 visible -- and transform-
+     all was a -6% LOSS without overlap (the compaction commit). So B trades compaction for
+     overlap; net is unknown -> MEASURE behind a flag, don't assume. If the 475-wall transform
+     fits in the 3ms BSP window, B hides most of the 776us for a fraction of A's effort.
