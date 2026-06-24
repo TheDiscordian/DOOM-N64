@@ -255,3 +255,16 @@ T&L that EMITS the rdpq triangles directly (no CPU readback) — a much larger u
 win, likely a missing precache); (b) sprites→mesh then strip R_AddLine (the bsp_walk
 collapse — the port's whole point); (c) present/2D-overlay offload (biggest MEAN win, but
 highest risk). RSP-emits-triangles underlies both (a-floors) and a long-term present cut.
+
+### UPDATE (2026-06-24): the frame-412 dlbuild spike is FIXED (prequant was off)
+Lever (a) above landed. Root cause was NOT a missed precache SET — it was that
+`DL_PrequantTexture` guarded on `n64_rdp_wall_ab`, which the mesh build forces to 0
+(mesh replaces the RDP wall route, d_main.c:2219). So the level-load prequant was a
+complete no-op for the ENTIRE mesh effort; every wall texture quantised lazily on first
+sight. Fix (commit f1cffea): prequant when `wall_ab || n64_rdp_mesh`. Clean-build A/B
+(mesh-floors, 4117 frames): **max_us 175159 -> 35991 (-79%), min_fps 5.8 -> 27.7**; avg
+16633->16592 / p95 30112->30240 (flat -- the spikes were too rare to move the aggregates,
+but they wrecked the worst case + felt smoothness on every room entry). Render-time
+texture builds 19 -> 0 (all 34 now prequant'd at load), confirmed via the new
+`DLBUILD_TRACE=1` probe. The MEAN levers (present 23.8%, bsp_walk, dlbuild steady) are
+unchanged and remain next.
