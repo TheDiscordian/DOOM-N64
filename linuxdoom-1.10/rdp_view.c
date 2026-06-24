@@ -2445,6 +2445,22 @@ typedef struct {
     int32_t emit;                  // 0x30        1 = survived all skips, else 0
     int32_t pad0, pad1, pad2;      // 0x34,0x38,0x3C
 } rsp_bwall_out_t;                 // 64 bytes
+
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+// Phase 4: per-leaf-VERTEX transform on the RSP (DLWallCmd_LeafBatch). Layout MUST
+// match BLI_*/BLO_* in rsp/rsp_dlwall.S. The RSP does the divide-heavy part (cx, invw);
+// the CPU derives sc=centerx*invw, z=DL_WallZ(invw), u/v, and per-surface cy.
+#define DLWALL_CMD_LEAFBATCH 3
+typedef struct {
+    int32_t x, y;                  // 0x00,0x04   world map coords (fixed_t)
+} rsp_bleaf_in_t;                  // 8 bytes
+typedef struct {
+    int32_t cx;                    // 0x00        screen-x 16.16 (== wall sx)
+    int32_t invw;                  // 0x04        65536/depth 16.16
+    int32_t emit;                  // 0x08        1 = in front of near plane, 0 = cull leaf
+    int32_t pad;                   // 0x0C
+} rsp_bleaf_out_t;                 // 16 bytes
+#endif
 #endif
 
 // Map a record's per-edge INV_W (== 1/depth in map units, see dl_invw_k) to a
@@ -4368,6 +4384,76 @@ static void DL_FlushSpans(void)
 // plane straddlers culled; ceilings/sky + the plane-suppression A/B come next.
 #define DL_LEAF_MAXV 64
 static int dl_leaf_tris = 0;
+
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+// Phase 4 VERIFY (logging only, no render effect): dispatch every drawable leaf's verts
+// through the RSP DLWallCmd_LeafBatch and compare {cx, invw, emit} against the CPU
+// leaf_proj the pre-pass just computed. Same gate the wall path used before cutover --
+// once RSP-LEAF mism/emit_dis hold at ~0 over the demo, the draw loop can read the RSP
+// output instead of the CPU transform.
+#define DL_LEAF_VERT_MAX (DL_WALL_ARENA * 4)
+static rsp_bleaf_in_t  leaf_in_buf[DL_LEAF_VERT_MAX]  __attribute__((aligned(16)));
+static rsp_bleaf_out_t leaf_out_buf[DL_LEAF_VERT_MAX] __attribute__((aligned(16)));
+static int             leaf_pvmap[DL_LEAF_VERT_MAX];
+static void DL_RSPLeafProbe(const float* leaf_proj, const unsigned char* leaf_cull)
+{
+    static unsigned lf_frame = 0;
+    static rsp_view_blk_t* vb = NULL;
+    fixed_t vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    fixed_t vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    int ss, i, nv = 0, mism = 0, emit_dis = 0, worst_cx = 0, worst_invw = 0;
+
+    if (rsp_dlwall_ovl_id == 0) return;
+    if (!vb) vb = memalign(16, sizeof *vb);
+    if (!vb) return;
+    vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
+    vb->vcos = vcos;   vb->vsin = vsin;
+    vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
+
+    for (ss = 0; ss < numsubsectors && nv < DL_LEAF_VERT_MAX; ss++) {
+        bake_leaf_t* lf;
+        int n;
+        if (leaf_cull[ss]) continue;
+        lf = &bake_leaves[ss];
+        n = lf->numverts;
+        for (i = 0; i < n && nv < DL_LEAF_VERT_MAX; i++) {
+            int pv = lf->firstvert + i;
+            leaf_in_buf[nv].x = bake_leaf_verts[pv][0];
+            leaf_in_buf[nv].y = bake_leaf_verts[pv][1];
+            leaf_pvmap[nv] = pv;
+            nv++;
+        }
+    }
+    if (nv == 0) { lf_frame++; return; }
+
+    data_cache_hit_writeback(vb, sizeof *vb);
+    data_cache_hit_writeback(leaf_in_buf,  (uint32_t)((size_t)nv * sizeof(rsp_bleaf_in_t)));
+    data_cache_hit_writeback(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
+    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_LEAFBATCH,
+               PhysicalAddr(vb), PhysicalAddr(leaf_in_buf),
+               PhysicalAddr(leaf_out_buf), (uint32_t)nv);
+    rspq_wait();
+    data_cache_hit_invalidate(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
+
+    for (i = 0; i < nv; i++) {
+        const rsp_bleaf_out_t* ro = &leaf_out_buf[i];
+        const float* pr = &leaf_proj[6 * leaf_pvmap[i]];
+        float rcx   = (float)ro->cx   * (1.0f / 65536.0f);
+        float rinvw = (float)ro->invw * (1.0f / 65536.0f);
+        float dcx   = fabsf(rcx - pr[0]);
+        double rel  = (pr[4] != 0.0f) ? (fabsf(rinvw - pr[4]) / fabsf(pr[4])) : 0.0;
+        if (!ro->emit) emit_dis++;          // CPU drew it (drawable leaf) yet RSP culled
+        if (dcx > 0.5f || rel > 0.01) mism++;
+        if ((int)(dcx * 1000.0f) > worst_cx)   worst_cx   = (int)(dcx * 1000.0f);
+        if ((int)(rel * 1e6)     > worst_invw) worst_invw = (int)(rel * 1e6);
+    }
+    if ((lf_frame % 256) == 0 || mism || emit_dis)
+        debugf("RSP-LEAF frame=%u verts=%d mism=%d emit_dis=%d worst_cx=%d(e-3) worst_invw=%d(e-6)\n",
+               lf_frame, nv, mism, emit_dis, worst_cx, worst_invw);
+    lf_frame++;
+}
+#endif
+
 static void DL_DrawMeshLeaves(void)
 {
     fixed_t vcos, vsin;
@@ -4469,6 +4555,11 @@ static void DL_DrawMeshLeaves(void)
         }
         leaf_cull[ss] = 0;                              // transformed OK -> drawable
     }
+
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+    // Phase 4 verify: RSP leaf-vertex transform vs the CPU leaf_proj just computed.
+    DL_RSPLeafProbe(leaf_proj, leaf_cull);
+#endif
 
     // surf 0 = floor, surf 1 = ceiling. Same leaf polygon at the sector's floor/ceiling
     // height + flat. Both passes share the Z-buffer (already paid) so adding ceilings
