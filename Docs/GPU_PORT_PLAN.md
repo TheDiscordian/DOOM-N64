@@ -214,3 +214,44 @@ solidsegs + R_StoreWallRange). The plan is to delete it and let the mesh do its 
    replacement the whole port is for. NOTE: even the frustum cull currently leans on solidsegs
    (R_CheckBBox uses them); the pure-frustum walk drops solidsegs entirely and lets Z do ALL
    occlusion — visits/draws more, but kills the per-seg cost. Measure the balance when it lands.
+
+## CURRENT PROFILE + corrected next levers (2026-06-24, default mesh build = mesh-floors)
+
+`bench/bench.sh mesh-floors`, E1M1 4117 frames, avg 16633 / p95 30112 (60.1 / 33.2 fps).
+Per-phase MEAN (pct of mean_total 19522us):
+
+| phase | mean us | pct | p95 us | tail (worst-5%) us |
+|---|---|---|---|---|
+| present  | 4654 | 23.8 | 11360 | 843 |
+| dlbuild  | 3455 | 17.7 | 11424 | 13084 |
+| bsp_walk | 2925 | 14.9 | 9120  | 9294 |
+| hud      | 2112 | 10.8 | 4192  | 3401 |
+| audio    | 2111 | 10.8 | 6176  | 4863 |
+| seg_rast | 1590 | 8.1  | 3360  | 3150 |
+| masked   | 1457 | 7.4  | 3360  | 2216 |
+| planes   | 60   | 0.3  | 288   | 254  |
+| rdpbusy  | 3    | 0.0  | -     | 3    |
+
+**Two distinct regimes — pick the lever by which you're cutting:**
+- **MEAN is `present`-dominated (23.8%).** NEW finding (prior notes were tail-focused).
+  `present` = the CI8-band `rdpq_tex_blit` emits (the still-software HUD / sprites / status
+  bar blitted around the RDP view box) + buffer flip. The RDP is idle (rdpbusy ~3us), so
+  this is CPU command-emit, not raster. copy-forward memcpy is wipe-only (not the cost).
+  Cutting it means moving the 2D overlay off the per-frame CI8 blit — DELICATE path (ghost
+  / TLUT / keyed-box correctness history); do not optimise speculatively.
+- **TAIL is `dlbuild` + `bsp_walk` (34% + 24%).** The worst frame (412) is a **154 ms**
+  dlbuild spike (= the max_us=172114 outlier) — a first-touch texture event the
+  R_PrecacheLevel prequant missed. Killing that one spike alone collapses max_us. bsp_walk
+  tail (9294) is the BSP-walk-as-visibility cost the port's endgame (strip R_AddLine) targets.
+
+**CORRECTION to "NEXT — leaf transform on the RSP" above: DONE and REFUTED.** Putting the
+floor-leaf transform on the RSP is a STRUCTURAL LOSS (+3.6% avg / +10.4% p95), not a win —
+the readback round-trip (overlay-reload DMA + buffer DMA + sync) costs more than the ~85
+cheap CPU divides it offloads, and no barrier placement fixes it (three builds tried; see
+RSP_PORT_PLAN.md §8.2/§8.3). Floors stay on the CPU-leaf path. The only floor win is RSP
+T&L that EMITS the rdpq triangles directly (no CPU readback) — a much larger ucode effort.
+
+**Recommended order now:** (a) the frame-412 dlbuild spike (isolated, biggest max-frame
+win, likely a missing precache); (b) sprites→mesh then strip R_AddLine (the bsp_walk
+collapse — the port's whole point); (c) present/2D-overlay offload (biggest MEAN win, but
+highest risk). RSP-emits-triangles underlies both (a-floors) and a long-term present cut.
