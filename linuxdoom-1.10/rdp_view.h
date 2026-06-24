@@ -265,6 +265,10 @@ extern int n64_rdp_mesh_rsp;    // RSP port (BENCH_FORCE_MESH_RSP); Phase 0 = DM
 extern int dl_zbuf_attached;    // set by i_video each frame (1 = z-image attached)
 int  DL_MeshRouteOn(void);
 void DL_MeshDrawWalls(void);
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+// OVERLAP experiment: dispatch the all-walls RSP transform before the BSP walk (r_main.c).
+void DL_RSPDispatchAllWalls(void);
+#endif
 
 // Pre-build one wall texture's CI4 block + sub-palette at LEVEL LOAD (called from
 // R_PrecacheLevel) so the per-frame render never pays the first-touch median-cut

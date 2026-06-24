@@ -1105,6 +1105,11 @@ void R_RenderPlayerView (player_t* player)
     // separately (the RDP renderer offloads SEG_RASTER, keeps BSP_WALK).
     R_MeshResetVis ();      // GPU port: clear per-line vis before the walk re-marks it
     R_MeshResetLeafVis ();  // GPU port: clear per-subsector vis (floor/ceiling leaves)
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+    // OVERLAP experiment: kick the all-walls RSP transform NOW so it runs on the RSP during
+    // the pure-CPU BSP walk below; DL_MeshDrawWalls then consumes it with a ~0 rspq_wait.
+    DL_RSPDispatchAllWalls ();
+#endif
 #ifdef N64_BENCH
     N64Bench_PhaseBegin(BPH_BSP_WALK);
     R_RenderBSPNode (numnodes-1);

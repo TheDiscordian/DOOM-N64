@@ -2534,11 +2534,15 @@ static void DL_RSPLoopbackProbe(void)
         return;
     }
 
-    // Register the overlay exactly once.
+    // Register the overlay exactly once. Guard on the SHARED rsp_dlwall_ovl_id, not just the
+    // local `registered` flag: another path (e.g. DL_RSPDispatchAllWalls, the EARLY-overlap
+    // experiment, which runs before this) may have registered it first -- registering the same
+    // overlay twice trips an rspq overlay-table assertion.
     if (!registered)
     {
-        ovl_id = rspq_overlay_register(&rsp_dlwall);
-        rsp_dlwall_ovl_id = ovl_id;
+        if (rsp_dlwall_ovl_id == 0)
+            rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+        ovl_id = rsp_dlwall_ovl_id;
         registered = 1;
         debugf("RSP-LOOPBACK: overlay registered, id=0x%08lx\n",
                (unsigned long)ovl_id);
@@ -2812,6 +2816,12 @@ static rsp_bwall_out_t *batch_out = batch_out_buf;
 // dense slot j; consumers (DL_MeshDrawWalls + the dl_rsp_verify compare) walk the list.
 static int batch_vislist[DL_WALL_ARENA];
 static int batch_nvis = 0;
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+// OVERLAP experiment: 1 once DL_RSPDispatchAllWalls has dispatched the all-walls transform
+// (before the BSP walk). When set, batch_out is indexed by WALL ID (not dense vis-slot) and
+// DL_RSPBatchProbe only builds the vis-list + waits, instead of packing+dispatching.
+static int batch_early_done = 0;
+#endif
 
 // Worst deltas observed across the whole run (for the end-of-demo report).
 static float  batch_run_worst_sx   = 0.0f;
@@ -2858,6 +2868,32 @@ static void DL_RSPBatchProbe(void)
         debugf("RSP-BATCH: SKIP (walls %d > arena %d)\n", bake_numwalls, DL_WALL_ARENA);
         return;
     }
+
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+    if (batch_early_done) {
+        // OVERLAP: the all-walls transform was dispatched before the BSP walk and has been
+        // running on the RSP throughout it. batch_out is indexed by WALL ID. Just build the
+        // vis-list (compaction filter, now that vis is known), wait (~0 -- the RSP finished
+        // during the walk, nothing else queued since), and invalidate.
+        batch_nvis = 0;
+        for (i = 0; i < bake_numwalls; i++) {
+            const bake_wall_t* bw = &bake_walls[i];
+            fixed_t ztopz, zbotz;
+            if (bake_linevis && !bake_linevis[bw->line]) continue;
+            ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                                  : sectors[bw->ztop_sec].floorheight;
+            zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                                  : sectors[bw->zbot_sec].floorheight;
+            if (ztopz <= zbotz) continue;
+            batch_vislist[batch_nvis++] = i;
+        }
+        rspq_wait();
+        data_cache_hit_invalidate(batch_out,
+            (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+        batch_frame++;
+        return;
+    }
+#endif
 
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
     vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
@@ -3055,6 +3091,60 @@ static void DL_RSPBatchProbe(void)
     batch_frame++;
     /* vb is a one-time static cache (vb_cache) -- never freed, so no per-frame heap churn */
 }
+
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+// OVERLAP experiment: dispatch the wall RSP transform for ALL baked walls (indexed by wall
+// id, NO compaction -- vis isn't known yet) BEFORE the BSP walk, and return WITHOUT waiting.
+// The RSP transforms the whole bake during the ~3ms pure-CPU walk; DL_RSPBatchProbe (after the
+// walk) builds the vis-list + waits (~0) + invalidates. Trades the compaction (475 vs ~30
+// walls transformed) for hiding the rspq_wait stall behind the walk. A/B vs the default.
+void DL_RSPDispatchAllWalls(void)
+{
+    static rsp_view_blk_t* vb2 = NULL;
+    fixed_t vcos, vsin;
+    int i;
+
+    batch_early_done = 0;
+    if (!n64_rdp_mesh_rsp || !DL_MeshRouteOn())
+        return;
+    if (!bake_walls || bake_numwalls <= 0 || bake_numwalls > DL_WALL_ARENA)
+        return;
+    if (rsp_dlwall_ovl_id == 0)
+        rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+    if (rsp_dlwall_ovl_id == 0)
+        return;
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    if (!vb2) vb2 = memalign(16, sizeof *vb2);
+    if (!vb2) return;
+    vb2->viewx = viewx; vb2->viewy = viewy; vb2->viewz = viewz;
+    vb2->vcos = vcos;   vb2->vsin = vsin;
+    vb2->centerx = centerx; vb2->centery = centery; vb2->pad0 = 0;
+
+    // Pack EVERY baked wall into batch_in[wall_id] (live sector heights snapshotted now, the
+    // same as the compacted path -- heights change in P_Ticker, not during the render).
+    for (i = 0; i < bake_numwalls; i++) {
+        const bake_wall_t* bw = &bake_walls[i];
+        fixed_t ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
+                                      : sectors[bw->ztop_sec].floorheight;
+        fixed_t zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
+                                      : sectors[bw->zbot_sec].floorheight;
+        batch_in[i].x1 = bw->x1; batch_in[i].y1 = bw->y1;
+        batch_in[i].x2 = bw->x2; batch_in[i].y2 = bw->y2;
+        batch_in[i].ztop = ztopz; batch_in[i].zbot = zbotz;
+        batch_in[i].vis = 1; batch_in[i].pad0 = 0;
+    }
+    data_cache_hit_writeback(vb2, sizeof *vb2);
+    data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_in_t)));
+    data_cache_hit_writeback(batch_out, (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_out_t)));
+    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
+               PhysicalAddr(vb2), PhysicalAddr(batch_in),
+               PhysicalAddr(batch_out), (uint32_t)bake_numwalls);
+    // NO rspq_wait -- overlaps the BSP walk. DL_RSPBatchProbe drains + invalidates.
+    batch_early_done = 1;
+}
+#endif // BENCH_FORCE_MESH_RSP_EARLY
 #endif // BENCH_FORCE_MESH_RSP
 
 void DL_MeshDrawWalls(void)
@@ -3198,7 +3288,12 @@ void DL_MeshDrawWalls(void)
         // the flag (rsp_bwall_out_t/batch_out exist only in RSP builds).
         if (n64_rdp_mesh_rsp)
         {
+#ifdef BENCH_FORCE_MESH_RSP_EARLY
+            // EARLY-overlap: batch_out is indexed by WALL ID (i), not the dense vis-slot.
+            const rsp_bwall_out_t* ro = &batch_out[i];
+#else
             const rsp_bwall_out_t* ro = &batch_out[idx];   // dense vis-list slot
+#endif
             const float k = 1.0f / 65536.0f;
             if (!ro->emit) continue;
             invwA = (float)ro->invwA * k; invwB = (float)ro->invwB * k;
