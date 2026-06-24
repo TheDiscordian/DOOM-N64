@@ -285,3 +285,31 @@ FEASIBLE, lower-risk than feared. Evidence-grounded plan:
   transform coords are already bit-verified (dl_rsp_verify/emit_disagree), so only this packing
   is new. Then CPU side: dispatch BatchEmit + delete the rspq_wait/invalidate(batch_out) +
   rdpq_triangle for the fits_hw set. Verify: NCC frozen-marks + LIVE grim grab + bench.
+
+### §9.2 Slice-2 interface FACTS established (2026-06-24) -- the emit call convention
+Mapped from libdragon/include/rsp_rdpq_tri.inc + tiny3d/src/t3d/rsp/rsp_tiny3d.S(:758-799)+
+rsp_tiny3d_clipping.S(:411). Concrete, load-bearing for writing DLWallCmd_BatchEmit:
+- **Call (tiny3d's exact pattern):** set a0,a1,a2 = the three vertex-struct DMEM ADDRESSES;
+  v0 = face cull (0=front,1=back, any-other=OFF -> use 2); s3 = RDPQ_CURRENT (the RDP dynamic-
+  buffer cursor); ra = continuation label; then `j RDPQ_Triangle_Send_Async` (NOT jal -- it
+  returns via jr ra). After ALL triangles in the command: `j RDPQ_Triangle_Send_End` with
+  ra=RSPQ_Loop. The stub RDPQ_Triangle_Clip is never reached (CLIPFLAGS=0).
+- **Register reuse wrinkle (the thing to resolve before writing):** the .inc #defines tricmd=a0
+  AND (under our CUSTOM_VTX) RDPQ_TRIANGLE_VTX1=a0. It loads the vertex first (llv vall1,
+  VTX_ATTR_XY,vtx1 at :253), re-derives the addr from vall1.e3 (mfc2 vtx1,vall1.e3 at :299),
+  then builds tricmd in a0 from flags (or tricmd,t6 :303 / or tricmd,t1 :382). So a0 is NOT a
+  caller-supplied tricmd under CUSTOM_VTX -- the command type comes from the vertex/flag path.
+  RESOLVE: read the .inc :130-300 sequentially to confirm where the TRI opcode (ZBUF+TEX, the
+  0x200/0x400/0x100 bits checked at :401/419/490) originates, before writing the staging.
+- **Vertex struct (per the .inc loads):** VTX_ATTR_XY(0x00)=X(e0),Y(e1) screen; Z(0x04,e2);
+  ADDR(0x06,e3) = this vertex's own DMEM addr (the .inc needs it written); RGBA(0x08) unused;
+  ST(0x0C) S,T s10.5; Wi/Wf(0x16/0x1E) 16.16; INVWi/f(0x20/0x22) 16.16.
+- **CPU must supply, per wall (the transform does NOT compute these):** the texture S/T per
+  corner (s_l/s_r along the wall, t_top/t_bot) in s10.5 -- add to BWALL_IN; and the per-texture
+  tricmd/SOM is already CPU-set before the batch (combiner/tile/TLUT stay CPU-side).
+- **Next build = DLWallCmd_BatchEmit:** after XformWall fills BWO_sx/yt/yb/invw, stage 4 vertex
+  structs (X,Y from sx/yt-yb; Z from depth; S,T from the new BWALL_IN fields; INVW from invwA/B;
+  ADDR=own slot; CLIPFLAGS=0) into a DMEM vert scratch, set s3=RDPQ_CURRENT, emit 2 tris via the
+  call above; Send_End at BatchDone. CPU: skip rspq_wait/invalidate(batch_out)+rdpq_triangle for
+  the fits_hw set. Expect the first build to diverge on fixed-point -> iterate via marks NCC +
+  live grab (the design's sanctioned method; transform coords already bit-verified).
