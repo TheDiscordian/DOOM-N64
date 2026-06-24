@@ -39,11 +39,12 @@ preset_flags() {
         mesh-cull)      echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_CULL=1" ;;  # mesh's own frustum visibility vs BSP solidsegs
         mesh-floors)    echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_FLOORS=1" ;;# + baked floor/ceiling leaf fans (CPU leaf transform)
         mesh-leaf-rsp)  echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_FLOORS=1 BENCH_FORCE_MESH_LEAF_RSP=1" ;; # + leaf transform on the RSP (Phase 4)
+        mesh-rsp-emit)  echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_RSP_EMIT=1" ;; # KEYSTONE: RSP transforms AND emits the wall RDP tris (no batch_out readback)
         *)              return 1 ;;
     esac
 }
 
-PRESET_LIST="software rdp planes-only walls-only mesh mesh-cpu mesh-cull mesh-floors mesh-leaf-rsp"
+PRESET_LIST="software rdp planes-only walls-only mesh mesh-cpu mesh-cull mesh-floors mesh-leaf-rsp mesh-rsp-emit"
 
 usage() {
     echo "usage: bench/bench.sh <preset> [<preset> ...]   (or --list)" >&2

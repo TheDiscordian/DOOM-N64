@@ -2471,6 +2471,16 @@ typedef struct {
     int32_t pad0, pad1, pad2;      // 0x34,0x38,0x3C
 } rsp_bwall_out_t;                 // 64 bytes
 
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+// Keystone: the RSP transforms AND emits the wall triangles. Index follows the ucode header
+// order in rsp_dlwall.S (after LeafBatch if that's compiled in, else right after Batch).
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+#define DLWALL_CMD_BATCHEMIT 4
+#else
+#define DLWALL_CMD_BATCHEMIT 3
+#endif
+#endif
+
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
 // Phase 4: per-leaf-VERTEX transform on the RSP (DLWallCmd_LeafBatch). Layout MUST
 // match BLI_*/BLO_* in rsp/rsp_dlwall.S. The RSP does the divide-heavy part (cx, invw);
@@ -2951,6 +2961,11 @@ static void DL_RSPBatchProbe(void)
         data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_in_t)));
         data_cache_hit_writeback(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
 
+        // Keystone first build: under BENCH_FORCE_MESH_RSP_EMIT, DLWallCmd_Batch ALSO draws
+        // the wall triangles on the RSP (no extra command). batch_out is still written + read
+        // below, so the CPU readback/draw still runs -- a DOUBLE draw this slice (intentional:
+        // A/B whether the RSP triangles appear ON TOP of the correct CPU walls before deleting
+        // the CPU path).
         rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
                    PhysicalAddr(vb), PhysicalAddr(batch_in),
                    PhysicalAddr(batch_out), (uint32_t)batch_nvis);
@@ -3166,8 +3181,16 @@ void DL_MeshDrawWalls(void)
     // transform compare (EVERY frame, CPU still authoritative).
 #ifdef BENCH_FORCE_MESH_RSP
     if (n64_rdp_mesh_rsp) {
+#ifndef BENCH_FORCE_MESH_RSP_EMIT
+        // The Phase-0/1 probes are stubbed in the ucode under RSP_EMIT (to free IMEM for the
+        // tri-emit engine); their CPU halves would read garbage output + hit a denormal float.
         DL_RSPLoopbackProbe();
         DL_RSPXformProbe();
+#else
+        // Still need the overlay registered (the probes normally do it first).
+        if (rsp_dlwall_ovl_id == 0)
+            rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+#endif
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
         // Phase 4 fold: queue the floor-leaf transform FIRST (no wait), so the wall
         // batch below drains it in the same rspq_wait and the leaf transform overlaps

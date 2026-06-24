@@ -17,12 +17,9 @@
 #define VTX_ATTR_Wf        0x1E
 #define VTX_ATTR_INVWi     0x20
 #define VTX_ATTR_INVWf     0x22
-#define RDPQ_TRIANGLE_VTX1 a0
-#define RDPQ_TRIANGLE_VTX2 a1
-#define RDPQ_TRIANGLE_VTX3 a2
-#define RDPQ_TRIANGLE_VTX1_DMEM 0,v1
-#define RDPQ_TRIANGLE_VTX2_DMEM 4,v1
-#define RDPQ_TRIANGLE_VTX3_DMEM 2,v1
+# Use the .inc DEFAULT vertex addressing: VTX1/2/3 = a1/a2/a3 (pointers), a0 = the tricmd
+# (ZBUF+TEX command word, CPU-passed), the .inc stores the pointers to s3 itself. Cleaner
+# than tiny3d's a0-aliased override -- no vertex-index table needed.
 #endif
 
 #include <rsp_queue.inc>
@@ -35,7 +32,11 @@
     # a defined label is required for the branch to assemble + link.
     .text
 RDPQ_Triangle_Clip:
-    j    RSPQ_Loop
+RDPQ_Triangle_Cull:
+    # Both are reached only for clipped/culled tris. Walls write CLIPFLAGS=0 and pass
+    # v0=cull-disabled, so neither fires; a defined label is required to link. Just
+    # continue the wall loop (the per-tri caller set ra to its own continuation).
+    jr   ra
     nop
 #endif
 
@@ -77,6 +78,7 @@ RSPQ_BeginOverlayHeader
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
     RSPQ_DefineCommand DLWallCmd_LeafBatch, 16   # 0x0C: (viewblk, in, out, vertcount) = 4 words
 #endif
+# RSP-EMIT reuses DLWallCmd_Batch (it transforms AND emits under the flag) -- no new command.
 RSPQ_EndOverlayHeader
 
 # The overlay needs no persisted state across commands.
@@ -191,6 +193,20 @@ BIN_BUF:  .ds.b BATCH_N * BWALL_IN_BYTES      # staged wall inputs (DMA'd in)
     .align 3
 BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back)
 
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+# RSP-EMIT vertex scratch: 4 wall corners staged in the rsp_rdpq_tri.inc VTX_ATTR layout
+# (36B/vertex = TRI_SIZE). DLWallCmd_BatchEmit fills these per wall and feeds them to
+# RDPQ_Triangle_Send_Async (2 tris/wall). 8-byte aligned for llv/ldv loads.
+#define EMIT_VTX_SIZE 36
+    .align 3
+VBUF: .ds.b 4 * EMIT_VTX_SIZE
+# DMEM staging buffer the engine assembles each RDP TRI command into (s3 points here).
+# Same role as libdragon's RDPQ_CMD_STAGING (0xB0 bytes); the engine DMAs it out to
+# RDPQ_CURRENT itself and serializes on COP0_DMA_BUSY, so one slot is safe to reuse.
+    .align 3
+EMIT_STAGING: .ds.b 0xB0
+#endif
+
 # Phase 4 leaf transform REUSES BIN_BUF / BOUT_BUF / BATCH_STATE (no new DMEM -- DMEM is
 # at the cap). A leaf element is ONE vertex: in = (x,y) 8B; out = (cx, invw, emit) padded
 # to 16B. 8 verts/chunk fits BIN_BUF (8*8=64<=256) and BOUT_BUF (8*16=128<=512).
@@ -240,6 +256,10 @@ XW_pad:   .word 0
 # PHASE 0: DMA loopback probe (unchanged).
 # ============================================================
 DLWallCmd_Loopback:
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    j    RSPQ_Loop               # Phase-0 probe stripped: free IMEM for the tri-emit engine
+    nop
+#else
     and  t0, a0, 0xFFFFFF        # DMA size word (byte_count-1), strip cmd id byte
     li   s4, %lo(LOOP_BUF)
     jal  DMAIn                   # RDRAM(a1)->DMEM, waits
@@ -248,6 +268,7 @@ DLWallCmd_Loopback:
     move s0, a2                  # RDRAM dst
     j    DMAOut                  # DMEM->RDRAM(a2)
     li   ra, %lo(RSPQ_Loop)      # (delay) return to queue engine
+#endif
 
 
 # ============================================================
@@ -274,6 +295,10 @@ DLWallCmd_Loopback:
 # 16.16 multiply; sx/sy follow with FixedMul-style 32x32->16.16 products.
 # ============================================================
 DLWallCmd_Xform:
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    j    RSPQ_Loop               # Phase-1 probe stripped: free IMEM for the tri-emit engine
+    nop
+#else
     # ---- DMA the view block in ----
     # DMAIn reads the transfer size from t0 (DMA_SIZE width/height); the command
     # dispatch leaves t0 undefined, so it MUST be set per DMA or a short/garbage
@@ -480,6 +505,7 @@ DLWallCmd_Xform:
     move s0, a2                  # RDRAM out addr
     j    DMAOut
     li   ra, %lo(RSPQ_Loop)      # (delay) return to the queue engine
+#endif
 
 
 # ============================================================
@@ -554,6 +580,10 @@ BatchWallLoop:
     nop
     jal  XformWall               # transforms BS_inptr -> BS_outptr (reads VIEWBLK)
     nop
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    jal  EmitWall                # ALSO draw this wall's 2 RDP triangles directly
+    nop
+#endif
     # advance per-wall cursors
     lw   t0, %lo(BS_idx)
     addiu t0, t0, 1
@@ -594,8 +624,118 @@ BatchChunkEmit:
     sw   t1, %lo(BS_remain)      # (delay)
 
 BatchDone:
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    # Wait for the last triangle's async DMA to drain. The engine maintained
+    # RDPQ_CURRENT itself across every Send_Async; nothing to publish here.
+    j    RDPQ_Triangle_Send_End
+    li   ra, %lo(RSPQ_Loop)      # (delay) Send_End returns to the queue engine
+#else
     j    RSPQ_Loop
     nop
+#endif
+
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+# ============================================================
+# KEYSTONE: DLWallCmd_BatchEmit -- transform each wall AND emit its 2 RDP triangles
+# directly (rsp_rdpq_tri.inc / RDPQ_Triangle_Send_Async), so the CPU never reads
+# batch_out back. Clone of DLWallCmd_Batch's DMA + chunk + per-wall loop, with an
+# EmitWall step after each XformWall. The engine assembles each tri into EMIT_STAGING
+# (DMEM, s3) and DMAs it out to RDPQ_CURRENT itself, serializing on COP0_DMA_BUSY.
+# First-build precision is INTENTIONALLY rough (Z/S/T placeholder, X/Y = sx>>14); tune
+# via the marks-NCC + live-grab loop. TRICMD = 0x0B00 = RDP tri + tex + zbuf, no shade.
+# ============================================================
+#define EMIT_TRICMD 0x0B00
+
+# ---- EmitWall: stage 4 corners from BS_outptr's BWO_* + emit 2 triangles --------------
+# Corners: V0=(sxA,ytA) V1=(sxB,ytB) V2=(sxA,ybA) V3=(sxB,ybB). Tris: (0,1,2) and (1,3,2).
+# Skips the wall if BWO_emit==0 (the RSP near/back/offscreen cull, same as the CPU path).
+EmitWall:
+    sw   ra, %lo(XW_ra)          # XformWall is done; reuse its ra slot
+    lw   t9, %lo(BS_outptr)
+    lw   t0, BWO_emit(t9)
+    beqz t0, EmitWallRet         # culled -> no triangles
+    nop
+
+    # --- stage V0 (top-left): sxA, ytA, invwA, dA ---
+    li   t8, %lo(VBUF + 0*EMIT_VTX_SIZE)
+    lw   t1, BWO_sxA(t9)
+    lw   t2, BWO_ytA(t9)
+    lw   t3, BWO_invwA(t9)
+    lw   t4, BWO_dA(t9)
+    jal  StageVtx
+    nop
+    # --- stage V1 (top-right): sxB, ytB, invwB, dB ---
+    li   t8, %lo(VBUF + 1*EMIT_VTX_SIZE)
+    lw   t1, BWO_sxB(t9)
+    lw   t2, BWO_ytB(t9)
+    lw   t3, BWO_invwB(t9)
+    lw   t4, BWO_dB(t9)
+    jal  StageVtx
+    nop
+    # --- stage V2 (bottom-left): sxA, ybA, invwA, dA ---
+    li   t8, %lo(VBUF + 2*EMIT_VTX_SIZE)
+    lw   t1, BWO_sxA(t9)
+    lw   t2, BWO_ybA(t9)
+    lw   t3, BWO_invwA(t9)
+    lw   t4, BWO_dA(t9)
+    jal  StageVtx
+    nop
+    # --- stage V3 (bottom-right): sxB, ybB, invwB, dB ---
+    li   t8, %lo(VBUF + 3*EMIT_VTX_SIZE)
+    lw   t1, BWO_sxB(t9)
+    lw   t2, BWO_ybB(t9)
+    lw   t3, BWO_invwB(t9)
+    lw   t4, BWO_dB(t9)
+    jal  StageVtx
+    nop
+
+    # --- emit triangle 0: V0,V1,V2 ---
+    li   a1, %lo(VBUF + 0*EMIT_VTX_SIZE)
+    li   a2, %lo(VBUF + 1*EMIT_VTX_SIZE)
+    li   a3, %lo(VBUF + 2*EMIT_VTX_SIZE)
+    li   a0, EMIT_TRICMD
+    li   v0, 2                   # culling disabled
+    li   s3, %lo(EMIT_STAGING)   # DMEM staging slot; engine DMAs it out + owns RDPQ_CURRENT
+    j    RDPQ_Triangle_Send_Async
+    li   ra, %lo(EmitTri1)       # (delay) return here
+
+EmitTri1:
+    # --- emit triangle 1: V1,V3,V2 ---
+    li   a1, %lo(VBUF + 1*EMIT_VTX_SIZE)
+    li   a2, %lo(VBUF + 3*EMIT_VTX_SIZE)
+    li   a3, %lo(VBUF + 2*EMIT_VTX_SIZE)
+    li   a0, EMIT_TRICMD
+    li   v0, 2
+    li   s3, %lo(EMIT_STAGING)   # reuse the slot; engine serialized the prior DMA on DMA_BUSY
+    j    RDPQ_Triangle_Send_Async
+    li   ra, %lo(EmitTri2)       # (delay)
+
+EmitTri2:
+EmitWallRet:
+    lw   ra, %lo(XW_ra)
+    jr   ra
+    nop
+
+# ---- StageVtx: write one vertex (t8=VBUF addr, t1=sx t2=sy t3=invw t4=depth, all 16.16) -
+# First-build packing (ROUGH -- tune via verify): X/Y = coord>>14 (16.16 -> s11.2 subpixel),
+# Z=0, CLIPFLAGS=0, RGBA=0, S/T=0, W=depth, INVW=invw (16.16 split). Clobbers t5,t6.
+StageVtx:
+    sra  t5, t1, 14
+    sh   t5, VTX_ATTR_XY(t8)         # X
+    sra  t6, t2, 14
+    sh   t6, VTX_ATTR_XY+2(t8)       # Y
+    sh   zero, VTX_ATTR_Z(t8)        # Z (placeholder)
+    sh   zero, VTX_ATTR_CLIPFLAGS(t8) # clip flags = 0
+    sw   zero, VTX_ATTR_RGBA(t8)     # rgba unused
+    sw   zero, VTX_ATTR_ST(t8)       # S,T placeholder
+    srl  t5, t4, 16
+    sh   t5, VTX_ATTR_Wi(t8)         # Wi = depth int
+    sh   t4, VTX_ATTR_Wf(t8)         # Wf = depth frac
+    srl  t5, t3, 16
+    sh   t5, VTX_ATTR_INVWi(t8)      # INVWi
+    jr   ra
+    sh   t3, VTX_ATTR_INVWf(t8)      # (delay) INVWf
+#endif
 
 
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
