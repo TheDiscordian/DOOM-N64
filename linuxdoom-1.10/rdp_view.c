@@ -2426,6 +2426,16 @@ static uint32_t rsp_dlwall_ovl_id = 0;
 #define DLWALL_CMD_XFORM    1
 #define DLWALL_CMD_BATCH    2
 
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+// Overlay B (rsp/rsp_dlemit.S): the triangle-emit half of the two-overlay split. It
+// reads the batch_out that overlay A transforms and emits each wall's RDP triangles
+// via rsp_rdpq_tri. Dispatched right after A with no rspq_wait (the readback stays
+// killed). Split because A's transform + the engine + S/T overflow one 4KB IMEM.
+DEFINE_RSP_UCODE(rsp_dlemit);
+static uint32_t rsp_dlemit_ovl_id = 0;
+#define DLEMIT_CMD_BATCH 0     // (batch_out_RDRAM, count) -- matches rsp_dlemit.S header
+#endif
+
 // ---- Phase 1 transform DMA blocks. Layouts MUST match rsp_dlwall.S byte-for-byte
 // (VIEWBLK / WALLIN / WALLOUT). All 32-bit signed words; no FPU on the RSP, so the
 // output is fixed-point and the CPU converts on read.
@@ -2965,15 +2975,17 @@ static void DL_RSPBatchProbe(void)
                    PhysicalAddr(vb), PhysicalAddr(batch_in),
                    PhysicalAddr(batch_out), (uint32_t)batch_nvis);
 #ifdef BENCH_FORCE_MESH_RSP_EMIT
-        // KEYSTONE cutover: DLWallCmd_Batch transformed AND emitted the wall RDP triangles
-        // on the RSP. The CPU never reads batch_out back -- so DROP the rspq_wait + invalidate
-        // (that readback barrier was the ~776us stall this port exists to kill). rspq serializes
-        // the RSP wall-emit ahead of the CPU's subsequent rdpq commands (planes/sprites/HUD),
-        // so no explicit wait is needed for correct RDP ordering. DL_MeshDrawWalls skips its
-        // CPU collect+sort+DL_EmitWallTier loop under this flag (the walls are already drawn).
-        // S/T are still 0 in the RSP path (StageVtx placeholder) -> walls are UNTEXTURED until
-        // the S/T pegging math is moved onto the RSP. This slice verifies geometry+occlusion+
-        // the readback removal.
+        // KEYSTONE two-overlay split: overlay A (above) transformed every visible wall
+        // into batch_out. Now dispatch overlay B (rsp_dlemit) to EMIT those walls' RDP
+        // triangles, reading batch_out back via DMA. No rspq_wait, no CPU readback: rspq
+        // runs A fully (incl. its batch_out DMA-out) before B, and B's triangles land
+        // ahead of the CPU's later rdpq commands. The ~776us readback stall stays gone.
+        // DL_MeshDrawWalls skips its CPU collect+sort+emit loop (walls drawn by B).
+        // S/T are still 0 in B (untextured) until A writes S/T into batch_out.
+        if (rsp_dlemit_ovl_id == 0)
+            rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
+        rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
+                   PhysicalAddr(batch_out), (uint32_t)batch_nvis);
 #else
         rspq_wait();
         data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));

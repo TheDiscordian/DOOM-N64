@@ -369,6 +369,13 @@ ifeq ($(MESH_RSP),1)
 OBJS += $(BUILD_DIR)/rsp/rsp_dlwall.o
 endif
 
+# RSP-EMIT keystone two-overlay split: overlay B (rsp_dlemit) hosts the rsp_rdpq_tri
+# triangle engine + the per-wall emit, reading batch_out that overlay A (rsp_dlwall)
+# transforms. Only built when the emit flag is on (which implies MESH_RSP).
+ifeq ($(BENCH_FORCE_MESH_RSP_EMIT),1)
+OBJS += $(BUILD_DIR)/rsp/rsp_dlemit.o
+endif
+
 # Hot TUs at -O3 (appended after n64.mk's -O2; last -O wins).
 # Renderer (round 1), plus game logic, sound mixer, and MUS synth (round 2).
 $(BUILD_DIR)/$(DOOM_SRC)/r_%.o: CFLAGS += -O3
