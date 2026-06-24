@@ -180,6 +180,14 @@ CFLAGS += -DBENCH_FORCE_MESH_RSP=1
 ifeq ($(BENCH_FORCE_MESH_RSP_EARLY),1)
 CFLAGS += -DBENCH_FORCE_MESH_RSP_EARLY=1
 endif
+#   BENCH_FORCE_MESH_RSP_EMIT=1 -> KEYSTONE (RSP_PORT_PLAN.md §9): the RSP TRANSFORMS AND EMITS
+#   the wall RDP triangles (via libdragon's rsp_rdpq_tri.inc compiled into rsp_dlwall.S), so the
+#   CPU never reads batch_out back (kills the 776us readback stall) nor emits rdpq_triangle.
+#   Reaches BOTH CFLAGS and the RSP assembly (RSPASFLAGS). Nested under MESH_RSP.
+ifeq ($(BENCH_FORCE_MESH_RSP_EMIT),1)
+CFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
+RSPASFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
+endif
 endif
 endif
 endif

@@ -1,4 +1,43 @@
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+# KEYSTONE (RSP_PORT_PLAN.md §9): compile libdragon's triangle-emit engine
+# (rsp_rdpq_tri.inc) into THIS overlay so the wall transform can ALSO emit the RDP
+# triangles, killing the batch_out readback. The custom vertex layout the .inc reads
+# (mirrors tiny3d rsp_tiny3d.S:5-35, the proven include pattern). DOOM walls are
+# TRIFMT_ZBUF_TEX {X,Y,Z,S,T,INV_W} -- no per-vertex shade.
+#define RDPQ_TRIANGLE_CUSTOM_VTX 1
+#define VTX_ATTR_XY        0x00
+#define VTX_ATTR_Z         0x04
+#define VTX_ATTR_CLIPFLAGS 0x06
+#define VTX_ATTR_REJFLAGS  0x07
+#define VTX_ATTR_RGBA      0x08
+#define VTX_ATTR_ST        0x0C
+#define VTX_ATTR_CLIPPOSi  0x10
+#define VTX_ATTR_Wi        0x16
+#define VTX_ATTR_CLIPPOSf  0x18
+#define VTX_ATTR_Wf        0x1E
+#define VTX_ATTR_INVWi     0x20
+#define VTX_ATTR_INVWf     0x22
+#define RDPQ_TRIANGLE_VTX1 a0
+#define RDPQ_TRIANGLE_VTX2 a1
+#define RDPQ_TRIANGLE_VTX3 a2
+#define RDPQ_TRIANGLE_VTX1_DMEM 0,v1
+#define RDPQ_TRIANGLE_VTX2_DMEM 4,v1
+#define RDPQ_TRIANGLE_VTX3_DMEM 2,v1
+#endif
+
 #include <rsp_queue.inc>
+
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+#include <rdpq_macros.h>
+#include <rsp_rdpq_tri.inc>
+    # The .inc branches here only when a vertex carries clip flags. DOOM walls are
+    # screen-clamped by the transform so we always write CLIPFLAGS=0 -> never reached;
+    # a defined label is required for the branch to assemble + link.
+    .text
+RDPQ_Triangle_Clip:
+    j    RSPQ_Loop
+    nop
+#endif
 
 ########################################################################
 # rsp_dlwall.S -- RSP wall-transform overlay (GPU port; see Docs/RSP_PORT_PLAN.md)
