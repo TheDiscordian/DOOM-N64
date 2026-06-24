@@ -191,9 +191,38 @@ reload + DMA + `rspq_wait` CPU stall) layered on top of the wall batch's round-t
 leaf divide it offloads is cheaper than that sync cost, so it loses. Compaction can't save
 it the way it saved walls — the cost here is the second *barrier*, not the per-vert work.
 
-**Next lever (the real fix):** fold leaves into the EXISTING wall batch — one combined
-in-buffer, one `DLWallCmd_BATCH`-style dispatch, ONE `rspq_wait` for both walls and leaves
-— so floors-on-RSP rides the wall round-trip already being paid instead of adding its own.
-Only then can floors-on-RSP plausibly net ahead (and let the software visplanes go, opening
-the bsp_walk plane-clip work). Until then leaf-RSP stays behind BENCH_FORCE_MESH_LEAF_RSP,
-default-off. The cutover code is committed (working, correct) so the fold can build on it.
+### 8.3 The barrier was NOT the cost — readback is structurally a loss (2026-06-24)
+Hypothesised the loss was the second barrier and chased it across three builds, each
+removing more synchronisation. The numbers (same E1M1 4117-frame scenario, CPU-leaf
+baseline 16633/30112):
+
+| leaf-RSP variant | avg µs | p95 µs | vs CPU-leaf |
+|---|---|---|---|
+| separate dispatch (its own rspq_wait) | 17463 | 34144 | +5.0% / +13.1% |
+| fold: queue leaf before wall batch, read at present time (wall wait drains it) | 17326 | 33632 | +4.2% / +11.7% |
+| fold + drain/invalidate at RENDER time, NO present-time wait | 17240 | 33248 | +3.6% / +10.4% |
+
+Killing BOTH barriers recovered only ~220 µs avg — the leaf-RSP path is STILL a +3.6% /
++10.4% loss. So the dominant cost is **not** the sync. It's the round-trip itself:
+- the leaf `DLWallCmd_LeafBatch` makes the dlwall overlay BIGGER → per-frame reload DMA
+  (~+394 µs measured earlier when the leaf ucode was unguarded in the default build),
+- plus the leaf in/out buffer DMA + writeback/invalidate,
+- plus the leaf transform time now added to the wall batch's `rspq_wait`.
+
+That overhead **exceeds the single CPU divide it offloads**. The CPU-leaf path computes
+~85 vert divides inline (cheap on the VR4300) with zero round-trip; the RSP version pays
+overlay+DMA+sync to save those divides and nets out behind. This is the OPPOSITE of walls,
+where the RSP offloads the ENTIRE multi-`FixedMul` corner transform AND compaction amortised
+the per-call overhead over the ~30 drawn walls.
+
+**CONCLUSION: leaf-vertex readback on the RSP is a structural loss; floors stay on the
+CPU-leaf path (`mesh-floors`), leaf-RSP stays behind BENCH_FORCE_MESH_LEAF_RSP default-off.**
+No barrier placement fixes it. The committed code is the best (render-time-drain fold)
+version — correct, just slower — kept as the foundation for the only thing that COULD win:
+
+**The real win requires NO readback — RSP T&L that EMITS the RDP triangles directly.** If
+the RSP ucode transforms the leaf verts AND writes the `rdpq_triangle` commands (the floor
+fan) straight into the RDP command stream, the CPU never reads transformed verts back, the
+sync disappears, and the leaf transform genuinely comes off the CPU. That is a much larger
+ucode effort (emit, not just compute) and is the same step walls will eventually need to
+fully leave the CPU. Tracked as the next floor lever; not attempted yet.

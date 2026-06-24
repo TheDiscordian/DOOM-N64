@@ -2795,6 +2795,11 @@ static double batch_run_worst_invw = 0.0;
 static long   batch_run_total_mism = 0;
 static unsigned batch_frame = 0;
 
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+static void DL_RSPLeafDispatch(void);    // Phase 4 fold: queues the leaf transform (defined below)
+static void DL_RSPLeafDrain(int wall_nvis); // Phase 4 fold: render-time drain+invalidate (below)
+#endif
+
 static void DL_RSPBatchProbe(void)
 {
     int i, jv;
@@ -3048,7 +3053,23 @@ void DL_MeshDrawWalls(void)
     if (n64_rdp_mesh_rsp) {
         DL_RSPLoopbackProbe();
         DL_RSPXformProbe();
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+        // Phase 4 fold: queue the floor-leaf transform FIRST (no wait), so the wall
+        // batch below drains it in the same rspq_wait and the leaf transform overlaps
+        // the wall pack. DL_DrawMeshLeaves reads the result at present time.
+        DL_RSPLeafDispatch();
+#endif
         DL_RSPBatchProbe();
+#ifdef BENCH_FORCE_MESH_LEAF_RSP
+        // The wall batch's rspq_wait just drained the leaf transform too. Invalidate
+        // leaf_out_buf NOW -- at render time, BEFORE DL_Flush queues any RDP draw -- so
+        // DL_DrawMeshLeaves reads it at present time with NO rspq_wait (a wait there would
+        // stall the CPU on the RDP rasterizing the walls; that stall, not the dispatch
+        // barrier, was what kept the earlier leaf-RSP builds a loss). The leaf statics live
+        // later in the file, so this is a forward-declared helper (batch_nvis = wall count
+        // for the 0-wall drain case).
+        DL_RSPLeafDrain(batch_nvis);
+#endif
     }
 #endif
 
@@ -4397,9 +4418,14 @@ static rsp_bleaf_out_t leaf_out_buf[DL_LEAF_VERT_MAX] __attribute__((aligned(16)
 static int*            leaf_rsp_slot = NULL;   // pv -> dense output slot, set this frame
 static int             leaf_rsp_slot_cap = 0;
 static int             leaf_rsp_nv = 0;        // verts dispatched this frame (0 = none)
-// Phase 4 cutover: dispatch every visible leaf's verts to the RSP, read back {cx, invw,
-// emit}; the pre-pass reads leaf_out_buf[leaf_rsp_slot[pv]] instead of the CPU divide.
-static void DL_RSPLeafXform(void)
+// Phase 4 FOLD: QUEUE every visible leaf's verts to the RSP -- but DO NOT wait. Called
+// from DL_MeshDrawWalls (after the BSP walk, so leaf vis is known) RIGHT BEFORE the wall
+// batch, so the queue is [leafbatch, wallbatch] and the wall batch's single rspq_wait
+// drains BOTH. The leaf transform thus overlaps the wall pack instead of stalling the CPU
+// on its own barrier (the separate-dispatch cutover was a +5%/+13% loss for exactly that
+// second barrier -- see Docs/RSP_PORT_PLAN.md §8.2). DL_DrawMeshLeaves reads the result
+// (cx, invw) from leaf_out_buf[leaf_rsp_slot[pv]] at present time, long after it's ready.
+static void DL_RSPLeafDispatch(void)
 {
     extern int bake_numleafverts;
     static rsp_view_blk_t* vb = NULL;
@@ -4408,6 +4434,9 @@ static void DL_RSPLeafXform(void)
     int ss, i, nv = 0;
 
     leaf_rsp_nv = 0;
+    // Same gate as DL_DrawMeshLeaves -- only queue when floors will actually be drawn.
+    if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+        return;
     if (rsp_dlwall_ovl_id == 0)
         rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
     if (rsp_dlwall_ovl_id == 0) return;
@@ -4442,12 +4471,28 @@ static void DL_RSPLeafXform(void)
     data_cache_hit_writeback(vb, sizeof *vb);
     data_cache_hit_writeback(leaf_in_buf,  (uint32_t)((size_t)nv * sizeof(rsp_bleaf_in_t)));
     data_cache_hit_writeback(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
+    // QUEUE only -- NO rspq_wait here. The wall batch (DL_RSPBatchProbe, dispatched right
+    // after this) waits for the whole queue, draining this leaf transform too; the CPU
+    // invalidate of leaf_out_buf + the read happen later in DL_DrawMeshLeaves (present time).
     rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_LEAFBATCH,
                PhysicalAddr(vb), PhysicalAddr(leaf_in_buf),
                PhysicalAddr(leaf_out_buf), (uint32_t)nv);
-    rspq_wait();
-    data_cache_hit_invalidate(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
     leaf_rsp_nv = nv;
+}
+
+// Phase 4 fold: called from DL_MeshDrawWalls right AFTER the wall batch (render time).
+// The wall batch's rspq_wait already drained the queued leaf transform (common case), so
+// just invalidate the CPU cache for leaf_out_buf -- BEFORE DL_Flush queues any RDP draw --
+// and DL_DrawMeshLeaves reads it at present time with no wait. wall_nvis==0 means the wall
+// batch skipped its rspq_wait, so drain the leaf transform here (cheap: no RDP draws yet).
+static void DL_RSPLeafDrain(int wall_nvis)
+{
+    if (leaf_rsp_nv <= 0)
+        return;
+    if (wall_nvis == 0)
+        rspq_wait();
+    data_cache_hit_invalidate(leaf_out_buf,
+                              (uint32_t)((size_t)leaf_rsp_nv * sizeof(rsp_bleaf_out_t)));
 }
 #endif
 
@@ -4503,9 +4548,12 @@ static void DL_DrawMeshLeaves(void)
     }
 
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
-    // Phase 4 cutover: dispatch every visible leaf's verts to the RSP for the divide
-    // (cx, invw) BEFORE the pre-pass, which reads leaf_out_buf[leaf_rsp_slot[pv]] below.
-    DL_RSPLeafXform();
+    // Phase 4 fold: the leaf transform was QUEUED + DRAINED + INVALIDATED back in
+    // DL_MeshDrawWalls (render time, before any RDP draw was queued). NO rspq_wait here:
+    // an rspq_wait at this point (present time, after DL_Flush queued the wall RDP draws)
+    // would stall the CPU on the RDP rasterizing the walls -- a sync the CPU-leaf path
+    // never pays, and the real cost that kept the separate-dispatch + first-fold builds a
+    // loss. leaf_out_buf is already coherent; just read it.
     if (leaf_rsp_nv == 0)
         return;                             // nothing visible -> no floors this frame
 #endif
@@ -4529,9 +4577,9 @@ static void DL_DrawMeshLeaves(void)
             fixed_t wy = bake_leaf_verts[pv][1];
             float   invw, sc, sx, u, v, *pr;
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
-            // CUTOVER: the RSP did the divide -- read cx + invw off batch_out (filled by
-            // DL_RSPLeafXform above, same vert set). emit=0 => behind near plane => cull
-            // the leaf (matches the CPU depth<nearz break). sc=centerx*invw stays CPU.
+            // FOLD: the RSP did the divide -- read cx + invw off leaf_out_buf (filled by
+            // DL_RSPLeafDispatch, queued in DL_MeshDrawWalls). emit=0 => behind near plane
+            // => cull the leaf (matches the CPU depth<nearz break). sc=centerx*invw stays CPU.
             {
                 const rsp_bleaf_out_t* ro = &leaf_out_buf[leaf_rsp_slot[pv]];
                 if (!ro->emit) { bad = 1; break; }
