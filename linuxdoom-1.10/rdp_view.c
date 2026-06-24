@@ -2989,6 +2989,28 @@ static void DL_RSPBatchProbe(void)
 #endif
     }
 
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    // Texture-sort the packed walls so same-texture walls are CONTIGUOUS in batch_in
+    // (hence batch_out): the upcoming texture-bind dispatch loads each CI4 texture once
+    // and fires overlay B for that texture's contiguous run. Wall-Z makes emit order
+    // irrelevant for correctness, so re-ordering is safe. Insertion sort -- batch_nvis
+    // is tiny (tens). batch_vislist[j] and batch_in[j] move in lockstep.
+    {
+        int a, b;
+        for (a = 1; a < batch_nvis; a++) {
+            int vi = batch_vislist[a];
+            rsp_bwall_in_t in = batch_in[a];
+            short tex = bake_walls[vi].texture;
+            for (b = a - 1; b >= 0 && bake_walls[batch_vislist[b]].texture > tex; b--) {
+                batch_vislist[b + 1] = batch_vislist[b];
+                batch_in[b + 1]     = batch_in[b];
+            }
+            batch_vislist[b + 1] = vi;
+            batch_in[b + 1]      = in;
+        }
+    }
+#endif
+
     // ---- coherency: flush inputs + view block, poison + flush outputs ----
     // Only the dense [0,batch_nvis) range is live this frame. The 0xA5 poison only
     // exists so the verify-compare can spot cells the RSP failed to write; pure waste
