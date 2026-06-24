@@ -2468,8 +2468,16 @@ typedef struct {
     int32_t x1, y1, x2, y2;        // 0x00..0x0C  fixed_t wall corners
     int32_t ztop, zbot;            // 0x10,0x14   fixed_t snapshotted live heights
     int32_t vis;                   // 0x18        1 = bake_linevis[line] && ztop>zbot
-    int32_t pad0;                  // 0x1C
-} rsp_bwall_in_t;                  // 32 bytes
+    // ---- RSP-EMIT S/T source (16.16 texels). textureoffset = S at corner A (pre
+    // near-clip); slen = wall length so S at B = textureoffset + slen. T is near-clip-
+    // invariant (clipping slides S only) so the CPU pre-computes t_top/t_bot = midw -
+    // ztop/zbot here; overlay A copies them into batch_out.
+    int32_t textureoffset;         // 0x1C        was pad0
+    int32_t slen;                  // 0x20        baked wall length (16.16 texels)
+    int32_t t_top;                 // 0x24        midw - ztop  (16.16 texels)
+    int32_t t_bot;                 // 0x28        midw - zbot  (16.16 texels)
+    int32_t pad0;                  // 0x2C        pad to 48
+} rsp_bwall_in_t;                  // 48 bytes
 
 typedef struct {
     int32_t dA, dB;                // 0x00,0x04   depth 16.16 (post near-clip)
@@ -2479,7 +2487,11 @@ typedef struct {
     int32_t ytA, ybA, ytB, ybB;    // 0x20..0x2C  screen Y top/bot per corner 16.16
     int32_t emit;                  // 0x30        1 = survived all skips, else 0
     int32_t pad0, pad1, pad2;      // 0x34,0x38,0x3C
-} rsp_bwall_out_t;                 // 64 bytes
+    // ---- RSP-EMIT S/T (16.16 texels) written by overlay A, read by overlay B's
+    // StageVtx (packed s10.5). sA/sB per column (post near-clip), t_top/t_bot per edge.
+    int32_t sA, sB;                // 0x40,0x44
+    int32_t t_top, t_bot;          // 0x48,0x4C
+} rsp_bwall_out_t;                 // 80 bytes
 
 #ifdef BENCH_FORCE_MESH_RSP_EMIT
 // Keystone: the RSP transforms AND emits the wall triangles. Index follows the ucode header
@@ -2958,6 +2970,23 @@ static void DL_RSPBatchProbe(void)
         batch_in[j].x2 = bw->x2; batch_in[j].y2 = bw->y2;
         batch_in[j].ztop = ztopz; batch_in[j].zbot = zbotz;
         batch_in[j].vis = 1; batch_in[j].pad0 = 0;
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+        // RSP-EMIT S/T source. T is near-clip-invariant so compute it here (fixed):
+        // midw = peg sector live height [+ textureheight] + rowoffset, then
+        // t_top/t_bot = midw - ztop/zbot -- the exact-fixed mirror of DL_MeshDrawWalls'
+        // float midw chain (both end at texel*32 in s10.5). S source (textureoffset,
+        // baked slen) feeds A's per-corner S with the near-clip slide.
+        {
+            fixed_t pegz = bw->peg_ceil ? sectors[bw->peg_sec].ceilingheight
+                                        : sectors[bw->peg_sec].floorheight;
+            fixed_t midw = pegz + bw->rowoffset;
+            if (bw->peg_addth) midw += textureheight[bw->texture];
+            batch_in[j].textureoffset = bw->textureoffset;
+            batch_in[j].slen          = bw->slen;
+            batch_in[j].t_top         = midw - ztopz;
+            batch_in[j].t_bot         = midw - zbotz;
+        }
+#endif
     }
 
     // ---- coherency: flush inputs + view block, poison + flush outputs ----

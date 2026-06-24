@@ -71,7 +71,11 @@ RSPQ_EmptySavedState
 #define BWO_ytB   0x28
 #define BWO_ybB   0x2C
 #define BWO_emit  0x30
-#define BWALL_OUT_BYTES 64
+#define BWO_sA    0x40      /* S at column A (16.16 texels, post near-clip) */
+#define BWO_sB    0x44      /* S at column B */
+#define BWO_ttop  0x48      /* T at top edge */
+#define BWO_tbot  0x4C      /* T at bottom edge */
+#define BWALL_OUT_BYTES 80
 
 #define NEARZ (4 << 16)
 #define EMIT_TRICMD 0x0B00          /* RDP tri + tex + zbuf, no shade */
@@ -122,8 +126,10 @@ EBatchChunkLoop:
 1:
     sw   t5, %lo(ES_chunk)
 
-    # ---- DMA this chunk of batch_out back in: chunk * 64 bytes ----
-    sll  t6, t5, 6               # bytes = chunk * 64 (BWALL_OUT_BYTES, <<6)
+    # ---- DMA this chunk of batch_out back in: chunk * 80 bytes ----
+    sll  t6, t5, 6               # chunk * 64
+    sll  t7, t5, 4               # chunk * 16   (80 = 64 + 16; no RSP scalar mul)
+    addu t6, t6, t7              # bytes = chunk * 80 (BWALL_OUT_BYTES)
     addiu t6, t6, -1             # DMA width word = byte_count - 1
     andi t0, t6, 0xFFF
     li   s4, %lo(EOUT_BUF)
@@ -156,7 +162,9 @@ EBatchChunkNext:
     # advance the RDRAM read cursor + remaining count for the next chunk
     lw   t5, %lo(ES_chunk)
     lw   t1, %lo(ES_outrd)
-    sll  t6, t5, 6
+    sll  t6, t5, 6               # chunk * 80 (64 + 16)
+    sll  t7, t5, 4
+    addu t6, t6, t7
     addu t1, t1, t6
     sw   t1, %lo(ES_outrd)
     lw   t1, %lo(ES_remain)
@@ -180,36 +188,45 @@ EmitWall:
     beqz t0, EmitWallRet
     nop
 
-    # --- stage V0 (top-left): sxA, ytA, invwA, dA ---
+    # Per corner: t1=sx t2=sy t3=invw t4=depth (geometry) + t0=S s0=T (16.16 texels).
+    # --- stage V0 (top-left): A column, top edge -> S=sA, T=t_top ---
     li   t8, %lo(VBUF + 0*EMIT_VTX_SIZE)
     lw   t1, BWO_sxA(t9)
     lw   t2, BWO_ytA(t9)
     lw   t3, BWO_invwA(t9)
     lw   t4, BWO_dA(t9)
+    lw   t0, BWO_sA(t9)
+    lw   s0, BWO_ttop(t9)
     jal  StageVtx
     nop
-    # --- stage V1 (top-right): sxB, ytB, invwB, dB ---
+    # --- stage V1 (top-right): B column, top edge -> S=sB, T=t_top ---
     li   t8, %lo(VBUF + 1*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
     lw   t2, BWO_ytB(t9)
     lw   t3, BWO_invwB(t9)
     lw   t4, BWO_dB(t9)
+    lw   t0, BWO_sB(t9)
+    lw   s0, BWO_ttop(t9)
     jal  StageVtx
     nop
-    # --- stage V2 (bottom-left): sxA, ybA, invwA, dA ---
+    # --- stage V2 (bottom-left): A column, bottom edge -> S=sA, T=t_bot ---
     li   t8, %lo(VBUF + 2*EMIT_VTX_SIZE)
     lw   t1, BWO_sxA(t9)
     lw   t2, BWO_ybA(t9)
     lw   t3, BWO_invwA(t9)
     lw   t4, BWO_dA(t9)
+    lw   t0, BWO_sA(t9)
+    lw   s0, BWO_tbot(t9)
     jal  StageVtx
     nop
-    # --- stage V3 (bottom-right): sxB, ybB, invwB, dB ---
+    # --- stage V3 (bottom-right): B column, bottom edge -> S=sB, T=t_bot ---
     li   t8, %lo(VBUF + 3*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
     lw   t2, BWO_ybB(t9)
     lw   t3, BWO_invwB(t9)
     lw   t4, BWO_dB(t9)
+    lw   t0, BWO_sB(t9)
+    lw   s0, BWO_tbot(t9)
     jal  StageVtx
     nop
 
@@ -240,9 +257,10 @@ EmitWallRet:
     jr   ra
     nop
 
-# ---- StageVtx: write one vertex (t8=VBUF addr; t1=sx t2=sy t3=invw t4=depth, 16.16) -----
-# Packs X/Y=coord>>14 (s11.2), Z from depth (z_float*0x7FFF == depth_mapunits, clamped
-# 32767), S/T=0 (untextured this slice), W=depth, INVW=invw. Clobbers t5,t6,t7.
+# ---- StageVtx: write one vertex --------------------------------------------------------
+# IN: t8=VBUF addr; t1=sx t2=sy t3=invw t4=depth (geometry, 16.16); t0=S, s0=T (16.16
+#     texels). Packs X/Y=coord>>14 (s11.2), Z from depth (clamped 32767), S/T as s10.5
+#     (16.16>>11 == texel*32, the scale rdpq_triangle applies). Clobbers t5,t6,t7; reads t0,s0.
 StageVtx:
     sra  t5, t1, 14
     sh   t5, VTX_ATTR_XY(t8)         # X
@@ -258,7 +276,10 @@ StageVtx:
     sh   t5, VTX_ATTR_Z(t8)          # Z
     sh   zero, VTX_ATTR_CLIPFLAGS(t8)
     sw   zero, VTX_ATTR_RGBA(t8)
-    sw   zero, VTX_ATTR_ST(t8)       # S,T = 0 (untextured this slice)
+    sra  t5, t0, 11                  # S: 16.16 texels -> s10.5 (texel*32)
+    sh   t5, VTX_ATTR_ST(t8)
+    sra  t6, s0, 11                  # T: 16.16 texels -> s10.5
+    sh   t6, VTX_ATTR_ST+2(t8)
     srl  t5, t4, 16
     sh   t5, VTX_ATTR_Wi(t8)         # Wi
     sh   t4, VTX_ATTR_Wf(t8)         # Wf

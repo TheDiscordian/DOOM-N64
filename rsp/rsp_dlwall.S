@@ -124,8 +124,12 @@ VSCRATCH: .ds.b 64
 #define BWI_ztop  0x10
 #define BWI_zbot  0x14
 #define BWI_vis   0x18      /* 1 = passed bake_linevis && ztop>zbot, else skip */
-#define BWI_pad   0x1C
-#define BWALL_IN_BYTES 32
+#define BWI_texoff 0x1C     /* RSP-EMIT: S at corner A (16.16 texels, pre near-clip) */
+#define BWI_slen   0x20     /* baked wall length (16.16 texels); S at B = texoff+slen */
+#define BWI_ttop   0x24     /* T at top edge = midw - ztop (16.16 texels, CPU-precomp) */
+#define BWI_tbot   0x28     /* T at bottom edge = midw - zbot */
+#define BWI_pad    0x2C
+#define BWALL_IN_BYTES 48
 
 # Per-wall output (BWALL_OUT, 64B): the 48B WALLOUT fields + an emit flag word +
 # padding to a 64B granule. Layout MUST match rsp_bwall_out_t in rdp_view.c.
@@ -145,7 +149,11 @@ VSCRATCH: .ds.b 64
 #define BWO_pad0  0x34
 #define BWO_pad1  0x38
 #define BWO_pad2  0x3C
-#define BWALL_OUT_BYTES 64
+#define BWO_sA    0x40      /* RSP-EMIT: S at column A (16.16 texels, post near-clip) */
+#define BWO_sB    0x44      /* S at column B */
+#define BWO_ttop  0x48      /* T at top edge (copied from input) */
+#define BWO_tbot  0x4C      /* T at bottom edge */
+#define BWALL_OUT_BYTES 80
 
 # How many walls to transform per DMA chunk. Kept small: the overlay's whole
 # .data+.bss must fit DMEM (4 KiB) alongside the persistent rspq state + the
@@ -201,6 +209,10 @@ XW_bot16: .word 0
 XW_cx:    .word 0    # centerx
 XW_cy:    .word 0    # centery
 XW_pad:   .word 0
+XW_sA:    .word 0    # RSP-EMIT S/T scratch: S at column A (16.16 texels, post near-clip)
+XW_sB:    .word 0    # S at column B
+XW_ttop:  .word 0    # T at top edge (copied from BWI_ttop)
+XW_tbot:  .word 0    # T at bottom edge (copied from BWI_tbot)
 
     .text
 
@@ -510,7 +522,9 @@ BatchChunkLoop:
     sw   t5, %lo(BS_chunk)
 
     # ---- DMA this chunk of inputs in: chunk * BWALL_IN_BYTES bytes ----
-    sll  t6, t5, 5               # bytes = chunk * 32  (BWALL_IN_BYTES==32 -> <<5)
+    sll  t6, t5, 5               # chunk * 32
+    sll  t7, t5, 4               # chunk * 16   (48 = 32 + 16; no RSP scalar mul)
+    addu t6, t6, t7              # bytes = chunk * 48 (BWALL_IN_BYTES)
     addiu t6, t6, -1            # DMA width word = byte_count - 1
     andi t0, t6, 0xFFF
     li   s4, %lo(BIN_BUF)
@@ -549,7 +563,9 @@ BatchWallLoop:
 BatchChunkEmit:
     # ---- DMA this chunk of outputs back: chunk * BWALL_OUT_BYTES bytes ----
     lw   t5, %lo(BS_chunk)
-    sll  t6, t5, 6               # bytes = chunk * 64 (BWALL_OUT_BYTES==64 -> <<6)
+    sll  t6, t5, 6               # chunk * 64
+    sll  t7, t5, 4               # chunk * 16   (80 = 64 + 16; no RSP scalar mul)
+    addu t6, t6, t7              # bytes = chunk * 80 (BWALL_OUT_BYTES)
     addiu t6, t6, -1
     andi t0, t6, 0xFFF
     li   s4, %lo(BOUT_BUF)
@@ -560,11 +576,15 @@ BatchChunkEmit:
     # advance the RDRAM cursors + remaining count for the next chunk
     lw   t5, %lo(BS_chunk)
     lw   t1, %lo(BS_inrd)
-    sll  t6, t5, 5
+    sll  t6, t5, 5               # chunk * 48 (32 + 16)
+    sll  t7, t5, 4
+    addu t6, t6, t7
     addu t1, t1, t6
     sw   t1, %lo(BS_inrd)
     lw   t1, %lo(BS_outrd)
-    sll  t6, t5, 6
+    sll  t6, t5, 6               # chunk * 80 (64 + 16)
+    sll  t7, t5, 4
+    addu t6, t6, t7
     addu t1, t1, t6
     sw   t1, %lo(BS_outrd)
     lw   t1, %lo(BS_remain)
@@ -795,11 +815,27 @@ XformWall:
     sw   zero, BWO_pad0(t9)
     sw   zero, BWO_pad1(t9)
     sw   zero, BWO_pad2(t9)
+    sw   zero, BWO_sA(t9)
+    sw   zero, BWO_sB(t9)
+    sw   zero, BWO_ttop(t9)
+    sw   zero, BWO_tbot(t9)
 
     # ---- vis gate (bake_linevis && ztop>zbot, folded by the CPU) ----
     lw   t0, BWI_vis(t8)
     beqz t0, XW_skip             # vis==0 -> culled before transform
     nop
+
+    # ---- RSP-EMIT default S/T: sA=textureoffset, sB=texoff+slen (unclipped); copy T.
+    # S is overridden in the near-clip branches below; T is near-clip-invariant.
+    lw   t4, BWI_texoff(t8)
+    sw   t4, %lo(XW_sA)
+    lw   t5, BWI_slen(t8)
+    add  t4, t4, t5
+    sw   t4, %lo(XW_sB)
+    lw   t4, BWI_ttop(t8)
+    sw   t4, %lo(XW_ttop)
+    lw   t5, BWI_tbot(t8)
+    sw   t5, %lo(XW_tbot)
 
     # ---- load corners + view, compute view-space tx/ty ----
     lw   t0, BWI_x1(t8)
@@ -892,6 +928,13 @@ XformWall:
     sw   t1, %lo(XW_tya)
     li   t8, NEARZ
     sw   t8, %lo(XW_dA)          # dA = nearz
+    # RSP-EMIT: clipped S at A = FixedMul(u, slen)  (matches DL_MeshDrawWalls sA=u*sLen)
+    lw   t8, %lo(XW_in)
+    lw   s7, BWI_slen(t8)        # slen
+    lw   a3, %lo(XW_pad)         # u (16.16)
+    jal  FixedMulVU              # v1 = u*slen >> 16
+    nop
+    sw   v1, %lo(XW_sA)
     j    XW_after_clip
     nop
 XW_clipB_chk:
@@ -932,6 +975,16 @@ XW_clipB_chk:
     sw   t3, %lo(XW_tyb)
     li   t8, NEARZ
     sw   t8, %lo(XW_dB)          # dB = nearz
+    # RSP-EMIT: clipped S at B = slen - FixedMul(u, slen)  (matches sB = sLen - u*sLen)
+    lw   t8, %lo(XW_in)
+    lw   s7, BWI_slen(t8)        # slen
+    lw   a3, %lo(XW_pad)         # u (16.16)
+    jal  FixedMulVU              # v1 = u*slen >> 16
+    nop
+    lw   t8, %lo(XW_in)
+    lw   t0, BWI_slen(t8)        # slen
+    sub  t0, t0, v1              # slen - u*slen
+    sw   t0, %lo(XW_sB)
 
 XW_after_clip:
     # Store final depths to the output (the CPU also clamps to nearz here).
@@ -1111,6 +1164,15 @@ XW_after_clip:
     # survived all skips -> emit
     li   t0, 1
     sw   t0, BWO_emit(t9)
+    # RSP-EMIT: publish per-column S + per-edge T (16.16 texels) into batch_out for B.
+    lw   t0, %lo(XW_sA)
+    sw   t0, BWO_sA(t9)
+    lw   t0, %lo(XW_sB)
+    sw   t0, BWO_sB(t9)
+    lw   t0, %lo(XW_ttop)
+    sw   t0, BWO_ttop(t9)
+    lw   t0, %lo(XW_tbot)
+    sw   t0, BWO_tbot(t9)
     lw   ra, %lo(XW_ra)
     jr   ra
     nop
