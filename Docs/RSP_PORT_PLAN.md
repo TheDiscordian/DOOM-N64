@@ -226,3 +226,35 @@ fan) straight into the RDP command stream, the CPU never reads transformed verts
 sync disappears, and the leaf transform genuinely comes off the CPU. That is a much larger
 ucode effort (emit, not just compute) and is the same step walls will eventually need to
 fully leave the CPU. Tracked as the next floor lever; not attempted yet.
+
+## §9 RSP-EMITS-TRIANGLES design (2026-06-24, workflow wf_13cf1532, FEASIBLE)
+The keystone (remove the 776us wall-transform readback stall + the 352us CPU emit). Verdict:
+FEASIBLE, lower-risk than feared. Evidence-grounded plan:
+
+- **Mechanism**: libdragon's `RDPQ_Triangle_Send_Async` (libdragon/include/rsp_rdpq_tri.inc:130)
+  reads 3 verts from DMEM, computes ALL edge/attribute/Z gradients on the VU, writes the
+  assembled RDP TRI to the shared RDP dynamic buffer, and feeds the RDP via mtc0 COP0_DP_END /
+  COP0_DMA_WRITE. NO CPU readback, NO rdpq_set_mode_standard -- it is a LEAF that honors whatever
+  combiner/TLUT/SOM the CPU set up. Clip + backface cull are OPT-OUT (CLIPFLAGS=0 -> clip never
+  fires; v0!=0/1 disables cull). Wall format = TRIFMT_ZBUF_TEX {X,Y,Z,S,T,INV_W}, no shade =
+  exactly what the async emit produces.
+- **Approach (chosen)**: `#include <rsp_rdpq_tri.inc>` INTO rsp_dlwall.S with a DOOM custom
+  RDPQ_TRIANGLE_CUSTOM_VTX layout, then jal RDPQ_Triangle_Send_Async from a new DLWallCmd. This
+  is exactly tiny3d's pattern (rsp_tiny3d.S:5-35: #define VTX_ATTR_* then #include the .inc)
+  MINUS tiny3d's t3d_frame_start rdpq_set_mode_standard poison. REJECTED: cross-overlay call
+  (Send_Async is not an exported RSP symbol; IMEM is per-overlay) and borrow-tiny3d (same .inc +
+  its mode reset). Reuses 100% of libdragon's bit-exact VU gradient math; DOOM RDP state stays CPU.
+- **First slice** (flag BENCH_FORCE_MESH_RSP_EMIT, nested under MESH_RSP): make the existing
+  DLWallCmd_Batch ALSO emit 2 RDP tris/wall; CPU SKIPS rdpq_triangle + the batch_out readback for
+  emitted walls. SCOPE to the fits_hw one-quad class ONLY (rdp_view.c:3633-3703); band-walk walls
+  stay CPU. Verify: NCC frozen-marks vs CPU-emit + LIVE grim grab (motion) + bench (776us readback
+  line gone). Keep per-texture CPU setup (PRIM/CI4 TLUT/SET_TILE) BEFORE the batch-emit command.
+- **Effort** ~3-5 days. Hardest = byte-exact per-vertex fixed-point packing (S/T s10.5 -- must
+  stay <1024 texels/tri, hence fits_hw-only; INV_W/W 16.16 split). The transform coords are
+  already bit-verified (dl_rsp_verify/emit_disagree), so only the S/T/W/Z packing is new.
+- **RISKS**: (1) IMEM budget -- the .inc is large; rsp_dlwall.S already has transform + leaf;
+  may overflow the 4KB overlay IMEM -> CHECK .text on first assemble; fallback = a dedicated
+  rsp_dlwall_emit overlay sharing DMEM via rspq_overlay_share_state, OR strip the leaf path under
+  this flag. (2) S/T s10.5 overflow -> fits_hw-only. (3) RDP-dynamic-buffer ordering -> one batch-
+  emit per texture bucket AFTER its setup (rspq serializes). (4) Z/W packing diverges on attempt 1
+  (expected debugging, localized by emit_disagree). (5) motion artifacts need a LIVE grab.
