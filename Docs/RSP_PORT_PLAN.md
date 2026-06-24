@@ -258,3 +258,30 @@ FEASIBLE, lower-risk than feared. Evidence-grounded plan:
   this flag. (2) S/T s10.5 overflow -> fits_hw-only. (3) RDP-dynamic-buffer ordering -> one batch-
   emit per texture bucket AFTER its setup (rspq serializes). (4) Z/W packing diverges on attempt 1
   (expected debugging, localized by emit_disagree). (5) motion artifacts need a LIVE grab.
+
+### §9.1 SLICE STATUS (2026-06-24)
+- **Slice 1 DONE + VERIFIED (commit 4f171ee): the tri-emit engine compiles into the dlwall
+  overlay and FITS.** Wired rsp_rdpq_tri.inc + the custom VTX layout + a stub RDPQ_Triangle_Clip
+  into rsp_dlwall.S behind BENCH_FORCE_MESH_RSP_EMIT (compiled but NOT yet called). First
+  assemble: rsp_dlwall.elf text 3200 / data 552 / bss 2056 -> fits the 4KB IMEM + 4KB DMEM caps
+  (~344B IMEM headroom), NO separate overlay needed. Bench (emit engine present-but-uncalled) =
+  16774/28960, IDENTICAL to plain mesh 16774/28896 -> the bigger overlay is cost-free uncalled,
+  transform still correct. The two scariest design risks (IMEM budget #1, overlay-reload cost)
+  are both CLEARED with hard data.
+- **Slice 2 (NEXT): DLWallCmd_BatchEmit -- the actual emit.** Per wall, after XformWall fills the
+  screen coords, stage 4 corner vertices in the .inc's DMEM layout then call
+  RDPQ_Triangle_Send_Async twice (tl,tr,bl + tr,br,bl). VERTEX LAYOUT the .inc reads (confirmed
+  from rsp_rdpq_tri.inc:236-260, the `vall` register comment "X Y [Z ADDR RG BA S T]"):
+    VTX_ATTR_XY 0x00 = X (e0), Y (e1)         -- screen subpixel
+    VTX_ATTR_Z  0x04 = Z (e2)
+    (ADDR e3 = the per-vertex DMEM addr, written by RDPQ_TRIANGLE_VTXn_DMEM via lsv)
+    VTX_ATTR_RGBA 0x08 = RG (e4-ish) BA       -- UNUSED for walls (TRIFMT_ZBUF_TEX, no shade)
+    VTX_ATTR_ST 0x0C = S (e4 in vattr), T     -- s10.5 (must stay <1024 texels/tri -> fits_hw only)
+    VTX_ATTR_INVWi/f 0x20/0x22 = INV_W        -- 16.16 split (i=int, f=frac)
+    VTX_ATTR_Wi/Wf 0x16/0x1E = W              -- 16.16 split
+  HARDEST SUB-PROBLEM (design-flagged): byte-exact fixed-point packing of X/Y subpixel, Z, S/T
+  s10.5, INV_W/W 16.16 to match the .inc's edge/gradient math. AUTHORITATIVE reference = how
+  rdpq_triangle_cpu (libdragon/src/rdpq/rdpq_tri.c) packs the SAME fields from floats; the RSP
+  transform coords are already bit-verified (dl_rsp_verify/emit_disagree), so only this packing
+  is new. Then CPU side: dispatch BatchEmit + delete the rspq_wait/invalidate(batch_out) +
+  rdpq_triangle for the fits_hw set. Verify: NCC frozen-marks + LIVE grim grab + bench.
