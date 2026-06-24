@@ -47,6 +47,15 @@ static void bake_quad (bake_wall_t* arr, int* n,
     w->peg_sec = (int16_t)peg_sec; w->peg_ceil = (uint8_t)peg_ceil;
     w->peg_addth = (uint8_t)peg_addth;
     w->rowoffset = rowoffset; w->textureoffset = textureoffset;
+    // Edge length in map units (== texels v1->v2), STATIC. Baked once here so the
+    // per-frame RSP S/T pack avoids the sqrt. dxf/dyf in map units (float) then back
+    // to 16.16. Matches DL_MeshDrawWalls' sLen = sqrtf(dxf*dxf + dyf*dyf).
+    {
+        double dxf = (double)(x2 - x1) / 65536.0;
+        double dyf = (double)(y2 - y1) / 65536.0;
+        double len = sqrt(dxf * dxf + dyf * dyf);
+        w->slen = (fixed_t)(len * 65536.0);
+    }
 }
 
 // ===========================================================================

@@ -41,6 +41,9 @@ typedef struct
     uint8_t peg_addth;  // 1 = add textureheight[texture] (DONTPEGBOTTOM/non-DONTPEGTOP)
     fixed_t rowoffset;     // sidedef->rowoffset    (16.16 map units -> vertical texel shift)
     fixed_t textureoffset; // sidedef->textureoffset (16.16; S at v1, +1 texel/map-unit to v2)
+    fixed_t slen;          // wall length in map units (16.16) = texels v1->v2; STATIC, baked
+                           // once (sqrt of the edge) so the per-frame S/T pack needs no sqrt.
+                           // S at corner B = textureoffset + slen (pre near-clip).
 } bake_wall_t;
 
 extern bake_wall_t* bake_walls;     // PU_LEVEL; rebuilt each P_SetupLevel
