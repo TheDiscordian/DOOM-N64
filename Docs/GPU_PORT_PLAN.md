@@ -268,3 +268,28 @@ but they wrecked the worst case + felt smoothness on every room entry). Render-t
 texture builds 19 -> 0 (all 34 now prequant'd at load), confirmed via the new
 `DLBUILD_TRACE=1` probe. The MEAN levers (present 23.8%, bsp_walk, dlbuild steady) are
 unchanged and remain next.
+
+### CORRECTION (2026-06-24): `present` is mostly VSYNC IDLE, not a compute lever
+The "present = 23.8% mean = biggest MEAN win" framing above is WRONG. Evidence: present
+mean 4654us but present TAIL (worst-5% frames) 843us -- it DROPS 5x on slow frames. A fixed
+CPU-blit cost can't do that; a vsync-coupled wait does (a slow frame eats the display-buffer
+slack, so the acquire wait shrinks to ~0). By default the `display_get()` free-framebuffer
+acquire is INSIDE the PRESENT bracket (it's only split out under the -- currently
+mesh-build-broken -- RDPWAIT_PROBE). So:
+  present CPU cost  ~= 843us   (the tail floor = the CI8 HUD/sprite/status blit emit)
+  present vsync idle ~= 3811us  (mean 4654 - 843; the CPU finished the frame early)
+
+So the MEAN frame is VSYNC-BOUND: avg 16633us = 60.1fps = the 60Hz cap, with ~3.8ms/frame
+spent idling in display_get. Cutting mean compute below vsync does NOTHING for avg fps. The
+ONLY lever that improves the experience is the TAIL -- frames whose compute exceeds 16.67ms
+drop below 60fps and are felt. That's why the prequant fix (max 175ms->36ms) mattered and
+yet barely moved avg/p95: avg was already vsync-capped; the spike was a pure tail/max defect.
+
+REVISED lever priority (all TAIL, since mean is vsync-capped):
+  1. (DONE) prequant area-transition spike -- the 154ms outlier, fixed.
+  2. bsp_walk tail (9294us p95) -- the BSP-walk-as-visibility; the port endgame (strip
+     R_AddLine once planes+sprites are mesh-driven).
+  3. dlbuild steady/tail + audio tail (4863us) -- audio is a known hard floor.
+The present CPU blit (~843us) is small and the path is delicate -- NOT worth touching.
+(Side note: RDPWAIT_PROBE=1 currently OOM-asserts at I_InitGraphics in the mesh build --
+a pre-existing diagnostic-only bit-rot, off by default; fix if that probe is needed.)
