@@ -2961,16 +2961,23 @@ static void DL_RSPBatchProbe(void)
         data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_in_t)));
         data_cache_hit_writeback(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
 
-        // Keystone first build: under BENCH_FORCE_MESH_RSP_EMIT, DLWallCmd_Batch ALSO draws
-        // the wall triangles on the RSP (no extra command). batch_out is still written + read
-        // below, so the CPU readback/draw still runs -- a DOUBLE draw this slice (intentional:
-        // A/B whether the RSP triangles appear ON TOP of the correct CPU walls before deleting
-        // the CPU path).
         rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_BATCH,
                    PhysicalAddr(vb), PhysicalAddr(batch_in),
                    PhysicalAddr(batch_out), (uint32_t)batch_nvis);
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+        // KEYSTONE cutover: DLWallCmd_Batch transformed AND emitted the wall RDP triangles
+        // on the RSP. The CPU never reads batch_out back -- so DROP the rspq_wait + invalidate
+        // (that readback barrier was the ~776us stall this port exists to kill). rspq serializes
+        // the RSP wall-emit ahead of the CPU's subsequent rdpq commands (planes/sprites/HUD),
+        // so no explicit wait is needed for correct RDP ordering. DL_MeshDrawWalls skips its
+        // CPU collect+sort+DL_EmitWallTier loop under this flag (the walls are already drawn).
+        // S/T are still 0 in the RSP path (StageVtx placeholder) -> walls are UNTEXTURED until
+        // the S/T pegging math is moved onto the RSP. This slice verifies geometry+occlusion+
+        // the readback removal.
+#else
         rspq_wait();
         data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
+#endif
     }
 
     // Real offload: batch_out is ready -- skip the CPU reference recompute below
@@ -3204,6 +3211,18 @@ void DL_MeshDrawWalls(void)
         { extern uint32_t bspw_rspwait_tk; BWP_T0(); DL_RSPBatchProbe(); BWP_ACC(bspw_rspwait_tk); }
 #else
         DL_RSPBatchProbe();
+#endif
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+        // KEYSTONE: the RSP wall batch ALSO emitted the walls' RDP triangles. The CPU
+        // collect+painter-sort+DL_EmitWallTier loop below would double-draw them, so skip
+        // it entirely -- the walls are on screen already (untextured this slice; S/T pending
+        // on the RSP). Planes/sprites/HUD still draw normally after this return.
+        if (n64_rdp_mesh_rsp) {
+            static unsigned ef = 0;
+            if ((ef++ & 511) == 0)
+                debugf("MESH RSP-EMIT: %d walls drawn on RSP (CPU emit skipped)\n", batch_nvis);
+            return;
+        }
 #endif
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
         // The wall batch's rspq_wait just drained the leaf transform too. Invalidate
