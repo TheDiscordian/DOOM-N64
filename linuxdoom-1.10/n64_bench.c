@@ -198,6 +198,7 @@ static uint32_t         cur_bspw_segloop_us;
 static uint32_t         cur_bspw_checkbbox_us;
 static uint32_t         cur_bspw_sprite_us;
 static uint32_t         cur_bspw_mesh_us;
+static uint32_t         cur_bspw_rspwait_us;
 static uint32_t         cur_bspw_addline_calls;
 // Running totals across the measured frames. MEAN-ONLY (no per-frame array): adding 6
 // per-frame fields to bench_frames[BENCH_MAX_FRAMES] bloats BSS ~98KB and starves the
@@ -205,6 +206,7 @@ static uint32_t         cur_bspw_addline_calls;
 // The mean breakdown answers the headline (each sub-part's SHARE of bsp_walk).
 static unsigned long long bspw_addline_sum, bspw_segloop_sum, bspw_checkbbox_sum;
 static unsigned long long bspw_sprite_sum,  bspw_mesh_sum,    bspw_calls_sum;
+static unsigned long long bspw_rspwait_sum;
 static unsigned long      bspw_nframes;
 #endif
 
@@ -419,6 +421,7 @@ void N64Bench_LoopBegin(void)
 #ifdef BSPWALK_PROBE
     cur_bspw_addline_net_us = cur_bspw_segloop_us = cur_bspw_checkbbox_us = 0;
     cur_bspw_sprite_us = cur_bspw_mesh_us = cur_bspw_addline_calls = 0;
+    cur_bspw_rspwait_us = 0;
 #endif
 #ifdef RDPWAIT_PROBE
     memset(cur_async_tk, 0, sizeof(cur_async_tk));
@@ -610,7 +613,8 @@ void N64Bench_SetDPlanes(uint32_t lump_tk, uint32_t fitter_tk, uint32_t unproj_t
 // R_RenderSegLoop nested inside it (the SEG_RASTER column loop, already attributed to
 // seg_rast -- subtract so this is the per-seg bsp_walk work, not the raster). Clamp >=0.
 void N64Bench_SetBspWalk(uint32_t addline_tk, uint32_t segloop_tk, uint32_t checkbbox_tk,
-                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t addline_calls)
+                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t rspwait_tk,
+                         uint32_t addline_calls)
 {
     uint32_t addline_net = (addline_tk > segloop_tk) ? (addline_tk - segloop_tk) : 0;
     if (!loop_open)
@@ -620,6 +624,7 @@ void N64Bench_SetBspWalk(uint32_t addline_tk, uint32_t segloop_tk, uint32_t chec
     cur_bspw_checkbbox_us   = (uint32_t)TICKS_TO_US(checkbbox_tk);
     cur_bspw_sprite_us      = (uint32_t)TICKS_TO_US(sprite_tk);
     cur_bspw_mesh_us        = (uint32_t)TICKS_TO_US(mesh_tk);
+    cur_bspw_rspwait_us     = (uint32_t)TICKS_TO_US(rspwait_tk);
     cur_bspw_addline_calls  = addline_calls;
 }
 #endif
@@ -738,6 +743,7 @@ void N64Bench_LoopEnd(void)
         bspw_checkbbox_sum+= cur_bspw_checkbbox_us;
         bspw_sprite_sum   += cur_bspw_sprite_us;
         bspw_mesh_sum     += cur_bspw_mesh_us;
+        bspw_rspwait_sum  += cur_bspw_rspwait_us;
         bspw_calls_sum    += cur_bspw_addline_calls;
         bspw_nframes++;
         // Per-frame copy for the TAIL breakdown (the report's tail loop sums these).
@@ -1360,11 +1366,12 @@ static void N64Bench_ReportPhases(void)
     // drawsegs). Read directly against the bsp_walk BENCH_PHASE/BENCH_TAIL lines.
     if (bspw_nframes)
     debugf("BENCH_BSPWALK addline_mean=%lu checkbbox_mean=%lu sprite_mean=%lu mesh_mean=%lu "
-           "segloop_mean=%lu addline_calls_mean=%lu nframes=%lu\n",
+           "mesh_rspwait_mean=%lu segloop_mean=%lu addline_calls_mean=%lu nframes=%lu\n",
            (unsigned long)(bspw_addline_sum  / bspw_nframes),
            (unsigned long)(bspw_checkbbox_sum / bspw_nframes),
            (unsigned long)(bspw_sprite_sum   / bspw_nframes),
            (unsigned long)(bspw_mesh_sum     / bspw_nframes),
+           (unsigned long)(bspw_rspwait_sum  / bspw_nframes),
            (unsigned long)(bspw_segloop_sum  / bspw_nframes),
            (unsigned long)(bspw_calls_sum    / bspw_nframes),
            bspw_nframes);

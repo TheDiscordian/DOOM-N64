@@ -172,7 +172,8 @@ extern uint32_t bspw_addline_calls;
 #define BWP_T0()       uint64_t _bwp_t0 = get_ticks()
 #define BWP_ACC(acc)   do { (acc) += (uint32_t)(get_ticks() - _bwp_t0); } while (0)
 void N64Bench_SetBspWalk(uint32_t addline_tk, uint32_t segloop_tk, uint32_t checkbbox_tk,
-                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t addline_calls);
+                         uint32_t sprite_tk, uint32_t mesh_tk, uint32_t rspwait_tk,
+                         uint32_t addline_calls);
 #endif
 
 // Called once per gametic from G_Ticker to advance scenario timing/phases.

@@ -89,6 +89,7 @@ uint32_t	bspw_segloop_tk = 0;
 uint32_t	bspw_checkbbox_tk = 0;
 uint32_t	bspw_sprite_tk = 0;
 uint32_t	bspw_mesh_tk = 0;
+uint32_t	bspw_rspwait_tk = 0;    // DL_RSPBatchProbe (wall RSP dispatch + rspq_wait) -- a SUBSET of bspw_mesh_tk
 uint32_t	bspw_addline_calls = 0;
 #endif
 
@@ -1022,6 +1023,7 @@ void R_SetupFrame (player_t* player)
     // re-fills them (call-site brackets in r_bsp.c / r_segs.c / r_main.c).
     bspw_addline_tk = bspw_segloop_tk = bspw_checkbbox_tk = 0;
     bspw_sprite_tk = bspw_mesh_tk = bspw_addline_calls = 0;
+    bspw_rspwait_tk = 0;
 #endif
 	
     if (player->fixedcolormap)
@@ -1175,7 +1177,7 @@ void R_RenderPlayerView (player_t* player)
     // Latch the bsp_walk sub-bracket tick accumulators (filled by the call-site brackets
     // during this frame's BSP walk + DL_MeshDrawWalls). Time-only -- perturbs no geometry.
     N64Bench_SetBspWalk(bspw_addline_tk, bspw_segloop_tk, bspw_checkbbox_tk,
-                        bspw_sprite_tk, bspw_mesh_tk, bspw_addline_calls);
+                        bspw_sprite_tk, bspw_mesh_tk, bspw_rspwait_tk, bspw_addline_calls);
 #endif
 #else
     R_DrawMasked ();

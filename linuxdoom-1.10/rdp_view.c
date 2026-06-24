@@ -52,6 +52,11 @@
 
 #include "rdp_view.h"
 
+#ifdef BSPWALK_PROBE
+#include "n64_bench.h"           // BWP_T0/BWP_ACC + bspw_* externs (the rdp_view include
+                                 // below is gated behind PLANE_UV_TRACE, off by default)
+#endif
+
 // --- Integer floor/ceil for the wall emit path (perf-only refactor) --------
 // IFLOOR/ICEIL compute floor()/ceil() of a float with integer/branch arithmetic
 // instead of the libm floorf()/ceilf() calls. Truncation toward zero ((int)x)
@@ -3079,7 +3084,14 @@ void DL_MeshDrawWalls(void)
         // the wall pack. DL_DrawMeshLeaves reads the result at present time.
         DL_RSPLeafDispatch();
 #endif
+#ifdef BSPWALK_PROBE
+        // Split the wall RSP round-trip (pack + dispatch + rspq_wait) out of the mesh
+        // bucket: extern bspw_rspwait_tk (r_main.c), report mesh_rspwait separately so we
+        // know how much of DL_MeshDrawWalls is the RSP stall vs the CPU emit/sort.
+        { extern uint32_t bspw_rspwait_tk; BWP_T0(); DL_RSPBatchProbe(); BWP_ACC(bspw_rspwait_tk); }
+#else
         DL_RSPBatchProbe();
+#endif
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
         // The wall batch's rspq_wait just drained the leaf transform too. Invalidate
         // leaf_out_buf NOW -- at render time, BEFORE DL_Flush queues any RDP draw -- so
