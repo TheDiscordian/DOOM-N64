@@ -151,3 +151,26 @@ the DEFAULT rsp_dlwall ucode/build stays untouched until verified):
 - Then floors-on should become a clear win (leaf dlbuild drops like wall dlbuild did), and it
   can go default-on too — at which point the software visplanes are gone and R_StoreWallRange's
   plane-clip work can start coming off the BSP walk (step toward the bsp_walk collapse).
+
+### 8.1 Phase 4 STATUS (built + verified, NOT cutover-ready) — precision wall
+The leaf ucode (DLWallCmd_LeafBatch + XformLeaf, `62f9a9a`) and the CPU verify
+(DL_RSPLeafProbe, `e4e5cc9`) are in, gated behind BENCH_FORCE_MESH_LEAF_RSP; the default
+overlay stays byte-identical (the leaf code is #ifdef'd, since a bigger overlay cost the
+default wall path +394us/frame in reload DMA — measured).
+
+Verify result (BENCH_FORCE_MESH+FLOORS+LEAF_RSP, E1M1): **structurally correct** —
+`emit_dis=0` every frame (RSP emits exactly the CPU's drawable verts; the cull/depth gate
+is right). **But coord precision blocks cutover:** cx mismatches the CPU by ~5-12px on
+~15-40% of verts (`worst_invw` ~1%). Walls stay ~1px because their lateral offset is
+bounded; floor verts span wide, and `cx = centerx - centerx*lat/depth` magnifies the ~1%
+ratio error into pixels.
+
+**Ruled out:** a 2nd Newton-Raphson step in RecipFixVU was a NO-OP — the per-frame numbers
+were byte-identical with/without it (frame4 worst_cx=12331, worst_invw=7619 both ways). So
+the reciprocal is already converged; the residual is NOT reciprocal-iteration error. The
+~1% lives downstream — the FixedDiv un-normalization (the NORMBIT `sh` shift + FIXEDDIV_SH
+16-bit truncation in FixedDivApply) and/or near-`nearz` verts (huge invw, tiny absolute
+error → big relative). Next investigation (a focused effort): instrument FixedDivApply's
+intermediate vs the exact ratio per vert to localize the lost bits; consider widening the
+FixedDiv result window past 16 bits, or computing cx = centerx*(1 - lat/depth) in a form
+less sensitive to the ratio's low bits. No cutover until cx holds < ~1px over the demo.
