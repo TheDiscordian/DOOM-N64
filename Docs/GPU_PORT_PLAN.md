@@ -344,3 +344,15 @@ Two ways to attack it:
      all was a -6% LOSS without overlap (the compaction commit). So B trades compaction for
      overlap; net is unknown -> MEASURE behind a flag, don't assume. If the 475-wall transform
      fits in the 3ms BSP window, B hides most of the 776us for a fraction of A's effort.
+
+### Option B (overlap-via-transform-all) = MEASURED LOSS, dead (2026-06-24)
+Implemented + benched (BENCH_FORCE_MESH_RSP_EARLY, commit). plain mesh 16774/28896 vs
+early-overlap 20588/36064 = **+22.7% / +24.8% WORSE**. Transforming all ~475 walls (to
+dispatch before the BSP walk, since vis isn't known yet) is ~16x the RSP work + the full-bake
+CPU pack + ~44KB/frame DMA coherency -- that swamps the overlap (the 475-wall transform
+exceeds the 3ms walk, so the consume wait still stalls for the remainder). The compaction
+(~30 walls) is too valuable to trade for the overlap. **B is dead. The ONLY way to remove the
+776us readback stall is A: RSP-emits-triangles** (the RSP transforms AND writes the
+rdpq_triangle commands -> CPU never reads batch_out back, keeps compaction, drops both the
+776us stall and the 352us emit). That's the keystone; it's a multi-session hand-rolled ucode
+effort (tiny3d is NO-GO: resets combiner/TLUT, stomps DOOM CI4).
