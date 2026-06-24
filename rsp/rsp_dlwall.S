@@ -724,7 +724,19 @@ StageVtx:
     sh   t5, VTX_ATTR_XY(t8)         # X
     sra  t6, t2, 14
     sh   t6, VTX_ATTR_XY+2(t8)       # Y
-    sh   zero, VTX_ATTR_Z(t8)        # Z (placeholder)
+    # Z (16-bit) = z_float*0x7FFF where z_float = DL_WallZ = depth_mapunits/32768
+    # (rdp_view.c). depth_mapunits = depth(16.16) >> 16, so Z16 ~= depth_mapunits
+    # (the 32767/32768 factor is sub-LSB). Near-clip guarantees depth >= 4 so Z16>0.
+    # Clamp to 32767 so a far wall (depth_mapunits > 32767) doesn't wrap negative
+    # (signed 16-bit) and draw in front of everything.
+    srl  t5, t4, 16                  # depth_mapunits
+    li   t6, 32767
+    sltu t7, t6, t5                  # 32767 < depth_mapunits ?
+    beqz t7, 1f
+    nop
+    move t5, t6                      # clamp to 32767
+1:
+    sh   t5, VTX_ATTR_Z(t8)          # Z
     sh   zero, VTX_ATTR_CLIPFLAGS(t8) # clip flags = 0
     sw   zero, VTX_ATTR_RGBA(t8)     # rgba unused
     sw   zero, VTX_ATTR_ST(t8)       # S,T placeholder
