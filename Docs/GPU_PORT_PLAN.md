@@ -193,3 +193,24 @@ Default mesh build baseline avg ~17.9k / p95 ~30.8k us. Per-phase tail (p95): `d
 - **Method note:** measuring one phase in isolation hides cross-phase cost (the RSP offload
   dropped `dlbuild` but added more wait; the Z-buffer "loss" was the same trap). Always check
   TOTAL frame time, not the single phase you touched.
+
+## BSP-walk-replacement roadmap (2026-06-24) — where the GPU port stands
+The RSP wall-transform offload is DEFAULT-ON and WON (walls off the CPU). That made `bsp_walk`
+(~23% tail) the new #1 cost: the per-seg BSP occlusion walk (R_AddLine: 2× R_PointToAngle +
+solidsegs + R_StoreWallRange). The plan is to delete it and let the mesh do its OWN cull
+(frustum + the wall Z-buffer). Sequencing, with what's done:
+1. **DONE — mesh frustum wall vis (`73acd81`, BENCH_FORCE_MESH_CULL, gated).** R_Subsector marks
+   ALL walls of a frustum-visible subsector; Z discards the overdraw. Render-verified equivalent.
+   Perf LOSS today (adds overdraw walls AND R_AddLine still runs) — it's the foundation.
+2. **NEXT — floors on the mesh, leaf transform on the RSP (Phase 4).** Floors-on already
+   suppresses the software visplanes (`planes` 1544→60us) and is an AVG win (16633 / 60fps) but a
+   p95 LOSS (30176) because the floor-leaf transform is still CPU and inflates dlbuild p95.
+   Putting the leaf transform on the RSP (extend the just-landed wall compaction: dense vis-list
+   pack + dispatch, but leaves are N-vertex not 4-corner, so the rsp_dlwall ucode needs a leaf
+   path) should drop leaf dlbuild like it did for walls → floors-on becomes a clear win.
+3. **THEN — sprites on the mesh** (remove the drawsegs dependency), then **strip R_AddLine**:
+   with planes + sprites off the BSP and walls on frustum+Z, the walk becomes a pure frustum
+   traversal (no per-seg angle math, no solidsegs) → `bsp_walk` collapses. That is the BSP-walk
+   replacement the whole port is for. NOTE: even the frustum cull currently leans on solidsegs
+   (R_CheckBBox uses them); the pure-frustum walk drops solidsegs entirely and lets Z do ALL
+   occlusion — visits/draws more, but kills the per-seg cost. Measure the balance when it lands.
