@@ -127,11 +127,11 @@ CFLAGS += -DBENCH_FORCE_MESH=1
 ifeq ($(BENCH_FORCE_MESH_FLOORS),1)
 CFLAGS += -DBENCH_FORCE_MESH_FLOORS=1
 endif
-#   BENCH_FORCE_MESH_RSP=1    -> RSP port (Docs/RSP_PORT_PLAN.md). Phase 0 is a
-#   DMA-loopback PROBE only: it registers the rsp_dlwall overlay and round-trips
-#   bake_wall_t RDRAM->DMEM->RDRAM, logging "RSP-LOOPBACK: ... memcmp=0". It does
-#   NOT change the render path -- de-risks overlay/DMA/cache coherency for the math.
-ifeq ($(BENCH_FORCE_MESH_RSP),1)
+#   RSP port (Docs/RSP_PORT_PLAN.md): the wall-transform offload is now DEFAULT-ON in
+#   the mesh build -- compaction made it beat the CPU transform -6% (render-equivalent,
+#   emit_disagree=0). Opt OUT for a CPU-mesh A/B with BENCH_FORCE_MESH_RSP=0.
+ifneq ($(BENCH_FORCE_MESH_RSP),0)
+MESH_RSP := 1
 CFLAGS += -DBENCH_FORCE_MESH_RSP=1
 endif
 endif
@@ -297,8 +297,9 @@ DOOM_PLATFORM_SRCS = \
 DOOM_SRCS = $(DOOM_COMMON_SRCS) $(DOOM_PLATFORM_SRCS)
 OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)
 
-# RSP port (Docs/RSP_PORT_PLAN.md): the rsp_dlwall overlay is only linked when
-# BENCH_FORCE_MESH_RSP=1. Without the flag the .o is never built or linked, so the
+# RSP port (Docs/RSP_PORT_PLAN.md): the rsp_dlwall overlay is linked whenever the RSP
+# offload is on -- now the default in the mesh build (MESH_RSP, set above unless
+# BENCH_FORCE_MESH_RSP=0). Outside the mesh build the .o is never built or linked, so the
 # default ROM stays byte-identical. The n64.mk %.o:%.S rule auto-detects the "rsp"
 # prefix and builds it as RSP ucode (the DEFINE_RSP_UCODE symbols resolve from here).
 #
@@ -309,7 +310,7 @@ OBJS = $(DOOM_SRCS:%.c=$(BUILD_DIR)/%.o)
 # --redefine-sym silently no-ops and rsp_dlwall_text_start stays undefined at link.
 # build/rsp/rsp_dlwall.o => prefix build_rsp_rsp_dlwall, which matches. (Cannot fix in
 # n64.mk -- libdragon is read-only.)
-ifeq ($(BENCH_FORCE_MESH_RSP),1)
+ifeq ($(MESH_RSP),1)
 OBJS += $(BUILD_DIR)/rsp/rsp_dlwall.o
 endif
 
