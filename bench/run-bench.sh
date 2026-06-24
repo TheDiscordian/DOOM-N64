@@ -73,6 +73,19 @@ trap cleanup EXIT INT TERM
 
 fail() { echo "BENCH_ERROR $*" >&2; exit 1; }
 
+# --- mesh flags imply BENCH_FORCE_RDP=1 (Makefile nesting) -------------------
+# The whole BENCH_FORCE_MESH* family lives INSIDE `ifeq ($(BENCH_FORCE_RDP),1)`
+# in the Makefile: a mesh flag without BENCH_FORCE_RDP=1 silently builds PURE
+# SOFTWARE (no error, just wrong numbers). Coerce it here, and -- critically --
+# do it BEFORE the flag-off cache check below, which keys on BENCH_FORCE_RDP
+# being empty; otherwise a mesh request gets served the cached SOFTWARE result.
+case "${BENCH_FORCE_MESH:-}${BENCH_FORCE_MESH_FLOORS:-}${BENCH_FORCE_MESH_CULL:-}${BENCH_FORCE_MESH_LEAF_RSP:-}${BENCH_FORCE_MESH_RSP:-}" in
+    *1*) if [ "${BENCH_FORCE_RDP:-}" != "1" ]; then
+             BENCH_FORCE_RDP=1
+             echo "[bench] mesh flag set -> auto-enabling BENCH_FORCE_RDP=1 (Makefile nests mesh under it)" >&2
+         fi ;;
+esac
+
 # --- flag-off result cache ----------------------------------------------------
 # The software (flag-off) path is contractually unchanged and the bench is
 # deterministic, so re-running an unmodified flag-off benchmark is pure waste
@@ -105,12 +118,31 @@ if [ -z "$RUN_ROM" ]; then
         fail "timed out (${LOCK_TIMEOUT}s) waiting for $LOCKFILE held by another bench build"
     fi
     echo "[bench] build lock acquired ($LOCKFILE)" >&2
-    echo "[bench] building BENCH ROM ($DOCKER_IMAGE)" >&2
+
+    # --- assemble the make flags from recognized env vars --------------------
+    # Every BENCH_* knob the harness understands is listed here, so passing it
+    # in the environment Just Works (`BENCH_FORCE_MESH=1 bench/run-bench.sh ...`)
+    # without hand-editing this line. BENCH=1 is ALWAYS set -- without it the ROM
+    # is an interactive build that boots to the WAD picker and never emits a
+    # BENCH_RESULT (footgun #1). See bench/README.md.
+    #
+    # (BENCH_FORCE_RDP was already coerced from any mesh flag near the top, before
+    # the flag-off cache check -- see "mesh flags imply BENCH_FORCE_RDP=1" above.)
+    MAKE_FLAGS="BENCH=1"
+    for v in BENCH_MP BENCH_FORCE_RDP BENCH_FORCE_PLANES_ONLY BENCH_FORCE_WALLS_ONLY \
+             BENCH_FORCE_MESH BENCH_FORCE_MESH_FLOORS BENCH_FORCE_MESH_CULL \
+             BENCH_FORCE_MESH_LEAF_RSP BENCH_FORCE_MESH_RSP \
+             BENCH_FORCE_SHOW_FPS BENCH_MARKS PVS_PROBE; do
+        eval "val=\${$v:-}"
+        [ -n "$val" ] && MAKE_FLAGS="$MAKE_FLAGS $v=$val"
+    done
+    echo "[bench] building BENCH ROM ($DOCKER_IMAGE): make $MAKE_FLAGS" >&2
+
     # Full wipe of build/: the n64_bench.o object must never cross-contaminate a
     # later non-BENCH build (the linker pulls in any stale .o left on disk).
     docker run --rm -v "$REPO":/doom -w /doom -e N64_INST=/n64_toolchain \
         "$DOCKER_IMAGE" bash -c \
-        "rm -rf filesystem build && make BENCH=1 ${BENCH_MP:+BENCH_MP=$BENCH_MP }${BENCH_FORCE_RDP:+BENCH_FORCE_RDP=$BENCH_FORCE_RDP }${BENCH_FORCE_PLANES_ONLY:+BENCH_FORCE_PLANES_ONLY=$BENCH_FORCE_PLANES_ONLY }${BENCH_FORCE_WALLS_ONLY:+BENCH_FORCE_WALLS_ONLY=$BENCH_FORCE_WALLS_ONLY }${BENCH_MARKS:+BENCH_MARKS=$BENCH_MARKS }${PVS_PROBE:+PVS_PROBE=$PVS_PROBE }-j4" \
+        "rm -rf filesystem build && make $MAKE_FLAGS -j4" \
         >"$WORKDIR/build.log" 2>&1 \
         || { cat "$WORKDIR/build.log" >&2; fail "build failed"; }
 
