@@ -313,3 +313,18 @@ rsp_tiny3d_clipping.S(:411). Concrete, load-bearing for writing DLWallCmd_BatchE
   call above; Send_End at BatchDone. CPU: skip rspq_wait/invalidate(batch_out)+rdpq_triangle for
   the fits_hw set. Expect the first build to diverge on fixed-point -> iterate via marks NCC +
   live grab (the design's sanctioned method; transform coords already bit-verified).
+
+### §9.3 tricmd blocker RESOLVED (2026-06-24)
+The §9.2 "where does the TRI opcode come from" question: read .inc :274-303. The command-TYPE
+bits are loaded from RDPQ_OTHER_MODES (the RDP SOM, a DMEM location the CPU's rdpq mode state
+maintains) -- line 281 `lbu t6, %lo(RDPQ_OTHER_MODES)`, masked 0x38 (:285), OR'd into tricmd
+(:303); the tex/zbuf bits (0x400/0x200 checked at :401/419) ride the same SOM-derived path.
+CONSEQUENCE: the emit does NOT pass a tricmd -- the CPU's EXISTING per-texture CI4 wall mode
+setup (combiner + Z + TEX, set before the batch command) already populates the SOM the .inc
+reads, exactly as tiny3d relies on. So DLWallCmd_BatchEmit only needs: stage the vertex structs
+(VTX_ATTR layout, ADDR=self) + set a0/a1/a2=vert addrs, v0=2, s3=RDPQ_CURRENT, ra=cont,
+j RDPQ_Triangle_Send_Async (x2/wall) + j RDPQ_Triangle_Send_End. Remaining unknowns are
+MECHANICAL (load/writeback s3 from RDPQ_CURRENT; the exact X/Y/Z/S-T/INVW fixed-point) -> a
+focused implementation pass, iterated via the build + marks-NCC + live-grab verify loop. The
+keystone is now feasibility-proven (slice 1) AND interface-resolved; what remains is writing +
+precision-tuning the ~80-line staging routine.
