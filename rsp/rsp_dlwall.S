@@ -128,7 +128,7 @@ VSCRATCH: .ds.b 64
 #define BWI_slen   0x20     /* baked wall length (16.16 texels); S at B = texoff+slen */
 #define BWI_ttop   0x24     /* T at top edge = midw - ztop (16.16 texels, CPU-precomp) */
 #define BWI_tbot   0x28     /* T at bottom edge = midw - zbot */
-#define BWI_pad    0x2C
+#define BWI_light  0x2C     /* packed RGBA shade = dl_prim_lut[level] (per-wall light) */
 #define BWALL_IN_BYTES 48
 
 # Per-wall output (BWALL_OUT, 64B): the 48B WALLOUT fields + an emit flag word +
@@ -148,7 +148,7 @@ VSCRATCH: .ds.b 64
 #define BWO_emit  0x30      /* 1 = wall survives all skips (emitted), 0 = culled */
 #define BWO_slopeA 0x34     /* dY/dT at corner A = (ybA-ytA)/(t_bot-t_top), 16.16 px/texel */
 #define BWO_slopeB 0x38     /* dY/dT at corner B (was pad1) -- B's per-band Y clip uses these */
-#define BWO_pad2  0x3C
+#define BWO_rgba  0x3C      /* packed RGBA shade copied from BWI_light (per-wall light) */
 #define BWO_sA    0x40      /* RSP-EMIT: S at column A (16.16 texels, post near-clip) */
 #define BWO_sB    0x44      /* S at column B */
 #define BWO_ttop  0x48      /* T at top edge (copied from input) */
@@ -814,7 +814,7 @@ XformWall:
     sw   zero, BWO_emit(t9)
     sw   zero, BWO_slopeA(t9)
     sw   zero, BWO_slopeB(t9)
-    sw   zero, BWO_pad2(t9)
+    sw   zero, BWO_rgba(t9)
     sw   zero, BWO_sA(t9)
     sw   zero, BWO_sB(t9)
     sw   zero, BWO_ttop(t9)
@@ -1173,6 +1173,10 @@ XW_after_clip:
     sw   t0, BWO_ttop(t9)
     lw   t0, %lo(XW_tbot)
     sw   t0, BWO_tbot(t9)
+    # per-wall SHADE: copy the packed RGBA light straight through (near-clip invariant)
+    lw   t8, %lo(XW_in)
+    lw   t0, BWI_light(t8)
+    sw   t0, BWO_rgba(t9)
 
     # ---- T-band clip slopes: slopeX = (ybX - ytX) / (t_bot - t_top), 16.16 px/texel.
     # Overlay B clips each wall to a TMEM T-band via yX' = ytX + (band_edge - t_top)*slopeX

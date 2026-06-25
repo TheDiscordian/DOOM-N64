@@ -2476,7 +2476,7 @@ typedef struct {
     int32_t slen;                  // 0x20        baked wall length (16.16 texels)
     int32_t t_top;                 // 0x24        midw - ztop  (16.16 texels)
     int32_t t_bot;                 // 0x28        midw - zbot  (16.16 texels)
-    int32_t pad0;                  // 0x2C        pad to 48
+    int32_t light;                 // 0x2C        packed RGBA shade = dl_prim_lut[level]
 } rsp_bwall_in_t;                  // 48 bytes
 
 typedef struct {
@@ -2491,7 +2491,7 @@ typedef struct {
     // FixedMul (yX' = ytX + (band_edge - t_top)*slopeX), no per-band divide. Repurposed
     // padding (no struct-size change).
     int32_t slopeA, slopeB;        // 0x34,0x38   (was pad0,pad1)
-    int32_t pad2;                  // 0x3C
+    int32_t rgba;                  // 0x3C        packed RGBA shade (copied from BWI_light)
     // ---- RSP-EMIT S/T (16.16 texels) written by overlay A, read by overlay B's
     // StageVtx (packed s10.5). sA/sB per column (post near-clip), t_top/t_bot per edge.
     int32_t sA, sB;                // 0x40,0x44
@@ -2984,7 +2984,7 @@ static void DL_RSPBatchProbe(void)
         batch_in[j].x1 = bw->x1; batch_in[j].y1 = bw->y1;
         batch_in[j].x2 = bw->x2; batch_in[j].y2 = bw->y2;
         batch_in[j].ztop = ztopz; batch_in[j].zbot = zbotz;
-        batch_in[j].vis = 1; batch_in[j].pad0 = 0;
+        batch_in[j].vis = 1; batch_in[j].light = 0;
 #ifdef BENCH_FORCE_MESH_RSP_EMIT
         // RSP-EMIT S/T source. T is near-clip-invariant so compute it here (fixed):
         // midw = peg sector live height [+ textureheight] + rowoffset, then
@@ -3028,6 +3028,16 @@ static void DL_RSPBatchProbe(void)
             batch_in[j].slen          = bw->slen;
             batch_in[j].t_top         = ttop;
             batch_in[j].t_bot         = tbot;
+            // Per-wall SHADE = the sector's depth-light RGB, same dl_prim_lut the CPU
+            // mesh path feeds as PRIM. Overlay B writes it as the vertex RGBA and the
+            // wall combiner is TEX0*SHADE, so each wall in a batch lights independently
+            // (PRIM is per-draw and can't vary within one B dispatch).
+            {
+                int lvl = (255 - bw->light) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                batch_in[j].light = (int32_t)dl_prim_lut[lvl];
+            }
         }
 #endif
     }
@@ -3259,7 +3269,7 @@ void DL_RSPDispatchAllWalls(void)
         batch_in[i].x1 = bw->x1; batch_in[i].y1 = bw->y1;
         batch_in[i].x2 = bw->x2; batch_in[i].y2 = bw->y2;
         batch_in[i].ztop = ztopz; batch_in[i].zbot = zbotz;
-        batch_in[i].vis = 1; batch_in[i].pad0 = 0;
+        batch_in[i].vis = 1; batch_in[i].light = 0;
     }
     data_cache_hit_writeback(vb2, sizeof *vb2);
     data_cache_hit_writeback(batch_in,  (uint32_t)((size_t)bake_numwalls * sizeof(rsp_bwall_in_t)));
@@ -5023,11 +5033,12 @@ static void DL_FlushRSPEmit(void)
     if (rsp_dlemit_ovl_id == 0)
         rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
 
-    // Walls combine TEX0*PRIM (RDPQ_COMBINER_TEX_FLAT). The CPU path sets PRIM per
-    // record from dl_prim_lut[light]; overlay B does NOT touch PRIM, so a stale PRIM=0
-    // from an earlier pass renders every wall TEX0*0 = solid BLACK. Set PRIM here.
-    // (Single value this slice => uniform full-bright walls; per-wall light follows.)
-    rdpq_set_prim_color(RGBA32(255, 255, 255, 255));
+    // Walls combine TEX0*SHADE: overlay B writes each wall's dl_prim_lut[level] light
+    // as the vertex shade (flat across the quad), so every wall in a batch lights with
+    // its own sector brightness (PRIM is per-draw and could not vary within one B
+    // dispatch). i_video set TEX_FLAT for the CPU bucket walk (empty on this path);
+    // override to TEX_SHADE here. The planes below re-set their own combiner.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
 
     // Walk the texture-sorted batch_out as contiguous same-texture runs.
     for (jw = 0; jw < batch_nvis; )

@@ -78,6 +78,7 @@ RSPQ_EmptySavedState
 #define BWO_emit   0x30
 #define BWO_slopeA 0x34     /* dY/dT at corner A (16.16 px/texel) -- T-band Y clip */
 #define BWO_slopeB 0x38     /* dY/dT at corner B */
+#define BWO_rgba   0x3C     /* packed RGBA shade (per-wall light) -> vertex shade */
 #define BWO_sA    0x40      /* S at column A (16.16 texels, post near-clip) */
 #define BWO_sB    0x44      /* S at column B */
 #define BWO_ttop  0x48      /* T at top edge (period-relative texels, 16.16) */
@@ -85,7 +86,7 @@ RSPQ_EmptySavedState
 #define BWALL_OUT_BYTES 80
 
 #define NEARZ (4 << 16)
-#define EMIT_TRICMD 0x0B00          /* RDP tri + tex + zbuf, no shade */
+#define EMIT_TRICMD 0x0F00          /* RDP tri + shade + tex + zbuf (shade = per-wall light) */
 
     .bss
 
@@ -273,6 +274,7 @@ EmitWall:
     addu t0, t0, v1
     sw   t0, %lo(EW_ybB)
 
+    lw   s1, BWO_rgba(t9)            # per-wall SHADE colour for all 4 corners (StageVtx writes it)
     # Per corner: t1=sx t2=sy t3=invw t4=depth + t0=S s0=T (16.16). Y/T are band-clipped.
     # --- stage V0 (top-left): A column, band top ---
     li   t8, %lo(VBUF + 0*EMIT_VTX_SIZE)
@@ -366,7 +368,7 @@ StageVtx:
     # made EVERY wall triangle trivially-rejected -> the BLACK WALLS.
     li   t6, 0x00FF
     sh   t6, VTX_ATTR_CLIPFLAGS(t8)
-    sw   zero, VTX_ATTR_RGBA(t8)
+    sw   s1, VTX_ATTR_RGBA(t8)       # per-wall SHADE colour (set once per wall in EmitWall)
     sra  t5, t0, 11                  # S: 16.16 texels -> s10.5 (texel*32)
     sh   t5, VTX_ATTR_ST(t8)
     sra  t6, s0, 11                  # T: 16.16 texels -> s10.5
