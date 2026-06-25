@@ -5088,6 +5088,78 @@ static void DL_FlushRSPEmit(void)
     // override to TEX_SHADE here. The planes below re-set their own combiner.
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
 
+    // SCREEN-EDGE X CLIP (close-wall void fix). Overlay B feeds the RDP engine the RAW
+    // projected screen X; up close a wall's off-screen corner reaches sx ~ -5000 px and the
+    // edge walker skews the lower bands' span off the view scissor -> the bottom of the wall
+    // is a BLACK VOID. The proven CPU "mesh" path clips X to [0,SCREENWIDTH-1] and re-lerps
+    // every attribute at the clip (DL_MeshDrawWalls); B has no such clip, so do it here on
+    // the CPU over batch_out before B reads it. A is done (no rspq_wait); invalidate, rewrite
+    // the clipped corners, write back for B's DMA. invw / S*invw / sx / Y / depth are all
+    // linear in screen x for a planar wall -> straight lerps; S = (S*invw)/invw at the clip.
+    // CRUCIAL: B's band Y-clip uses BWO_slopeA/slopeB = (ybX-ytX)/(t_bot-t_top); after the Y
+    // corners move, the slopes MUST be recomputed from the CLIPPED Y or the band clip stays
+    // stale and the void survives (the trap that defeated the earlier sx-only attempt).
+    {
+        const float K = 1.0f / 65536.0f, SCRWM1 = (float)(SCREENWIDTH - 1);
+        int k, nclip = 0;
+        data_cache_hit_invalidate(batch_out,
+            (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
+        for (k = 0; k < batch_nvis; k++) {
+            rsp_bwall_out_t* r = &batch_out[k];
+            float sxA, sxB, dsx, tL, tR, tr_tx;
+            if (!r->emit) continue;
+            sxA = (float)r->sxA * K; sxB = (float)r->sxB * K;
+            if (sxA >= 0.0f && sxB <= SCRWM1) continue;     // fully on-screen: no clip
+            dsx = sxB - sxA;
+            if (dsx <= 0.0f) continue;                      // degenerate (A culls back-faces)
+            tL = (sxA < 0.0f)   ? (0.0f   - sxA) / dsx : 0.0f;
+            tR = (sxB > SCRWM1) ? (SCRWM1 - sxA) / dsx : 1.0f;
+            {
+                float invwA = (float)r->invwA * K, invwB = (float)r->invwB * K;
+                float dA = (float)r->dA * K, dB = (float)r->dB * K;
+                float ytA = (float)r->ytA * K, ybA = (float)r->ybA * K;
+                float ytB = (float)r->ytB * K, ybB = (float)r->ybB * K;
+                float siA = (float)r->sA * K * invwA, siB = (float)r->sB * K * invwB;
+                float iwl = invwA + tL * (invwB - invwA), iwr = invwA + tR * (invwB - invwA);
+                float sil = siA + tL * (siB - siA),       sir = siA + tR * (siB - siA);
+                float nsxA = sxA + tL * dsx,              nsxB = sxA + tR * dsx;
+                float nytA = ytA + tL * (ytB - ytA),      nybA = ybA + tL * (ybB - ybA);
+                float nytB = ytA + tR * (ytB - ytA),      nybB = ybA + tR * (ybB - ybA);
+                if (nsxA < 0.0f) nsxA = 0.0f;
+                if (nsxB > SCRWM1) nsxB = SCRWM1;
+                r->sxA  = (int32_t)(nsxA * 65536.0f);
+                r->sxB  = (int32_t)(nsxB * 65536.0f);
+                r->invwA = (int32_t)(iwl * 65536.0f);
+                r->invwB = (int32_t)(iwr * 65536.0f);
+                r->dA = (int32_t)((dA + tL * (dB - dA)) * 65536.0f);
+                r->dB = (int32_t)((dA + tR * (dB - dA)) * 65536.0f);
+                r->ytA = (int32_t)(nytA * 65536.0f);
+                r->ybA = (int32_t)(nybA * 65536.0f);
+                r->ytB = (int32_t)(nytB * 65536.0f);
+                r->ybB = (int32_t)(nybB * 65536.0f);
+                r->sA = (iwl != 0.0f) ? (int32_t)((sil / iwl) * 65536.0f) : r->sA;
+                r->sB = (iwr != 0.0f) ? (int32_t)((sir / iwr) * 65536.0f) : r->sB;
+                // recompute the band-clip slopes from the CLIPPED Y corners.
+                tr_tx = (float)(r->t_bot - r->t_top) * K;       // T-range (texels)
+                if (tr_tx != 0.0f) {
+                    r->slopeA = (int32_t)(((nybA - nytA) / tr_tx) * 65536.0f);
+                    r->slopeB = (int32_t)(((nybB - nytB) / tr_tx) * 65536.0f);
+                }
+                if (nclip == 0) {
+                    static unsigned dg = 0;
+                    if ((dg++ & 63) == 0)
+                        debugf("RSPEMIT-XCLIP w%d sx %d->[%d..%d] ytA %d->%d ybA %d->%d\n",
+                               k, (int)sxA, (int)nsxA, (int)nsxB,
+                               (int)ytA, (int)nytA, (int)ybA, (int)nybA);
+                }
+                nclip++;
+            }
+        }
+        if (nclip > 0)
+            data_cache_hit_writeback(batch_out,
+                (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
+    }
+
     // Walk the texture-sorted batch_out as contiguous same-texture runs.
     for (jw = 0; jw < batch_nvis; )
     {
