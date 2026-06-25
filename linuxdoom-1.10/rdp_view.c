@@ -2486,7 +2486,12 @@ typedef struct {
     int32_t sxA, sxB;              // 0x18,0x1C   screen X 16.16
     int32_t ytA, ybA, ytB, ybB;    // 0x20..0x2C  screen Y top/bot per corner 16.16
     int32_t emit;                  // 0x30        1 = survived all skips, else 0
-    int32_t pad0, pad1, pad2;      // 0x34,0x38,0x3C
+    // ---- RSP-EMIT T-band slopes (16.16, px/texel) = (ybX-ytX)/(t_bot-t_top), written
+    // by overlay A. Overlay B uses them to clip each wall to a TMEM T-band with a single
+    // FixedMul (yX' = ytX + (band_edge - t_top)*slopeX), no per-band divide. Repurposed
+    // padding (no struct-size change).
+    int32_t slopeA, slopeB;        // 0x34,0x38   (was pad0,pad1)
+    int32_t pad2;                  // 0x3C
     // ---- RSP-EMIT S/T (16.16 texels) written by overlay A, read by overlay B's
     // StageVtx (packed s10.5). sA/sB per column (post near-clip), t_top/t_bot per edge.
     int32_t sA, sB;                // 0x40,0x44
@@ -5032,7 +5037,7 @@ static void DL_FlushRSPEmit(void)
         int            blkh = 0, blkw = 0;
         byte*          block;
         dl_rowmajor_t* slot;
-        int            pad_w, pitchb, cap, rows, run_idx;
+        int            pad_w, pitchb, cap, run_idx;
         surface_t      texsurf;
         rdpq_tileparms_t tp;
         int            maskbits, wbit, hbit;
@@ -5061,12 +5066,12 @@ static void DL_FlushRSPEmit(void)
 
         pad_w  = (blkw < 16) ? 16 : blkw;
         pitchb = pad_w / 2;
-        cap    = DL_TMEM_HALF / pitchb;
+        cap    = DL_TMEM_HALF / pitchb;         // CI4 source rows per TMEM band
         if (cap < 1) continue;
-        rows   = (blkh <= cap) ? blkh : cap;    // fits_hw loads blkh; else a clamped band
 
-        // CI4 draw tile (TILE0) + I8 load tile (TILE1). Hardware S-wrap = log2(blkw).
-        // fits_hw adds hardware T-wrap = log2(blkh); otherwise T clamps over the band.
+        // CI4 draw tile (TILE0) + I8 load tile (TILE1), once per texture. Hardware
+        // S-wrap = log2(blkw). fits_hw (whole block <= TMEM half, pow2 dims) gets
+        // hardware T-wrap and draws as a single quad; everything else is T-banded.
         memset(&tp, 0, sizeof(tp));
         for (maskbits = 0, wbit = blkw; wbit > 1; wbit >>= 1) maskbits++;
         tp.s.mask  = maskbits;
@@ -5076,22 +5081,51 @@ static void DL_FlushRSPEmit(void)
             for (hbit = blkh; hbit > 1; hbit >>= 1) tbits++;
             tp.t.mask = tbits;
         } else {
-            tp.t.clamp = true;
+            tp.t.clamp = true;                  // band T-extent set per band below
         }
-        texsurf = surface_make_linear(block, FMT_I8, pitchb, rows);
+        texsurf = surface_make_linear(block, FMT_I8, pitchb, blkh);
         rdpq_set_texture_image(&texsurf);
         rdpq_set_tile(TILE1, FMT_I8,  0, pitchb, NULL);
         rdpq_set_tile(TILE0, FMT_CI4, 0, pitchb, &tp);
-        rdpq_load_tile(TILE1, 0, 0, blkw / 2, rows);
-        rdpq_set_tile_size(TILE0, 0, 0, blkw, rows);
-        dl_tile_loads++;
-        dl_uploads++;
 
-        // Fire overlay B for this run's contiguous batch_out slice. B DMAs the slice in
-        // and emits each surviving wall's 2 triangles against the just-bound tile/TLUT.
-        rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
-                   PhysicalAddr(&batch_out[r0]), (uint32_t)(r1 - r0));
-        drew_any++;
+        if (slot->fits_hw) {
+            // One quad, hardware S+T wrap. Band range [INT_MIN,INT_MAX] => B does NOT
+            // clip (full wall T); the tile's T-mask wraps a wall taller than the texture.
+            rdpq_load_tile(TILE1, 0, 0, blkw / 2, blkh);
+            rdpq_set_tile_size(TILE0, 0, 0, blkw, blkh);
+            dl_tile_loads++; dl_uploads++;
+            rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
+                       PhysicalAddr(&batch_out[r0]), (uint32_t)(r1 - r0),
+                       0x80000000u, 0x7FFFFFFFu);
+            drew_any++;
+        } else {
+            // T-BAND WALK on the RSP. A wall taller than one TMEM band is drawn across
+            // several bands; each loads `cap` source rows and dispatches B for the walls
+            // whose T-range intersects that band (B clips screen-Y via the dY/dT slopes).
+            // Source rows are loaded period-relative, but the TILE0 T-extent is set to the
+            // ABSOLUTE band T -- so B passes absolute T directly (RDP addresses TMEM
+            // relative to TL = src_lo_abs, and the loaded rows start at TMEM offset 0).
+            // Two periods cover a wall up to ~blkh texels tall after the pack's T-bias
+            // (min(t_top,t_bot) in [0,blkh)); a band is split at the period edge so a
+            // non-pow2 height stays exact.
+            int p;
+            for (p = 0; p < 2; p++) {
+                int pbase = p * blkh, k;
+                for (k = 0; k < blkh; k += cap) {
+                    int rlo = k;
+                    int rhi = (k + cap > blkh) ? blkh : k + cap;
+                    int alo = pbase + rlo;      // absolute band T lo (texels)
+                    int ahi = pbase + rhi;
+                    rdpq_load_tile(TILE1, 0, rlo, blkw / 2, rhi);
+                    rdpq_set_tile_size(TILE0, 0, alo, blkw, ahi);
+                    dl_tile_loads++; dl_uploads++;
+                    rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
+                               PhysicalAddr(&batch_out[r0]), (uint32_t)(r1 - r0),
+                               (uint32_t)(alo << 16), (uint32_t)(ahi << 16));
+                }
+            }
+            drew_any++;
+        }
     }
 
     // The CI4 pass overwrote the 256-entry TLUT region with per-texture sub-palettes;

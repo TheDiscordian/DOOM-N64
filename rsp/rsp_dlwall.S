@@ -146,8 +146,8 @@ VSCRATCH: .ds.b 64
 #define BWO_ytB   0x28
 #define BWO_ybB   0x2C
 #define BWO_emit  0x30      /* 1 = wall survives all skips (emitted), 0 = culled */
-#define BWO_pad0  0x34
-#define BWO_pad1  0x38
+#define BWO_slopeA 0x34     /* dY/dT at corner A = (ybA-ytA)/(t_bot-t_top), 16.16 px/texel */
+#define BWO_slopeB 0x38     /* dY/dT at corner B (was pad1) -- B's per-band Y clip uses these */
 #define BWO_pad2  0x3C
 #define BWO_sA    0x40      /* RSP-EMIT: S at column A (16.16 texels, post near-clip) */
 #define BWO_sB    0x44      /* S at column B */
@@ -812,8 +812,8 @@ XformWall:
     sw   zero, BWO_ytB(t9)
     sw   zero, BWO_ybB(t9)
     sw   zero, BWO_emit(t9)
-    sw   zero, BWO_pad0(t9)
-    sw   zero, BWO_pad1(t9)
+    sw   zero, BWO_slopeA(t9)
+    sw   zero, BWO_slopeB(t9)
     sw   zero, BWO_pad2(t9)
     sw   zero, BWO_sA(t9)
     sw   zero, BWO_sB(t9)
@@ -1173,6 +1173,32 @@ XW_after_clip:
     sw   t0, BWO_ttop(t9)
     lw   t0, %lo(XW_tbot)
     sw   t0, BWO_tbot(t9)
+
+    # ---- T-band clip slopes: slopeX = (ybX - ytX) / (t_bot - t_top), 16.16 px/texel.
+    # Overlay B clips each wall to a TMEM T-band via yX' = ytX + (band_edge - t_top)*slopeX
+    # (one FixedMul, no per-band divide). denom = t_bot - t_top > 0 (ztop>zbot guaranteed
+    # by the CPU vis gate). recip(denom) computed once, applied to each corner's dY.
+    lw   t0, %lo(XW_tbot)
+    lw   t1, %lo(XW_ttop)
+    sub  a3, t0, t1              # denom = t_bot - t_top  (>0, texels 16.16)
+    jal  RecipFixVU             # park recip(denom)
+    nop
+    lw   t9, %lo(XW_out)
+    lw   t0, BWO_ybA(t9)
+    lw   t1, BWO_ytA(t9)
+    sub  a3, t0, t1             # ybA - ytA  (screen px 16.16)
+    jal  FixedDivApply          # slopeA = (ybA-ytA)/denom
+    nop
+    lw   t9, %lo(XW_out)
+    sw   v1, BWO_slopeA(t9)
+    lw   t0, BWO_ybB(t9)
+    lw   t1, BWO_ytB(t9)
+    sub  a3, t0, t1             # ybB - ytB
+    jal  FixedDivApply          # slopeB = (ybB-ytB)/denom (recip(denom) still parked)
+    nop
+    lw   t9, %lo(XW_out)
+    sw   v1, BWO_slopeB(t9)
+
     lw   ra, %lo(XW_ra)
     jr   ra
     nop

@@ -57,7 +57,7 @@ RDPQ_Triangle_Cull:
     .data
 
 RSPQ_BeginOverlayHeader
-    RSPQ_DefineCommand DLEmitCmd_Batch, 8    # 0x00: (batch_out_RDRAM, count) = 2 words
+    RSPQ_DefineCommand DLEmitCmd_Batch, 16   # 0x00: (batch_out, count, band_t_lo, band_t_hi)
 RSPQ_EndOverlayHeader
 
 RSPQ_EmptySavedState
@@ -75,10 +75,12 @@ RSPQ_EmptySavedState
 #define BWO_ybA   0x24
 #define BWO_ytB   0x28
 #define BWO_ybB   0x2C
-#define BWO_emit  0x30
+#define BWO_emit   0x30
+#define BWO_slopeA 0x34     /* dY/dT at corner A (16.16 px/texel) -- T-band Y clip */
+#define BWO_slopeB 0x38     /* dY/dT at corner B */
 #define BWO_sA    0x40      /* S at column A (16.16 texels, post near-clip) */
 #define BWO_sB    0x44      /* S at column B */
-#define BWO_ttop  0x48      /* T at top edge */
+#define BWO_ttop  0x48      /* T at top edge (period-relative texels, 16.16) */
 #define BWO_tbot  0x4C      /* T at bottom edge */
 #define BWALL_OUT_BYTES 80
 
@@ -107,7 +109,22 @@ ES_remain: .word 0      # walls left
 ES_chunk:  .word 0      # walls in the current DMEM chunk
 ES_idx:    .word 0      # wall index within the chunk
 ES_outptr: .word 0      # DMEM ptr into EOUT_BUF for the current wall
+ES_band_lo: .word 0     # this band's first source row (16.16 texels) -- T clip lo
+ES_band_hi: .word 0     # one past this band's last source row (16.16 texels) -- T clip hi
 EW_ra:     .word 0      # saved ra across StageVtx / the engine calls
+# Per-wall T-band clip scratch (FixedMulVU clobbers t7..t9, so keep clipped Y/T in DMEM).
+EW_Ttop:   .word 0      # clipped T at the band-top edge (period-relative texels)
+EW_Tbot:   .word 0      # clipped T at the band-bottom edge
+EW_dTtop:  .word 0      # ct_top - t_top (texels into the wall from its top)
+EW_dTbot:  .word 0      # ct_bot - t_top
+EW_ytA:    .word 0      # clipped screen Y, corner A top
+EW_ybA:    .word 0      # corner A bottom
+EW_ytB:    .word 0      # corner B top
+EW_ybB:    .word 0      # corner B bottom
+
+# Vector-multiply staging for FixedMulVU (the band-clip dY = dT * slope). 8-byte aligned.
+    .align 4
+VSCRATCH:  .ds.b 32
 
     .text
 
@@ -118,6 +135,8 @@ EW_ra:     .word 0      # saved ra across StageVtx / the engine calls
 DLEmitCmd_Batch:
     sw   a0, %lo(ES_outrd)
     sw   a1, %lo(ES_remain)
+    sw   a2, %lo(ES_band_lo)     # this band's T clip range [band_lo, band_hi)
+    sw   a3, %lo(ES_band_hi)
 
 EBatchChunkLoop:
     lw   t4, %lo(ES_remain)
@@ -182,10 +201,13 @@ EBatchDone:
     j    RDPQ_Triangle_Send_End
     li   ra, %lo(RSPQ_Loop)      # (delay)
 
-# ---- EmitWall: stage 4 corners from ES_outptr's BWO_* + emit 2 triangles ---------------
-# Corners: V0=(sxA,ytA) V1=(sxB,ytB) V2=(sxA,ybA) V3=(sxB,ybB). Tris: (0,1,2) and (1,3,2).
-# Skips the wall if BWO_emit==0 (the cull the transform recorded). S/T are 0 this slice
-# (untextured) until rsp_dlwall writes S/T into batch_out and this reads them.
+# ---- EmitWall: emit ONE wall, clipped to the current TMEM T-band -----------------------
+# A wall taller than the texture's TMEM cap is drawn across several bands; each band loads
+# cap source rows and dispatches B with [band_lo,band_hi). This routine clips the wall's
+# T range to the band, lerps the per-corner screen Y to the band edges via the precomputed
+# dY/dT slopes (one FixedMul each -- no divide), and emits the band's quad. fits_hw walls
+# are the degenerate single-band case (band covers the whole texture -> no clip).
+# Corners: V0=(sxA,ytA') V1=(sxB,ytB') V2=(sxA,ybA') V3=(sxB,ybB'); T'=band-clipped texels.
 EmitWall:
     sw   ra, %lo(EW_ra)
     lw   t9, %lo(ES_outptr)
@@ -193,45 +215,103 @@ EmitWall:
     beqz t0, EmitWallRet
     nop
 
-    # Per corner: t1=sx t2=sy t3=invw t4=depth (geometry) + t0=S s0=T (16.16 texels).
-    # --- stage V0 (top-left): A column, top edge -> S=sA, T=t_top ---
+    # ---- clip the wall's [t_top,t_bot] to this band's [band_lo,band_hi) ----
+    lw   t0, BWO_ttop(t9)        # t_top
+    lw   t1, BWO_tbot(t9)        # t_bot
+    lw   t2, %lo(ES_band_lo)
+    lw   t3, %lo(ES_band_hi)
+    slt  t4, t0, t2              # t_top < band_lo ?
+    beqz t4, 1f
+    nop
+    move t0, t2                  # ct_top = max(t_top, band_lo)
+1:  slt  t4, t3, t1              # band_hi < t_bot ?
+    beqz t4, 2f
+    nop
+    move t1, t3                  # ct_bot = min(t_bot, band_hi)
+2:  slt  t4, t0, t1              # ct_top < ct_bot ?
+    beqz t4, EmitWallRet         # band does not intersect this wall -> skip
+    nop
+    sw   t0, %lo(EW_Ttop)        # clipped T at band-top edge (period-relative)
+    sw   t1, %lo(EW_Tbot)        # clipped T at band-bottom edge
+    lw   t5, BWO_ttop(t9)        # t_top
+    sub  t6, t0, t5             # dT_top = ct_top - t_top
+    sub  t2, t1, t5            # dT_bot = ct_bot - t_top
+    sw   t6, %lo(EW_dTtop)
+    sw   t2, %lo(EW_dTbot)
+
+    # ---- clipped screen Y per corner: yX' = ytX + dT*slopeX (FixedMulVU clobbers t7-t9) ----
+    lw   a3, %lo(EW_dTtop)
+    lw   s7, BWO_slopeA(t9)
+    jal  FixedMulVU
+    nop
+    lw   t9, %lo(ES_outptr)
+    lw   t0, BWO_ytA(t9)
+    addu t0, t0, v1
+    sw   t0, %lo(EW_ytA)
+    lw   a3, %lo(EW_dTbot)
+    lw   s7, BWO_slopeA(t9)
+    jal  FixedMulVU
+    nop
+    lw   t9, %lo(ES_outptr)
+    lw   t0, BWO_ytA(t9)
+    addu t0, t0, v1
+    sw   t0, %lo(EW_ybA)
+    lw   a3, %lo(EW_dTtop)
+    lw   s7, BWO_slopeB(t9)
+    jal  FixedMulVU
+    nop
+    lw   t9, %lo(ES_outptr)
+    lw   t0, BWO_ytB(t9)
+    addu t0, t0, v1
+    sw   t0, %lo(EW_ytB)
+    lw   a3, %lo(EW_dTbot)
+    lw   s7, BWO_slopeB(t9)
+    jal  FixedMulVU
+    nop
+    lw   t9, %lo(ES_outptr)
+    lw   t0, BWO_ytB(t9)
+    addu t0, t0, v1
+    sw   t0, %lo(EW_ybB)
+
+    # Per corner: t1=sx t2=sy t3=invw t4=depth + t0=S s0=T (16.16). Y/T are band-clipped.
+    # --- stage V0 (top-left): A column, band top ---
     li   t8, %lo(VBUF + 0*EMIT_VTX_SIZE)
     lw   t1, BWO_sxA(t9)
-    lw   t2, BWO_ytA(t9)
+    lw   t2, %lo(EW_ytA)
     lw   t3, BWO_invwA(t9)
     lw   t4, BWO_dA(t9)
     lw   t0, BWO_sA(t9)
-    lw   s0, BWO_ttop(t9)
+    lw   s0, %lo(EW_Ttop)
     jal  StageVtx
     nop
-    # --- stage V1 (top-right): B column, top edge -> S=sB, T=t_top ---
+    # --- stage V1 (top-right): B column, band top ---
     li   t8, %lo(VBUF + 1*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
-    lw   t2, BWO_ytB(t9)
+    lw   t2, %lo(EW_ytB)
     lw   t3, BWO_invwB(t9)
     lw   t4, BWO_dB(t9)
     lw   t0, BWO_sB(t9)
-    lw   s0, BWO_ttop(t9)
+    lw   s0, %lo(EW_Ttop)
     jal  StageVtx
     nop
-    # --- stage V2 (bottom-left): A column, bottom edge -> S=sA, T=t_bot ---
+    # --- stage V2 (bottom-left): A column, band bottom ---
     li   t8, %lo(VBUF + 2*EMIT_VTX_SIZE)
     lw   t1, BWO_sxA(t9)
-    lw   t2, BWO_ybA(t9)
+    lw   t2, %lo(EW_ybA)
     lw   t3, BWO_invwA(t9)
     lw   t4, BWO_dA(t9)
     lw   t0, BWO_sA(t9)
-    lw   s0, BWO_tbot(t9)
+    lw   s0, %lo(EW_Tbot)
     jal  StageVtx
     nop
-    # --- stage V3 (bottom-right): B column, bottom edge -> S=sB, T=t_bot ---
+    # --- stage V3 (bottom-right): B column, band bottom ---
     li   t8, %lo(VBUF + 3*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
-    lw   t2, BWO_ybB(t9)
+    lw   t2, %lo(EW_ybB)
     lw   t3, BWO_invwB(t9)
     lw   t4, BWO_dB(t9)
     lw   t0, BWO_sB(t9)
-    lw   s0, BWO_tbot(t9)
+    lw   s0, %lo(EW_Tbot)
     jal  StageVtx
     nop
 
@@ -298,5 +378,33 @@ StageVtx:
     sh   t5, VTX_ATTR_INVWi(t8)      # INVWi
     jr   ra
     sh   t3, VTX_ATTR_INVWf(t8)      # (delay) INVWf
+
+# ============================================================
+# FixedMulVU(a3, s7) -> v1 = (a3 * s7) >> 16, signed 16.16 multiply (the RSP scalar
+# core has no multiply). Dual-precision VU partial-product pattern, bit-exact to the
+# CPU FixedMul. Copied from rsp_dlwall.S (overlay A) -- B needs it for the per-band
+# Y lerp dY = dT * slope. CLOBBERS at, t7,t8,t9, v20..v25; preserves t0-t6,s0-s6,ra.
+# ============================================================
+    .set noat
+FixedMulVU:
+    sw   a3, %lo(VSCRATCH)+0     # a : [ah][al]
+    sw   s7, %lo(VSCRATCH)+4     # b : [bh][bl]
+    li   t9, %lo(VSCRATCH)
+    lsv  $v20, 0, 0, t9          # ah (signed high half of a)
+    lsv  $v21, 0, 2, t9          # al (low half)
+    lsv  $v22, 0, 4, t9          # bh
+    lsv  $v23, 0, 6, t9          # bl
+    vmudl $v24, $v21, $v23       # al*bl (unsigned low)
+    vmadm $v24, $v20, $v23       # + ah*bl
+    vmadn $v24, $v21, $v22       # + al*bh -> fractional lane
+    vmadh $v25, $v20, $v22       # + ah*bh -> integer lane
+    ssv  $v24, 0, 0, t9          # rF (low 16)
+    ssv  $v25, 0, 2, t9          # rI (high 16)
+    lh   t7, %lo(VSCRATCH)+2     # rI (signed)
+    lhu  t8, %lo(VSCRATCH)+0     # rF (unsigned)
+    sll  t7, t7, 16
+    jr   ra
+    or   v1, t7, t8             # (delay) v1 = (rI<<16)|rF = FixedMul result 16.16
+    .set at
 
 #endif /* BENCH_FORCE_MESH_RSP_EMIT */
