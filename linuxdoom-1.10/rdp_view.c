@@ -3011,12 +3011,10 @@ static void DL_RSPBatchProbe(void)
             fixed_t ttop, tbot, per_w = 0;
             int32_t lrgba;
             int     slen_tx = (int)(bw->slen >> 16);
-            int     nseg = (slen_tx + DL_RSP_SMAX - 1) / DL_RSP_SMAX;
+            int     nseg = 1, smax;
             int     k;
             int     blkh = 0, blkw = 0;
 
-            if (nseg < 1) nseg = 1;
-            if (nseg > DL_RSP_MAXSEG) nseg = DL_RSP_MAXSEG;
             if (slen_tx > dl_rsp_max_slen) dl_rsp_max_slen = slen_tx;    // diag
 
             // T PERIOD BIAS (base saturation guard): reduce t_top/t_bot by a whole number
@@ -3027,6 +3025,17 @@ static void DL_RSPBatchProbe(void)
             tbot = midw - zbotz;
             (void)DL_RowMajorBlock(bw->texture, &blkh, &blkw);
             if (blkw > 0) per_w = (fixed_t)blkw << 16;
+
+            // S-SPAN SPLIT, blkw-AWARE. A wall saturates only when soff + slen > 1024,
+            // and soff (base bias) < blkw -- so a wall is safe as one quad while
+            // slen <= 1024 - blkw. Splitting more than that is pure waste (it was the p95
+            // cost of a flat cap): split ONLY walls that actually cross the limit, into
+            // sub-segments of <= smax texels (32 of slack for interpolation rounding).
+            smax = 1024 - blkw - 32;
+            if (smax < DL_RSP_SMAX) smax = DL_RSP_SMAX;     // floor for very wide textures
+            nseg = (slen_tx + smax - 1) / smax;
+            if (nseg < 1) nseg = 1;
+            if (nseg > DL_RSP_MAXSEG) nseg = DL_RSP_MAXSEG;
             if (blkh > 0) {
                 fixed_t per  = (fixed_t)blkh << 16;
                 fixed_t tmin = (ttop < tbot) ? ttop : tbot;
