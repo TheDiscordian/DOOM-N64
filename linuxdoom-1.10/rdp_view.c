@@ -2862,6 +2862,14 @@ static int batch_nvis = 0;
 // run. dl_rspemit_pending is armed by the pack each 3D frame and consumed once by
 // DL_Flush, so a menu/non-3D present (no pack) never re-emits a stale batch_out.
 static int dl_rspemit_pending = 0;
+// S-SPAN RUN SPLIT: a wall's S span = its length in texels; StageVtx packs S as s10.5,
+// which saturates past 1024 texels. Split a long wall into sub-segments each <= DL_RSP_SMAX
+// texels so every emitted quad's S stays in range (the CI4 S-mask wraps across the split,
+// so the texture stays continuous). SMAX leaves room for the base bias (< blkw <= 512), so
+// max |S| = SMAX + (blkw-1) < 1024. Ports DL_DrawRecord's documented run-split guard.
+#define DL_RSP_SMAX   480
+#define DL_RSP_MAXSEG 12               // hard cap on sub-segments per wall (arena safety)
+static int dl_rsp_max_slen = 0;        // diag: longest packed wall (texels) seen this frame
 #endif
 #ifdef BENCH_FORCE_MESH_RSP_EARLY
 // OVERLAP experiment: 1 once DL_RSPDispatchAllWalls has dispatched the all-walls transform
@@ -2969,74 +2977,105 @@ static void DL_RSPBatchProbe(void)
     // near-clip / back-face / off-screen culls (BWO_emit). The pack + coherency + RSP
     // loop now scale with the drawn set, not the whole bake.
     batch_nvis = 0;
+    // dl_rsp_max_slen is a RUNNING max across the whole run (NOT reset per frame) so one
+    // late log line reports the demo-wide longest visible wall -- the diag that says
+    // whether any wall actually crosses the s10.5 S-saturation point (~900+ texels).
     for (i = 0; i < bake_numwalls; i++) {
         const bake_wall_t* bw = &bake_walls[i];
         fixed_t ztopz, zbotz;
+#ifndef BENCH_FORCE_MESH_RSP_EMIT
         int j;
+#endif
         if (bake_linevis && !bake_linevis[bw->line]) continue;      // BSP-occluded
         ztopz = bw->ztop_ceil ? sectors[bw->ztop_sec].ceilingheight
                               : sectors[bw->ztop_sec].floorheight;
         zbotz = bw->zbot_ceil ? sectors[bw->zbot_sec].ceilingheight
                               : sectors[bw->zbot_sec].floorheight;
         if (ztopz <= zbotz) continue;                               // step closed
+#ifndef BENCH_FORCE_MESH_RSP_EMIT
         j = batch_nvis++;
         batch_vislist[j] = i;
         batch_in[j].x1 = bw->x1; batch_in[j].y1 = bw->y1;
         batch_in[j].x2 = bw->x2; batch_in[j].y2 = bw->y2;
         batch_in[j].ztop = ztopz; batch_in[j].zbot = zbotz;
         batch_in[j].vis = 1; batch_in[j].light = 0;
-#ifdef BENCH_FORCE_MESH_RSP_EMIT
-        // RSP-EMIT S/T source. T is near-clip-invariant so compute it here (fixed):
-        // midw = peg sector live height [+ textureheight] + rowoffset, then
-        // t_top/t_bot = midw - ztop/zbot -- the exact-fixed mirror of DL_MeshDrawWalls'
-        // float midw chain (both end at texel*32 in s10.5). S source (textureoffset,
-        // baked slen) feeds A's per-corner S with the near-clip slide.
+#else
+        // RSP-EMIT. T/light/pegging are wall-wide (computed once); the geometry + S are
+        // split into sub-segments so each emitted quad's S span stays under the s10.5
+        // saturation limit (DL_RSP_SMAX). T is near-clip-invariant: midw = peg sector
+        // live height [+ textureheight] + rowoffset, then t_top/t_bot = midw - ztop/zbot.
         {
             fixed_t pegz = bw->peg_ceil ? sectors[bw->peg_sec].ceilingheight
                                         : sectors[bw->peg_sec].floorheight;
             fixed_t midw = pegz + bw->rowoffset;
-            fixed_t toff = bw->textureoffset;
-            fixed_t ttop, tbot;
-            // S/T PERIOD BIAS (saturation guard). StageVtx packs S/T as s10.5 (16.16
-            // texels >>11), which OVERFLOWS past |1024| texels -- the "no texture / smear
-            // up close" the CPU DL_DrawRecord avoids with its own period bias. The CI4
-            // draw tile wraps S with mask log2(blkw) and (fits_hw) T with mask log2(blkh),
-            // so subtracting a WHOLE number of texture periods from textureoffset / the
-            // T pair is sampling-identical and keeps the BASE coordinate small. (The
-            // per-wall S SPAN = slen can still exceed 1024 on a long wall -- that needs a
-            // run split, handled separately; this bias fixes the base, which is what the
-            // common short wall needs.) blkw/blkh come from the texture's stored CI4 block.
+            fixed_t ttop, tbot, per_w = 0;
+            int32_t lrgba;
+            int     slen_tx = (int)(bw->slen >> 16);
+            int     nseg = (slen_tx + DL_RSP_SMAX - 1) / DL_RSP_SMAX;
+            int     k;
+            int     blkh = 0, blkw = 0;
+
+            if (nseg < 1) nseg = 1;
+            if (nseg > DL_RSP_MAXSEG) nseg = DL_RSP_MAXSEG;
+            if (slen_tx > dl_rsp_max_slen) dl_rsp_max_slen = slen_tx;    // diag
+
+            // T PERIOD BIAS (base saturation guard): reduce t_top/t_bot by a whole number
+            // of texture periods so the smaller lands in [0, blkh); the tile T-mask /
+            // band walk wraps the rest. S base is reduced per sub-segment below.
             if (bw->peg_addth) midw += textureheight[bw->texture];
             ttop = midw - ztopz;
             tbot = midw - zbotz;
-            {
-                int blkh = 0, blkw = 0;
-                (void)DL_RowMajorBlock(bw->texture, &blkh, &blkw);
-                if (blkw > 0) {
-                    fixed_t per = (fixed_t)blkw << 16;
-                    toff %= per; if (toff < 0) toff += per;     // base in [0, blkw texels)
-                }
-                if (blkh > 0) {
-                    fixed_t per  = (fixed_t)blkh << 16;
-                    fixed_t tmin = (ttop < tbot) ? ttop : tbot;
-                    fixed_t bias = (tmin / per) * per;          // toward-zero floor of periods
-                    if (tmin - bias < 0) bias -= per;           // ensure tmin-bias in [0,per)
-                    ttop -= bias; tbot -= bias;                 // base in [0, blkh texels)
-                }
+            (void)DL_RowMajorBlock(bw->texture, &blkh, &blkw);
+            if (blkw > 0) per_w = (fixed_t)blkw << 16;
+            if (blkh > 0) {
+                fixed_t per  = (fixed_t)blkh << 16;
+                fixed_t tmin = (ttop < tbot) ? ttop : tbot;
+                fixed_t bias = (tmin / per) * per;
+                if (tmin - bias < 0) bias -= per;
+                ttop -= bias; tbot -= bias;
             }
-            batch_in[j].textureoffset = toff;
-            batch_in[j].slen          = bw->slen;
-            batch_in[j].t_top         = ttop;
-            batch_in[j].t_bot         = tbot;
-            // Per-wall SHADE = the sector's depth-light RGB, same dl_prim_lut the CPU
-            // mesh path feeds as PRIM. Overlay B writes it as the vertex RGBA and the
-            // wall combiner is TEX0*SHADE, so each wall in a batch lights independently
-            // (PRIM is per-draw and can't vary within one B dispatch).
+            // Per-wall SHADE = the sector's depth-light RGB, same dl_prim_lut the CPU mesh
+            // path feeds as PRIM. Overlay B writes it as the vertex RGBA (TEX0*SHADE), so
+            // each wall lights with its own brightness within a B dispatch.
             {
                 int lvl = (255 - bw->light) >> 3;
                 if (lvl < 0) lvl = 0;
                 if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
-                batch_in[j].light = (int32_t)dl_prim_lut[lvl];
+                lrgba = (int32_t)dl_prim_lut[lvl];
+            }
+
+            for (k = 0; k < nseg; k++) {
+                fixed_t fx1, fy1, fx2, fy2, soff, sl, sk, sk1;
+                int     jj;
+                if (batch_nvis >= DL_WALL_ARENA) break;         // arena full -- drop the tail
+                // World endpoints of sub-segment k (k/nseg .. (k+1)/nseg along the linedef);
+                // last segment snaps to the true corner so splits leave no gap.
+                fx1 = bw->x1 + (fixed_t)(((int64_t)(bw->x2 - bw->x1) * k) / nseg);
+                fy1 = bw->y1 + (fixed_t)(((int64_t)(bw->y2 - bw->y1) * k) / nseg);
+                if (k == nseg - 1) { fx2 = bw->x2; fy2 = bw->y2; }
+                else {
+                    fx2 = bw->x1 + (fixed_t)(((int64_t)(bw->x2 - bw->x1) * (k + 1)) / nseg);
+                    fy2 = bw->y1 + (fixed_t)(((int64_t)(bw->y2 - bw->y1) * (k + 1)) / nseg);
+                }
+                // S range for this sub-segment: [k/nseg, (k+1)/nseg] of the wall length.
+                sk   = (fixed_t)(((int64_t)bw->slen * k) / nseg);
+                sk1  = (k == nseg - 1) ? bw->slen
+                                       : (fixed_t)(((int64_t)bw->slen * (k + 1)) / nseg);
+                sl   = sk1 - sk;                                 // sub-segment S span
+                soff = bw->textureoffset + sk;                  // S at sub-seg corner A
+                if (per_w > 0) { soff %= per_w; if (soff < 0) soff += per_w; }
+
+                jj = batch_nvis++;
+                batch_vislist[jj] = i;
+                batch_in[jj].x1 = fx1; batch_in[jj].y1 = fy1;
+                batch_in[jj].x2 = fx2; batch_in[jj].y2 = fy2;
+                batch_in[jj].ztop = ztopz; batch_in[jj].zbot = zbotz;
+                batch_in[jj].vis = 1;
+                batch_in[jj].textureoffset = soff;
+                batch_in[jj].slen          = sl;
+                batch_in[jj].t_top         = ttop;
+                batch_in[jj].t_bot         = tbot;
+                batch_in[jj].light         = lrgba;
             }
         }
 #endif
@@ -5152,8 +5191,8 @@ static void DL_FlushRSPEmit(void)
     {
         static unsigned rf = 0;
         if ((rf++ & 511) == 0)
-            debugf("MESH RSP-EMIT: %d tex-runs bound+emitted (%d walls)\n",
-                   drew_any, batch_nvis);
+            debugf("MESH RSP-EMIT: %d tex-runs bound+emitted (%d sub-quads, max wall %d texels)\n",
+                   drew_any, batch_nvis, dl_rsp_max_slen);
     }
 }
 #endif /* BENCH_FORCE_MESH_RSP_EMIT */
