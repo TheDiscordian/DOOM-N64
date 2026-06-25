@@ -2848,6 +2848,16 @@ static rsp_bwall_out_t *batch_out = batch_out_buf;
 // dense slot j; consumers (DL_MeshDrawWalls + the dl_rsp_verify compare) walk the list.
 static int batch_vislist[DL_WALL_ARENA];
 static int batch_nvis = 0;
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+// RSP-EMIT: overlay B (the wall triangle emit) is NO LONGER dispatched from the
+// render-view pack (DL_RSPBatchProbe) -- that ran BEFORE rdpq_attach + the world
+// textured mode + the ghost-fix view fill (all in I_FinishUpdate), so B's tris
+// landed on no framebuffer with no CI4 tile/TLUT bound => black walls. B is now
+// dispatched from DL_Flush (DL_FlushRSPEmit), AFTER attach/mode/bind, per texture
+// run. dl_rspemit_pending is armed by the pack each 3D frame and consumed once by
+// DL_Flush, so a menu/non-3D present (no pack) never re-emits a stale batch_out.
+static int dl_rspemit_pending = 0;
+#endif
 #ifdef BENCH_FORCE_MESH_RSP_EARLY
 // OVERLAP experiment: 1 once DL_RSPDispatchAllWalls has dispatched the all-walls transform
 // (before the BSP walk). When set, batch_out is indexed by WALL ID (not dense vis-slot) and
@@ -2980,11 +2990,39 @@ static void DL_RSPBatchProbe(void)
             fixed_t pegz = bw->peg_ceil ? sectors[bw->peg_sec].ceilingheight
                                         : sectors[bw->peg_sec].floorheight;
             fixed_t midw = pegz + bw->rowoffset;
+            fixed_t toff = bw->textureoffset;
+            fixed_t ttop, tbot;
+            // S/T PERIOD BIAS (saturation guard). StageVtx packs S/T as s10.5 (16.16
+            // texels >>11), which OVERFLOWS past |1024| texels -- the "no texture / smear
+            // up close" the CPU DL_DrawRecord avoids with its own period bias. The CI4
+            // draw tile wraps S with mask log2(blkw) and (fits_hw) T with mask log2(blkh),
+            // so subtracting a WHOLE number of texture periods from textureoffset / the
+            // T pair is sampling-identical and keeps the BASE coordinate small. (The
+            // per-wall S SPAN = slen can still exceed 1024 on a long wall -- that needs a
+            // run split, handled separately; this bias fixes the base, which is what the
+            // common short wall needs.) blkw/blkh come from the texture's stored CI4 block.
             if (bw->peg_addth) midw += textureheight[bw->texture];
-            batch_in[j].textureoffset = bw->textureoffset;
+            ttop = midw - ztopz;
+            tbot = midw - zbotz;
+            {
+                int blkh = 0, blkw = 0;
+                (void)DL_RowMajorBlock(bw->texture, &blkh, &blkw);
+                if (blkw > 0) {
+                    fixed_t per = (fixed_t)blkw << 16;
+                    toff %= per; if (toff < 0) toff += per;     // base in [0, blkw texels)
+                }
+                if (blkh > 0) {
+                    fixed_t per  = (fixed_t)blkh << 16;
+                    fixed_t tmin = (ttop < tbot) ? ttop : tbot;
+                    fixed_t bias = (tmin / per) * per;          // toward-zero floor of periods
+                    if (tmin - bias < 0) bias -= per;           // ensure tmin-bias in [0,per)
+                    ttop -= bias; tbot -= bias;                 // base in [0, blkh texels)
+                }
+            }
+            batch_in[j].textureoffset = toff;
             batch_in[j].slen          = bw->slen;
-            batch_in[j].t_top         = midw - ztopz;
-            batch_in[j].t_bot         = midw - zbotz;
+            batch_in[j].t_top         = ttop;
+            batch_in[j].t_bot         = tbot;
         }
 #endif
     }
@@ -3027,16 +3065,14 @@ static void DL_RSPBatchProbe(void)
                    PhysicalAddr(batch_out), (uint32_t)batch_nvis);
 #ifdef BENCH_FORCE_MESH_RSP_EMIT
         // KEYSTONE two-overlay split: overlay A (above) transformed every visible wall
-        // into batch_out. Now dispatch overlay B (rsp_dlemit) to EMIT those walls' RDP
-        // triangles, reading batch_out back via DMA. No rspq_wait, no CPU readback: rspq
-        // runs A fully (incl. its batch_out DMA-out) before B, and B's triangles land
-        // ahead of the CPU's later rdpq commands. The ~776us readback stall stays gone.
-        // DL_MeshDrawWalls skips its CPU collect+sort+emit loop (walls drawn by B).
-        // S/T are still 0 in B (untextured) until A writes S/T into batch_out.
-        if (rsp_dlemit_ovl_id == 0)
-            rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
-        rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
-                   PhysicalAddr(batch_out), (uint32_t)batch_nvis);
+        // into batch_out. Overlay B (the triangle EMIT) is dispatched LATER, from
+        // DL_Flush (DL_FlushRSPEmit), NOT here. This pack runs in R_RenderPlayerView,
+        // which is BEFORE I_FinishUpdate does rdpq_attach + the ghost-fix view fill +
+        // the world textured-mode setup -- emitting B here put its tris on no attached
+        // framebuffer with no CI4 tile/TLUT bound (black walls). Arm the consume-once
+        // flag; DL_Flush emits B per texture run after attach/mode/bind. A's batch_out
+        // DMA completes on the RSP before B (same rspq FIFO), so still no rspq_wait.
+        dl_rspemit_pending = 1;
 #else
         rspq_wait();
         data_cache_hit_invalidate(batch_out, (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
@@ -4952,6 +4988,131 @@ static void DL_DrawMeshLeaves(void)
     }
 }
 
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+// RSP-EMIT texture pass (overlay B), dispatched from DL_Flush -- AFTER rdpq_attach,
+// the world textured mode, and the ghost-fix view fill. The render-view pack
+// (DL_RSPBatchProbe) transformed every visible wall into batch_out (texture-sorted)
+// and armed dl_rspemit_pending; overlay A's batch_out DMA is already done on the RSP
+// (same rspq FIFO), so B reads it with NO rspq_wait. Here the CPU only walks the
+// texture runs and, per run, BINDS the CI4 texture (sub-palette TLUT + tile + load),
+// then fires overlay B for that run -- B emits the run's wall triangles into the now-
+// correctly-bound RDP state. This mirrors DL_Flush's per-texture bucket bind, but the
+// triangles come off the RSP (batch_out) instead of CPU DL_DrawRecord, keeping the
+// readback-free win. Z-mode is already enabled by the caller (dl_wall_z).
+//
+// SCOPE (this slice): one tri-pair per wall with hardware S-wrap + (fits_hw) hardware
+// T-wrap, else a single clamped band of min(blkh,cap) rows. Correct for fits_hw / short
+// walls; a wall longer than ~1024 texels (S span) or taller than the loaded band still
+// shows S/T saturation -- those get a run/band split in a follow-up. The per-wall S/T
+// BASE is period-reduced in the pack so the common wall lands in range.
+static void DL_FlushRSPEmit(void)
+{
+    int jw;
+    int drew_any = 0;
+
+    if (!dl_rspemit_pending)
+        return;
+    dl_rspemit_pending = 0;
+    if (batch_nvis <= 0)
+        return;
+    if (rsp_dlemit_ovl_id == 0)
+        rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
+
+    // Walls combine TEX0*PRIM (RDPQ_COMBINER_TEX_FLAT). The CPU path sets PRIM per
+    // record from dl_prim_lut[light]; overlay B does NOT touch PRIM, so a stale PRIM=0
+    // from an earlier pass renders every wall TEX0*0 = solid BLACK. Set PRIM here.
+    // (Single value this slice => uniform full-bright walls; per-wall light follows.)
+    rdpq_set_prim_color(RGBA32(255, 255, 255, 255));
+
+    // Walk the texture-sorted batch_out as contiguous same-texture runs.
+    for (jw = 0; jw < batch_nvis; )
+    {
+        int            tex = bake_walls[batch_vislist[jw]].texture;
+        int            r0  = jw, r1;
+        int            blkh = 0, blkw = 0;
+        byte*          block;
+        dl_rowmajor_t* slot;
+        int            pad_w, pitchb, cap, rows, run_idx;
+        surface_t      texsurf;
+        rdpq_tileparms_t tp;
+        int            maskbits, wbit, hbit;
+
+        for (r1 = jw; r1 < batch_nvis &&
+                       bake_walls[batch_vislist[r1]].texture == tex; r1++)
+            ;
+        jw = r1;                                // advance for the next run
+
+        block = DL_RowMajorBlock(tex, &blkh, &blkw);
+        if (!block || blkh < 1 || blkw < 1)
+            continue;                           // no usable CI4 block: leave this run unlit
+
+        slot    = &dl_rowmajor[tex];
+        run_idx = drew_any;                     // touch order = TLUT slot assignment
+        slot->pal_slot = (uint8_t)(run_idx & 15);
+        DL_MarkInFlight(tex);
+        DL_RetintSlot(slot, dl_retint_gen);
+
+        // Upload this texture's 16-colour CI4 sub-palette into its slot. A slot reused
+        // past 16 textures must let the prior owner's tris drain first (same as DL_Flush).
+        if (run_idx >= 16) { rdpq_sync_tile(); rdpq_sync_load(); }
+        memcpy(dl_subpal_up[slot->pal_slot], slot->subpal, sizeof(slot->subpal));
+        data_cache_hit_writeback(dl_subpal_up[slot->pal_slot], sizeof(slot->subpal));
+        rdpq_tex_upload_tlut(dl_subpal_up[slot->pal_slot], slot->pal_slot * 16, 16);
+
+        pad_w  = (blkw < 16) ? 16 : blkw;
+        pitchb = pad_w / 2;
+        cap    = DL_TMEM_HALF / pitchb;
+        if (cap < 1) continue;
+        rows   = (blkh <= cap) ? blkh : cap;    // fits_hw loads blkh; else a clamped band
+
+        // CI4 draw tile (TILE0) + I8 load tile (TILE1). Hardware S-wrap = log2(blkw).
+        // fits_hw adds hardware T-wrap = log2(blkh); otherwise T clamps over the band.
+        memset(&tp, 0, sizeof(tp));
+        for (maskbits = 0, wbit = blkw; wbit > 1; wbit >>= 1) maskbits++;
+        tp.s.mask  = maskbits;
+        tp.palette = slot->pal_slot;
+        if (slot->fits_hw) {
+            int tbits = 0;
+            for (hbit = blkh; hbit > 1; hbit >>= 1) tbits++;
+            tp.t.mask = tbits;
+        } else {
+            tp.t.clamp = true;
+        }
+        texsurf = surface_make_linear(block, FMT_I8, pitchb, rows);
+        rdpq_set_texture_image(&texsurf);
+        rdpq_set_tile(TILE1, FMT_I8,  0, pitchb, NULL);
+        rdpq_set_tile(TILE0, FMT_CI4, 0, pitchb, &tp);
+        rdpq_load_tile(TILE1, 0, 0, blkw / 2, rows);
+        rdpq_set_tile_size(TILE0, 0, 0, blkw, rows);
+        dl_tile_loads++;
+        dl_uploads++;
+
+        // Fire overlay B for this run's contiguous batch_out slice. B DMAs the slice in
+        // and emits each surviving wall's 2 triangles against the just-bound tile/TLUT.
+        rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_BATCH,
+                   PhysicalAddr(&batch_out[r0]), (uint32_t)(r1 - r0));
+        drew_any++;
+    }
+
+    // The CI4 pass overwrote the 256-entry TLUT region with per-texture sub-palettes;
+    // re-assert the master 256-TLUT so the CI8 planes/sprites/HUD that draw next sample
+    // the right colours (same fix DL_Flush's bucket walk does). Only when walls drew.
+    if (drew_any > 0) {
+        rdpq_sync_tile();
+        rdpq_sync_load();
+        I_N64ForceTLUTReupload();
+        I_N64UploadMasterTLUT();
+    }
+
+    {
+        static unsigned rf = 0;
+        if ((rf++ & 511) == 0)
+            debugf("MESH RSP-EMIT: %d tex-runs bound+emitted (%d walls)\n",
+                   drew_any, batch_nvis);
+    }
+}
+#endif /* BENCH_FORCE_MESH_RSP_EMIT */
+
 // Drain the emitted wall records into the attached display fb. Stage 3: a
 // per-TEXTURE bucket walk -- for each touched texture, fetch + pin its transpose
 // block ONCE, then draw every record in that texture's bucket (DL_DrawRecord)
@@ -5053,6 +5214,14 @@ void DL_Flush(void)
     // for the walls only -- disabled again before the planes draw below.
     if (dl_wall_z)
         rdpq_mode_zbuf(true, true);
+
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    // RSP-EMIT: the walls were transformed on the RSP (batch_out) and are emitted here
+    // off the RSP, per texture run, against this CI4 bind -- AFTER attach/mode/Z, so
+    // (unlike the old render-view dispatch) they land textured on the attached fb. The
+    // CPU bucket walk below is empty on this path (DL_MeshDrawWalls skipped the collect).
+    DL_FlushRSPEmit();
+#endif
 
     // Per-texture bucket walk (Q6, the Stage-3 autosync collapse). For each
     // texnum touched this frame, fetch + pin its transpose block ONCE, then draw

@@ -18,8 +18,15 @@
 # rsp_dlwall.S header for the objcopy/--redefine-sym reason.
 # ============================================================================
 
-# Custom vertex layout the rsp_rdpq_tri engine reads (mirrors rsp_dlwall.S / tiny3d).
-# DOOM walls are TRIFMT_ZBUF_TEX {X,Y,Z,S,T,INV_W} -- no per-vertex shade.
+# Custom vertex layout the rsp_rdpq_tri engine reads. These offsets MUST match
+# libdragon/include/rsp_rdpq_tri.inc EXACTLY -- the engine does `lsv vw_i, VTX_ATTR_Wi`
+# etc. at fixed offsets. The engine's vertex is a COMPACT 24-byte record with NO clip-
+# space position: Wi/Wf/INVWi/INVWf sit at 0x10/0x12/0x14/0x16, packed right after ST.
+# (The earlier layout interleaved phantom CLIPPOSi/CLIPPOSf words and pushed Wi..INVWf to
+# 0x16..0x22, so StageVtx wrote W/INV_W where the engine reads CLIPPOS and the engine read
+# W/INV_W from uninitialised bytes -> degenerate perspective -> the triangles never
+# rasterised, i.e. the BLACK WALLS. The engine ignores any bytes past 0x18.)
+# DOOM walls are {X,Y,Z,S,T,INV_W} -- no per-vertex shade.
 #define RDPQ_TRIANGLE_CUSTOM_VTX 1
 #define VTX_ATTR_XY        0x00
 #define VTX_ATTR_Z         0x04
@@ -27,12 +34,10 @@
 #define VTX_ATTR_REJFLAGS  0x07
 #define VTX_ATTR_RGBA      0x08
 #define VTX_ATTR_ST        0x0C
-#define VTX_ATTR_CLIPPOSi  0x10
-#define VTX_ATTR_Wi        0x16
-#define VTX_ATTR_CLIPPOSf  0x18
-#define VTX_ATTR_Wf        0x1E
-#define VTX_ATTR_INVWi     0x20
-#define VTX_ATTR_INVWf     0x22
+#define VTX_ATTR_Wi        0x10
+#define VTX_ATTR_Wf        0x12
+#define VTX_ATTR_INVWi     0x14
+#define VTX_ATTR_INVWf     0x16
 
 #include <rsp_queue.inc>
 #include <rdpq_macros.h>
@@ -274,7 +279,13 @@ StageVtx:
     move t5, t6                      # clamp
 1:
     sh   t5, VTX_ATTR_Z(t8)          # Z
-    sh   zero, VTX_ATTR_CLIPFLAGS(t8)
+    # CLIPFLAGS (byte 0x06) = 0: no near/far/guard clip needed (walls are pre-clipped).
+    # REJFLAGS (byte 0x07) = 0xFF: the engine CULLS unless (rej1|rej2|rej3)&0x3F == 0x3F
+    # (rsp_rdpq_tri.inc:277-279 -- negated trivial-reject = "inside all 6 planes"). A
+    # 16-bit 0x00FF store sets clipflags=0, rejflags=0xFF. Writing 0 here (the old code)
+    # made EVERY wall triangle trivially-rejected -> the BLACK WALLS.
+    li   t6, 0x00FF
+    sh   t6, VTX_ATTR_CLIPFLAGS(t8)
     sw   zero, VTX_ATTR_RGBA(t8)
     sra  t5, t0, 11                  # S: 16.16 texels -> s10.5 (texel*32)
     sh   t5, VTX_ATTR_ST(t8)
