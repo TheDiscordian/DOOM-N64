@@ -11,6 +11,51 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit walls render BLACK / no texture / saturate up close
+- **Symptom (evolved over the session):** under `BENCH_FORCE_MESH_RSP_EMIT` the GPU wall
+  path (overlay A transforms -> overlay B emits the RDP tris, no CPU readback) drew BLACK
+  walls -- no texture, no visible geometry. After the emit was fixed, 128-wide textures
+  smeared vertically; then walls were full-bright; then long walls "went fucky up close OR
+  on some angles". (~22 builds were burned on the BLACK stage before this session.)
+- **Root cause -- the BLACK walls were THREE stacked bugs, none of them the binding:**
+  1. Overlay B was dispatched from the render-view pack (`DL_RSPBatchProbe`, called in
+     `R_RenderPlayerView`) -- BEFORE `I_FinishUpdate` does `rdpq_attach` + the ghost-fix
+     view-fill + the world textured-mode setup. B's tris hit no attached fb with no CI4
+     tile/TLUT. Fix: dispatch B from `DL_Flush` (`DL_FlushRSPEmit`), after attach/mode/bind.
+  2. `rsp_dlemit.S` vertex layout did NOT match the `rsp_rdpq_tri` engine: it interleaved
+     phantom `CLIPPOSi/CLIPPOSf` words, pushing `Wi/Wf/INVWi/INVWf` to 0x16/0x1E/0x20/0x22.
+     The engine reads them at 0x10/0x12/0x14/0x16 -> it read W/INV_W from garbage ->
+     degenerate perspective -> tris never rasterised. Fix: correct the offsets (compact
+     24-byte engine vertex, no CLIPPOS).
+  3. `StageVtx` wrote a 16-bit zero over `CLIPFLAGS`(0x06)+`REJFLAGS`(0x07). The engine
+     CULLS unless `(rej1|rej2|rej3)&0x3F == 0x3F` (rsp_rdpq_tri.inc:277) -- negated
+     trivial-reject. rejflags=0 -> EVERY tri trivially-rejected. Fix: write `0x00FF`.
+- **Wrong turns (do NOT retry) -- the ~22 BLACK-stage builds:** master-TLUT re-assert
+  timing/sync, moving the bind into `DL_Flush`, TEX_FLAT mode setup, `rdpq_sync_pipe`
+  between bind and B, per-run vs per-wall dispatch, `rspq_wait` full isolation, band
+  `src_lo` clamp, T-period reduction. ALL of these chase the TEXTURE BIND -- but the tris
+  were never rasterising at all (bugs 2+3), so no bind could ever show. **The diagnostic
+  that cracked it:** force a bright flat PRIM + Z off and dump `batch_out` -> geometry was
+  VALID (emit=1, sane sx/sy) yet nothing drew => the failure is the engine vertex contract
+  (offsets + reject flags), NOT the bind. When valid geometry doesn't rasterise, check the
+  `rsp_rdpq_tri` VTX_ATTR offsets and the REJFLAGS before touching texturing.
+- **The later issues (each its own fix):** 128-wide smear = no T-banding (load 1 of 4
+  bands + clamp) -> RSP T-band walk; full-bright = PRIM can't vary within one B dispatch
+  -> per-wall `TEX0*SHADE` via vertex RGBA + tricmd 0x0B00->0x0F00; "fucky up close OR on
+  some angles" = S-span saturation (StageVtx packs S as s10.5, saturates >1024 texels; a
+  diag proved E1M1's longest visible wall is 832 texels, which + the base bias crosses
+  1024 on 256-wide textures) -> port the CPU's documented S-span run-split (blkw-aware).
+- **Repro:** `bench/bench.sh mesh-rsp-emit` (perf), or a `BENCH_MARKS=1` build +
+  `bench/scan-marks.sh` for frozen frames; A/B vs the canonical frozen software at
+  `~/.local/share/doom-n64-bench/ref-sw-frozen/` (NEVER re-run software). Note: the
+  close-wall saturation is viewpoint-dependent and the static demo does not always hit it.
+- **Resolution:** `3230e77` (the 3 BLACK-wall fixes), `6108bcd` (T-banding), `ac413f8`
+  (lighting), `7226518`+`4b61395` (S-span split, blkw-aware), `29cd5b9` (empty-band
+  elision). Result: textured/lit/correct, 16616/28384 us avg/p95 vs software 19860/31840
+  (-16.3%/-10.8%). Viewpoint-dependent close-wall still pending Ryan's interactive drive.
+
+---
+
 ## FIXED: HUD/status-bar shimmers after death (post-respawn arms-number flicker)
 - **Symptom:** the status bar flickers once the player dies. Ryan: "ONLY after death,
   maybe it just needs to be redrawn after respawn". Localised: the **arms-number digits**
