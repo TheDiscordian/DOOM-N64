@@ -5167,14 +5167,30 @@ static void DL_FlushRSPEmit(void)
             // Two periods cover a wall up to ~blkh texels tall after the pack's T-bias
             // (min(t_top,t_bot) in [0,blkh)); a band is split at the period edge so a
             // non-pow2 height stays exact.
-            int p;
+            // Bound the band sweep to the T-extent the run's walls actually cover. The
+            // pack wrote each wall's period-relative t_top/t_bot into batch_in (CPU-side,
+            // free to read -- no readback), so skip any band no wall touches. This is the
+            // p95 lever: the 2-period x cap-band sweep was issuing (and B re-DMAing) bands
+            // with zero walls; most runs span only a couple of bands. Pure dispatch
+            // elision -- a skipped band has no geometry, so it cannot change a pixel.
+            int p, kk;
+            int lo_tx = 0x7fffffff, hi_tx = 0;
+            for (kk = r0; kk < r1; kk++) {
+                int tt = (int)(batch_in[kk].t_top >> 16);
+                int tb = (int)((batch_in[kk].t_bot + 0xFFFF) >> 16);   // ceil
+                if (tt < lo_tx) lo_tx = tt;
+                if (tb > hi_tx) hi_tx = tb;
+            }
+            if (lo_tx < 0) lo_tx = 0;
             for (p = 0; p < 2; p++) {
                 int pbase = p * blkh, k;
+                if (pbase >= hi_tx) break;          // whole period past the run's T extent
                 for (k = 0; k < blkh; k += cap) {
                     int rlo = k;
                     int rhi = (k + cap > blkh) ? blkh : k + cap;
                     int alo = pbase + rlo;      // absolute band T lo (texels)
                     int ahi = pbase + rhi;
+                    if (ahi <= lo_tx || alo >= hi_tx) continue;        // no wall in this band
                     rdpq_load_tile(TILE1, 0, rlo, blkw / 2, rhi);
                     rdpq_set_tile_size(TILE0, 0, alo, blkw, ahi);
                     dl_tile_loads++; dl_uploads++;
