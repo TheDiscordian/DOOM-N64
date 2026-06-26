@@ -11,6 +11,38 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit wall-texture WARP (diagonal arcing bands on clipped receding walls)
+- **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, wall textures "draw, they just warp a
+  lot" (Ryan) — visible while standing still, animating only as the player moves. On a
+  receding wall a flat texture sprouts bright **diagonal arcing bands** ("triangles appear
+  and pull the texture in weird directions"). Worst on long receding / near-the-camera walls.
+- **Bisection (decisive):** built RSP-transform + **CPU-emit** vs RSP-transform + **RSP-emit**
+  off the *identical* overlay-A `batch_out`. CPU-emit = correct, RSP-emit = warped → the warp
+  is entirely in overlay B's emit (`rsp/rsp_dlemit.S` + `DL_FlushRSPEmit`), NOT the transform.
+  (Logged in `Docs/RSP_EMIT_TESTS.md`.)
+- **Root cause:** the `rsp_rdpq_tri` engine's perspective normalization (`rsp_rdpq_tri.inc:
+  429-447`) uses `min(W)` as a stand-in for `1/max(INVW)` — valid ONLY when `W == 1/INVW`
+  per vertex. Both the near-plane clip (overlay A) and the screen-edge X-clip
+  (`DL_FlushRSPEmit`) carried **W (depth) as a LINEAR lerp** while INVW (= 1/w, correctly
+  linear in screen-x) was lerped separately, so `W·INVW` drifted to **1.1–1.8** on clipped
+  receding walls. A wrong `min(W)` pushes the normalized INVW out of [0,1] → the per-pixel
+  S/T divide shears → diagonal arcing. Found by adding a `W·INVW` (WxIV) column to a
+  `DL_FlushRSPEmit` dump: ~1.000 on all the good walls, 1.1–1.8 on exactly the arcing ones.
+- **Wrong turns (do NOT retry for the warp):** forced horizontal subdivision (`nseg≥8`),
+  `FILTER_POINT` (bilinear), halved T-band cap, transform precision — all measured, none
+  changed the warp. The transform is clean (CPU-emit off the same `batch_out` is correct).
+- **Repro:** any `BENCH_FORCE_MESH_RSP_EMIT` marks ROM; the warp is general (most lit
+  receding-wall frames). The capture's `bench_frame_count` decouples from game-state in the
+  marks build (debugf makes frames outliers, and outliers don't increment the counter), so
+  gate diagnostics on wall CONTENT (wide span + invw spread), not the frame number.
+- **Resolution (`df09a66`):** in `DL_FlushRSPEmit`, rebuild W as the EXACT reciprocal of the
+  final (clipped) INVW for every emitted wall (`dA = 1/iwl`, `dB = 1/iwr`), not a depth lerp.
+  No-op for the already-consistent unclipped walls; corrects every clipped one. After: WxIV
+  0.992–1.000 demo-wide; full 32-frame A/B vs the frozen SW ref (128–4096) shows the arcs
+  gone and the walls tracking software. Perf: +2 float reciprocals per emitted wall, negligible.
+
+---
+
 ## FIXED: RSP-emit close-wall BLACK VOID (near-clipped wall → off-screen Y → RDP overflow)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, walls "USUALLY render correctly, but
   sometimes on some angles OR up close weird things start to happen" (Ryan). Up close / in a
