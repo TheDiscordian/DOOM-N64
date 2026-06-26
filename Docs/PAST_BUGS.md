@@ -41,7 +41,7 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
   where floors are visible, then climbing through the corridors). A motion-burst grim capture
   (non-marks ROM, `/tmp/motion-burst.sh`) of the broken region: pre-fix shows stale-frame
   reversions (world matches the 3-presents-ago frame), post-fix shows none.
-- **Resolution (`b956aeb`):** add `DL_RSPEmitPending()` (returns `dl_rspemit_pending`, 0 in
+- **Resolution (`8039d6c`):** add `DL_RSPEmitPending()` (returns `dl_rspemit_pending`, 0 in
   non-RSP-emit builds) and OR it into the gate at i_video_n64.c:1326. Now every RSP-emit frame
   runs the colour-clear (retires the 3-presents-ago fb) and DL_Flush -> DL_FlushRSPEmit (draws
   THIS frame's walls). Flag-OFF / non-RSP-emit builds are byte-identical (the term is 0 there);
