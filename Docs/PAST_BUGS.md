@@ -11,6 +11,43 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit close-wall BLACK VOID (near-clipped wall → off-screen Y → RDP overflow)
+- **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, walls "USUALLY render correctly, but
+  sometimes on some angles OR up close weird things start to happen" (Ryan). Up close / in a
+  corridor, the big close wall(s) that should fill the view render as a BLACK VOID. Bench
+  frames 256 + 384 reproduce it (the demo walks into a corridor).
+- **Root cause (TWO layers):**
+  1. **The mechanism:** a close wall whose near corner is near-clipped (slid to
+     `depth==nearz=4`) projects to a screen Y *far* outside the RDP's 14-bit s11.2 edge-Y
+     range (±2047.75); measured `ytA=-4005`. Overlay B's `rsp_rdpq_tri` clip path is STUBBED
+     (`RDPQ_Triangle_Clip: jr ra`, CLIPFLAGS forced 0) so it feeds the raw vertex straight to
+     the RDP -> the Y edge field overflows -> garbage edge walk -> BLACK. (X is fine: the RDP
+     X edges are s15.16 + scissored; only **Y** overflows.) The CPU "mesh" path never hits
+     this because its screen-edge X-clip drags the off-screen corner to x∈[0,SCRW-1] and
+     re-lerps Y at the clip, which brings Y back in range. B had no such clip.
+  2. **Why the committed clip (`a9636d7`) did NOT fix it:** that clip was correct math but ran
+     on the CPU over `batch_out` **without `rspq_wait`**. The EMIT pack (`DL_RSPBatchProbe`,
+     the `BENCH_FORCE_MESH_RSP_EMIT` branch) is readback-free and deliberately skips the wait
+     (only the `#else` branch waits). So the CPU read of `batch_out` got STALE/partial overlay-A
+     output and its writeback raced overlay B's RSP-side read -> the clip operated on garbage
+     and did nothing. **One-line fix: `rspq_wait()` before the clip reads `batch_out`** (`545fe6a`).
+- **Wrong turns (do NOT retry):** saturation split, slope-overflow→frac, "screen-edge X-clip"
+  (the clip was RIGHT but read stale memory — this is the trap), Y-clamp ±1536, a multi-agent
+  X-clip verdict, a CPU-emit fallback routing extreme walls to `DL_EmitWallTier`. ALL failed
+  for the SAME hidden reason: **any CPU read of `batch_out` in `DL_FlushRSPEmit` is stale
+  without `rspq_wait`** (the EMIT pack doesn't wait). A coherent dump (rspq_wait + the CPU's
+  own projection beside A's) at frame 256 showed overlay A is CORRECT (AsxA=-1917 vs the CPU's
+  CsxA=-1912, emit=1) — the bug was always downstream of A.
+- **Repro:** `BENCH_MARKS=1` build of `mesh-rsp-emit` + `bench/scan-marks.sh`, view frame 256;
+  A/B vs `~/.local/share/doom-n64-bench/ref-sw-frozen/frame-256.png`. The `mesh` preset (pure
+  CPU projection) renders 256 correctly — the anchor proving the walls ARE in the render set.
+- **Resolution:** `545fe6a`. Perf IMPROVED (the wait is ~free — A is done by `DL_Flush` time):
+  software 19860/31840 → mesh-rsp-emit 16255/26720 us avg/p95 (−18.2% / −16.1%, 61.5/37.4 fps).
+  Note: the CPU clip + wait re-introduces a `batch_out` readback the keystone removed, but it
+  costs nothing measurable here; an overlay-A-side clip (truly readback-free) is a future option.
+
+---
+
 ## FIXED: RSP-emit walls render BLACK / no texture / saturate up close
 - **Symptom (evolved over the session):** under `BENCH_FORCE_MESH_RSP_EMIT` the GPU wall
   path (overlay A transforms -> overlay B emits the RDP tris, no CPU readback) drew BLACK
