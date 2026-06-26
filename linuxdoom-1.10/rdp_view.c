@@ -5184,6 +5184,28 @@ static void DL_FlushRSPEmit(void)
             // bands. Rebuild W from the final INVW so the invariant holds for every wall.
             r->dA = (iwl > 0.0f) ? (int32_t)((1.0f / iwl) * 65536.0f) : r->dA;
             r->dB = (iwr > 0.0f) ? (int32_t)((1.0f / iwr) * 65536.0f) : r->dB;
+
+            // DISTANCE LIGHTING: shade the wall by its DEPTH (zlight, the depth-indexed table
+            // the RDP planes use), not the flat baked sector light. The pack wrote
+            // dl_prim_lut[(255-light)>>3] -- sector light only, no distance falloff -- so distant
+            // mesh walls stayed full-bright while software darkens with depth (a big room like
+            // demo frame 3712 read "too bright"). Recompute the per-wall SHADE from
+            // (sector light + extralight, wall midpoint depth) and overwrite batch_out.rgba
+            // (overlay B's vertex SHADE). dA/dB are depth 16.16 (= 1/invw post warp-fix).
+            {
+                extern int extralight;
+                int  lnum = ((int)bake_walls[batch_vislist[k]].light >> LIGHTSEGSHIFT) + extralight;
+                int  zi   = (int)(((r->dA + r->dB) >> 1) >> LIGHTZSHIFT);
+                long lvl2;
+                if (lnum < 0) lnum = 0;
+                if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+                if (zi < 0) zi = 0;
+                if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+                lvl2 = (zlight[lnum][zi] - colormaps) / 256;
+                if (lvl2 < 0) lvl2 = 0;
+                if (lvl2 >= NUMCOLORMAPS) lvl2 = NUMCOLORMAPS - 1;
+                r->rgba = (int32_t)dl_prim_lut[lvl2];
+            }
             nclip++;
         }
         if (nclip > 0)
