@@ -226,6 +226,11 @@ void DL_Flush(void);
 // this with DL_SpanCount() so a planes-only frame still enters DL_Flush.
 int DL_Count(void);
 
+// RSP-emit walls are tracked by dl_rspemit_pending, NOT dl_wall_count, so the
+// world-flush gate must OR this in too or RSP-emit-only frames skip the colour-
+// clear + DL_Flush (3-frames-ago fb -> motion ghost). 0 in non-RSP-emit builds.
+int DL_RSPEmitPending(void);
+
 // Retire per-present RDP world state. Call at the END of the present seam,
 // AFTER the buffer-flip busy spin (which proves the PREVIOUS present's RDP
 // stream fully drained). Demotes texture blocks pinned for the previous

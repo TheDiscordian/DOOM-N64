@@ -1323,7 +1323,12 @@ void I_FinishUpdate(void)
     // never drains a half-built world list. Stage 2 routes ONE single-sided
     // (midtexture) seg through DL_Flush; everything else is still software-
     // rendered into the CI8 buffer that the present blit reads.
-    if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount()) > 0)
+    // DL_RSPEmitPending(): RSP-emit walls live in dl_rspemit_pending, NOT dl_wall_count
+    // (DL_Count). Without it, an RSP-emit-ONLY frame (up-close facing a static mesh wall,
+    // no door/movable wall and no routed plane in view) reads 0 here and SKIPS both the
+    // colour-clear below and DL_Flush -> the 3-frames-ago 16bpp fb shows through the keyed
+    // present -> whole-view motion ghost. 0 in non-RSP-emit builds (gate byte-identical).
+    if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount() + DL_RSPEmitPending()) > 0)
     {
         int vx0 = viewwindowx;
         int vy0 = viewwindowy;

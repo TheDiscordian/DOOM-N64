@@ -5305,6 +5305,27 @@ static void DL_FlushRSPEmit(void)
 }
 #endif /* BENCH_FORCE_MESH_RSP_EMIT */
 
+// Whether the RSP-emit wall pass has work queued for THIS frame. RSP-emit walls
+// are tracked by dl_rspemit_pending (armed by the pack each 3D frame, consumed by
+// DL_FlushRSPEmit), NOT by dl_wall_count -- DL_MeshDrawWalls returns before the
+// DL_EmitWallTier loop in the RSP-emit build. The I_FinishUpdate world-render gate
+// sums DL_Count()+DL_SpanCount()+DL_PolyCount(); without this term it reads 0 on an
+// RSP-emit-ONLY frame (up-close facing a static mesh wall, no door/movable wall and
+// no routed plane in view), SKIPPING both the per-frame colour-clear and DL_Flush
+// (the only caller of DL_FlushRSPEmit). The triple-buffered 16bpp fb then keeps its
+// image from 3 frames ago, which the keyed CI8 present blits through the cleared
+// view -> a whole-view motion ghost (worst up-close, smears everything incl. the
+// gun via its transparent edges). Returns 0 in non-RSP-emit builds so the gate is
+// byte-identical there.
+int DL_RSPEmitPending(void)
+{
+#ifdef BENCH_FORCE_MESH_RSP_EMIT
+    return dl_rspemit_pending;
+#else
+    return 0;
+#endif
+}
+
 // Drain the emitted wall records into the attached display fb. Stage 3: a
 // per-TEXTURE bucket walk -- for each touched texture, fetch + pin its transpose
 // block ONCE, then draw every record in that texture's bucket (DL_DrawRecord)

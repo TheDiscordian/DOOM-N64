@@ -11,6 +11,44 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit up-close MOTION SMEAR / whole-view ghost (world-render gate drops RSP-emit-only frames)
+- **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, "up-close it OFTEN SMEARS EVERYTHING too,
+  including the gun/smoke" (Ryan) -- MOTION-dependent (only while the player moves; static
+  frames fine). Separate from the wall-texture warp.
+- **Wrong turns (do NOT retry):** the "stale CI8 sprite/smoke pixels" theory (4 independent
+  readers all gave it) is REFUTED -- `I_N64KeyClearView` (i_video_n64.c:1184-1228, called every
+  3D frame from r_main.c) clears the FULL view window (which CONTAINS the gun/smoke) to the
+  transparency key each frame, so old CI8 sprite pixels inside the view are overwritten; the
+  smear is in the RDP world layer, not the CI8 overlay.
+- **Root cause:** the I_FinishUpdate world-render gate (i_video_n64.c:1326)
+  `if (rdp_on && (DL_Count()+DL_SpanCount()+DL_PolyCount()) > 0)` guards BOTH the per-frame
+  16bpp colour-clear (the ace12f2 moving-wall ghost fix, 1368-1373) AND `DL_Flush()` (1395, the
+  ONLY caller of `DL_FlushRSPEmit`). RSP-emit walls are tracked by `dl_rspemit_pending`/
+  `batch_nvis`, NOT `dl_wall_count` (DL_MeshDrawWalls returns before DL_EmitWallTier in this
+  build), so `DL_Count()` reads 0 for them. On an RSP-emit-ONLY frame -- up-close facing a static
+  mesh wall with NO door/movable wall (the only thing that bumps DL_Count via r_segs) and NO
+  routed plane (DL_SpanCount/PolyCount) in view -- all three counts are 0, the gate is FALSE, and
+  the WHOLE world block is skipped: no colour-clear AND no wall draw. The N64 rotates 3 hardware
+  framebuffers (display_init(...,3,...)), so `disp` still holds its image from 3 PRESENTS ago;
+  the keyed CI8 present blits the (key-cleared, transparent) view over it -> the whole world is
+  3 presents stale. Still camera => N-3 ~= N (invisible); MOVING camera => N-3 from a different
+  angle => whole-view judder/ghost, worst UP-CLOSE (a near wall fills the view and occludes the
+  floor + distant door/movable walls, forcing all counts to 0). The gun/HUD are current (CI8) so
+  the stale world shows through their transparent edges = "smears everything incl. the gun".
+- **Repro + proof:** static BENCH_MARKS freezes HIDE it (frozen camera => N-3==N). Instrumented
+  the gate over the normal demo: **482 of 2304 frames (~21%) hit `rdp_on && base==0 &&
+  dl_rspemit_pending>0`** -- the dropped frames (rescued=0 for the opening room frames 0-256
+  where floors are visible, then climbing through the corridors). A motion-burst grim capture
+  (non-marks ROM, `/tmp/motion-burst.sh`) of the broken region: pre-fix shows stale-frame
+  reversions (world matches the 3-presents-ago frame), post-fix shows none.
+- **Resolution (`b956aeb`):** add `DL_RSPEmitPending()` (returns `dl_rspemit_pending`, 0 in
+  non-RSP-emit builds) and OR it into the gate at i_video_n64.c:1326. Now every RSP-emit frame
+  runs the colour-clear (retires the 3-presents-ago fb) and DL_Flush -> DL_FlushRSPEmit (draws
+  THIS frame's walls). Flag-OFF / non-RSP-emit builds are byte-identical (the term is 0 there);
+  the change only ADDS the clear+draw on the frames that were being dropped.
+
+---
+
 ## FIXED: RSP-emit wall-texture WARP (diagonal arcing bands on clipped receding walls)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, wall textures "draw, they just warp a
   lot" (Ryan) — visible while standing still, animating only as the player moves. On a
