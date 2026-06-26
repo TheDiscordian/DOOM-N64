@@ -5154,6 +5154,26 @@ static void DL_FlushRSPEmit(void)
                     }
                 }
             }
+            // WALL-FLOOR SEAM FIX: bias the wall BOTTOM down 1px so it abuts/overlaps the RDP
+            // floor plane top. The mesh wall bottom projects to the floor-height pixel CENTER
+            // (~yh+0.5); the floor plane's top edge is the visplane top = yh+1. The half-row
+            // between is painted by neither, so the per-frame black colour-clear shows as a
+            // thin black seam at the wall-floor junction. The software wall path already biases
+            // its bottom down (DL_EmitRunPiece: ybl += bias_bot); the RSP-emit walls (drawn by
+            // overlay B from batch_out, NOT the CPU w-record) lacked it. Bias the FINAL (post-
+            // clip) bottom corners and recompute the band-emit slopes so overlay B reconstructs
+            // the extended bottom. Bottom only (the ceiling junction has its own visplane).
+            {
+                float ytA2 = (float)r->ytA * K, ytB2 = (float)r->ytB * K;
+                float ybA2 = (float)r->ybA * K + 1.0f, ybB2 = (float)r->ybB * K + 1.0f;
+                float trtx = (float)(r->t_bot - r->t_top) * K;
+                r->ybA = (int32_t)(ybA2 * 65536.0f);
+                r->ybB = (int32_t)(ybB2 * 65536.0f);
+                if (trtx != 0.0f) {
+                    r->slopeA = (int32_t)(((ybA2 - ytA2) / trtx) * 65536.0f);
+                    r->slopeB = (int32_t)(((ybB2 - ytB2) / trtx) * 65536.0f);
+                }
+            }
             // W == 1/INVW, EXACTLY (the warp fix). The tri engine's min-W perspective
             // normalization (rsp_rdpq_tri.inc:429-447) treats min(W) as 1/max(INVW); it
             // is only valid when W is the reciprocal of INVW per vertex. Both the
