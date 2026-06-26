@@ -5102,6 +5102,9 @@ static void DL_FlushRSPEmit(void)
     {
         const float K = 1.0f / 65536.0f, SCRWM1 = (float)(SCREENWIDTH - 1);
         int k, nclip = 0;
+        rspq_wait();   // A's batch_out DMA MUST finish before the CPU reads it: the EMIT
+                       // pack skips the wait (readback-free), so without this the clip
+                       // reads STALE A output AND races B's read -> the void survives.
         data_cache_hit_invalidate(batch_out,
             (uint32_t)((size_t)batch_nvis * sizeof(rsp_bwall_out_t)));
         for (k = 0; k < batch_nvis; k++) {
@@ -5144,13 +5147,6 @@ static void DL_FlushRSPEmit(void)
                 if (tr_tx != 0.0f) {
                     r->slopeA = (int32_t)(((nybA - nytA) / tr_tx) * 65536.0f);
                     r->slopeB = (int32_t)(((nybB - nytB) / tr_tx) * 65536.0f);
-                }
-                if (nclip == 0) {
-                    static unsigned dg = 0;
-                    if ((dg++ & 63) == 0)
-                        debugf("RSPEMIT-XCLIP w%d sx %d->[%d..%d] ytA %d->%d ybA %d->%d\n",
-                               k, (int)sxA, (int)nsxA, (int)nsxB,
-                               (int)ytA, (int)nytA, (int)ybA, (int)nybA);
                 }
                 nclip++;
             }
