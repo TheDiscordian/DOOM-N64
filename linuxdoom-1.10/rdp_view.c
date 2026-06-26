@@ -5110,46 +5110,61 @@ static void DL_FlushRSPEmit(void)
         for (k = 0; k < batch_nvis; k++) {
             rsp_bwall_out_t* r = &batch_out[k];
             float sxA, sxB, dsx, tL, tR, tr_tx;
+            float iwl, iwr;                                 // final (clipped) 1/w per corner
             if (!r->emit) continue;
             sxA = (float)r->sxA * K; sxB = (float)r->sxB * K;
-            if (sxA >= 0.0f && sxB <= SCRWM1) continue;     // fully on-screen: no clip
             dsx = sxB - sxA;
-            if (dsx <= 0.0f) continue;                      // degenerate (A culls back-faces)
-            tL = (sxA < 0.0f)   ? (0.0f   - sxA) / dsx : 0.0f;
-            tR = (sxB > SCRWM1) ? (SCRWM1 - sxA) / dsx : 1.0f;
-            {
-                float invwA = (float)r->invwA * K, invwB = (float)r->invwB * K;
-                float dA = (float)r->dA * K, dB = (float)r->dB * K;
-                float ytA = (float)r->ytA * K, ybA = (float)r->ybA * K;
-                float ytB = (float)r->ytB * K, ybB = (float)r->ybB * K;
-                float siA = (float)r->sA * K * invwA, siB = (float)r->sB * K * invwB;
-                float iwl = invwA + tL * (invwB - invwA), iwr = invwA + tR * (invwB - invwA);
-                float sil = siA + tL * (siB - siA),       sir = siA + tR * (siB - siA);
-                float nsxA = sxA + tL * dsx,              nsxB = sxA + tR * dsx;
-                float nytA = ytA + tL * (ytB - ytA),      nybA = ybA + tL * (ybB - ybA);
-                float nytB = ytA + tR * (ytB - ytA),      nybB = ybA + tR * (ybB - ybA);
-                if (nsxA < 0.0f) nsxA = 0.0f;
-                if (nsxB > SCRWM1) nsxB = SCRWM1;
-                r->sxA  = (int32_t)(nsxA * 65536.0f);
-                r->sxB  = (int32_t)(nsxB * 65536.0f);
-                r->invwA = (int32_t)(iwl * 65536.0f);
-                r->invwB = (int32_t)(iwr * 65536.0f);
-                r->dA = (int32_t)((dA + tL * (dB - dA)) * 65536.0f);
-                r->dB = (int32_t)((dA + tR * (dB - dA)) * 65536.0f);
-                r->ytA = (int32_t)(nytA * 65536.0f);
-                r->ybA = (int32_t)(nybA * 65536.0f);
-                r->ytB = (int32_t)(nytB * 65536.0f);
-                r->ybB = (int32_t)(nybB * 65536.0f);
-                r->sA = (iwl != 0.0f) ? (int32_t)((sil / iwl) * 65536.0f) : r->sA;
-                r->sB = (iwr != 0.0f) ? (int32_t)((sir / iwr) * 65536.0f) : r->sB;
-                // recompute the band-clip slopes from the CLIPPED Y corners.
-                tr_tx = (float)(r->t_bot - r->t_top) * K;       // T-range (texels)
-                if (tr_tx != 0.0f) {
-                    r->slopeA = (int32_t)(((nybA - nytA) / tr_tx) * 65536.0f);
-                    r->slopeB = (int32_t)(((nybB - nytB) / tr_tx) * 65536.0f);
+            if (sxA >= 0.0f && sxB <= SCRWM1) {
+                // Fully on-screen: no X-clip. invw is already correct; carry it through
+                // so W is rebuilt as its reciprocal below (the near-plane clip in overlay A
+                // leaves dA/invwA INCONSISTENT -- see the W==1/INVW note below).
+                iwl = (float)r->invwA * K; iwr = (float)r->invwB * K;
+            } else {
+                if (dsx <= 0.0f) continue;                  // degenerate (A culls back-faces)
+                tL = (sxA < 0.0f)   ? (0.0f   - sxA) / dsx : 0.0f;
+                tR = (sxB > SCRWM1) ? (SCRWM1 - sxA) / dsx : 1.0f;
+                {
+                    float invwA = (float)r->invwA * K, invwB = (float)r->invwB * K;
+                    float ytA = (float)r->ytA * K, ybA = (float)r->ybA * K;
+                    float ytB = (float)r->ytB * K, ybB = (float)r->ybB * K;
+                    float siA = (float)r->sA * K * invwA, siB = (float)r->sB * K * invwB;
+                    float sil = siA + tL * (siB - siA),       sir = siA + tR * (siB - siA);
+                    float nsxA = sxA + tL * dsx,              nsxB = sxA + tR * dsx;
+                    float nytA = ytA + tL * (ytB - ytA),      nybA = ybA + tL * (ybB - ybA);
+                    float nytB = ytA + tR * (ytB - ytA),      nybB = ybA + tR * (ybB - ybA);
+                    iwl = invwA + tL * (invwB - invwA);
+                    iwr = invwA + tR * (invwB - invwA);
+                    if (nsxA < 0.0f) nsxA = 0.0f;
+                    if (nsxB > SCRWM1) nsxB = SCRWM1;
+                    r->sxA  = (int32_t)(nsxA * 65536.0f);
+                    r->sxB  = (int32_t)(nsxB * 65536.0f);
+                    r->invwA = (int32_t)(iwl * 65536.0f);
+                    r->invwB = (int32_t)(iwr * 65536.0f);
+                    r->ytA = (int32_t)(nytA * 65536.0f);
+                    r->ybA = (int32_t)(nybA * 65536.0f);
+                    r->ytB = (int32_t)(nytB * 65536.0f);
+                    r->ybB = (int32_t)(nybB * 65536.0f);
+                    r->sA = (iwl != 0.0f) ? (int32_t)((sil / iwl) * 65536.0f) : r->sA;
+                    r->sB = (iwr != 0.0f) ? (int32_t)((sir / iwr) * 65536.0f) : r->sB;
+                    // recompute the band-clip slopes from the CLIPPED Y corners.
+                    tr_tx = (float)(r->t_bot - r->t_top) * K;   // T-range (texels)
+                    if (tr_tx != 0.0f) {
+                        r->slopeA = (int32_t)(((nybA - nytA) / tr_tx) * 65536.0f);
+                        r->slopeB = (int32_t)(((nybB - nytB) / tr_tx) * 65536.0f);
+                    }
                 }
-                nclip++;
             }
+            // W == 1/INVW, EXACTLY (the warp fix). The tri engine's min-W perspective
+            // normalization (rsp_rdpq_tri.inc:429-447) treats min(W) as 1/max(INVW); it
+            // is only valid when W is the reciprocal of INVW per vertex. Both the
+            // near-plane clip (overlay A) and the screen-edge X-clip leave W (depth) as a
+            // LINEAR lerp while INVW is the correct (also linear in screen-x) 1/w, so
+            // W*INVW drifts to ~1.1-1.8 on clipped receding walls -> INVW normalizes out
+            // of [0,1] -> the per-pixel divide shears the texture into diagonal arcing
+            // bands. Rebuild W from the final INVW so the invariant holds for every wall.
+            r->dA = (iwl > 0.0f) ? (int32_t)((1.0f / iwl) * 65536.0f) : r->dA;
+            r->dB = (iwr > 0.0f) ? (int32_t)((1.0f / iwr) * 65536.0f) : r->dB;
+            nclip++;
         }
         if (nclip > 0)
             data_cache_hit_writeback(batch_out,

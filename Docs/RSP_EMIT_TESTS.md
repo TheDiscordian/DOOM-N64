@@ -31,6 +31,23 @@ invw/depth/S/slopes). The ONLY thing that changes between correct (2) and warped
 transform (`rsp/rsp_dlwall.S`) and NOT in the bake.** Do not re-investigate the
 transform for the warp — row 2 proves it is clean.
 
+### ROOT CAUSE + FIX (2026-06-26, RESOLVED)
+The triangle engine's perspective normalization (`rsp_rdpq_tri.inc:429-447`) treats
+`min(W)` as `1/max(INVW)` -- valid ONLY when `W == 1/INVW` per vertex. Instrumenting
+`DL_FlushRSPEmit` with a `W*INVW` (WxIV) column showed almost all walls at ~1.000 but
+the **clipped receding walls at 1.1-1.8** -- exactly the arcing ones. Cause: both the
+near-plane clip (overlay A) and the screen-edge X-clip carried `W` (depth) as a LINEAR
+lerp while `INVW` (= 1/w, correctly linear in screen-x) was lerped separately, so they
+drifted apart. A wrong `min(W)` pushes the normalized INVW out of [0,1] -> the per-pixel
+texture divide shears into diagonal arcing bands.
+
+Fix (`DL_FlushRSPEmit`): rebuild `W` as the EXACT reciprocal of the final (clipped) INVW
+for every emitted wall (`dA = 1/iwl`, `dB = 1/iwr`). No-op for already-consistent walls;
+corrects every clipped one. After the fix, WxIV is 0.992-1.000 across the whole demo and
+the arcs are gone (full 32-frame A/B vs SW, frames 128-4096, matches software; later
+frames re-captured clean after a focus-steal artifact). Perf: +2 float reciprocals per
+emitted wall (~tens/frame), negligible.
+
 ### Ruled out earlier (do not re-test for the warp)
 - Missing horizontal subdivision (forced `nseg>=8` in `DL_RSPBatchProbe`): no change.
 - Bilinear filtering (`FILTER_POINT`): no change.
