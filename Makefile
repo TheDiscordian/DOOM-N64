@@ -199,6 +199,16 @@ endif
 ifeq ($(BENCH_FORCE_SHOW_FPS),1)
 CFLAGS += -DBENCH_FORCE_SHOW_FPS=1
 endif
+# BENCH_FORCE_FIXEDCOLORMAP=<n>: pin the player's fixedcolormap to row <n> every
+# frame in R_SetupFrame, forcing the whole view into a powerup colormap state the
+# E1M1 demo never reaches: 1 = light-amp visor (near-fullbright), 32 = invuln (the
+# inverted grey-scale map). Lets a BENCH_MARKS capture verify the CI4 mesh walls'
+# fixedcolormap path (rdp_view.c DL_RetintSlot) against a software-rendered
+# reference under the SAME forced state. Renderer-independent (applies to SW and
+# RDP/mesh alike). Visual-capture builds only -- never timing builds.
+ifneq ($(BENCH_FORCE_FIXEDCOLORMAP),)
+CFLAGS += -DBENCH_FORCE_FIXEDCOLORMAP=$(BENCH_FORCE_FIXEDCOLORMAP)
+endif
 # BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
 # ISViewer every 256 retained frames) for exactly-paired cross-build
 # screenshot series. Visual-capture builds only -- never timing builds, the

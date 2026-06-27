@@ -1026,6 +1026,13 @@ void R_SetupFrame (player_t* player)
     bspw_rspwait_tk = 0;
 #endif
 	
+#ifdef BENCH_FORCE_FIXEDCOLORMAP
+    // Visual-capture probe: pin the worn colormap row so the E1M1 demo enters a
+    // powerup state it never reaches (1 = light-amp visor, 32 = invuln). Lets a
+    // BENCH_MARKS capture A/B the CI4 mesh walls' fixedcolormap path against a
+    // software reference under the SAME forced state. See Makefile.
+    player->fixedcolormap = BENCH_FORCE_FIXEDCOLORMAP;
+#endif
     if (player->fixedcolormap)
     {
 	fixedcolormap =

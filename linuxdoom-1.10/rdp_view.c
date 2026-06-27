@@ -715,11 +715,30 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
 extern uint32_t I_N64PaletteGen(void);
 extern const uint16_t* I_N64MasterTLUT(void);
 
+// FIXEDCOLORMAP (invuln / light-amp goggles) for CI4 walls. A fixedcolormap is a
+// whole-view colormap LEVEL the player wears: the light-amp visor pins level 1
+// (near-fullbright), invulnerability pins INVERSECOLORMAP (=32, the inverted
+// grey-scale map). Software draws every texel as master_tlut[ colormap[L][texel] ]:
+// the texel's PLAYPAL index is first REMAPPED through colormap row L, then shown
+// through the master palette. The distance/zlight shade is overridden to flat in
+// this state (the level already bakes the brightness/inversion into the index).
+//
+// Goggles is approximately a brightness, but invuln is an INDEX INVERSION -- it
+// cannot be a shade multiply (a multiply preserves channel ratios; inversion
+// remaps the index). So the CI4 walls must re-derive their sub-palettes through
+// the active colormap row, exactly the master_tlut[colormap[L][idx]] chain above.
+// dl_retint_fclevel carries that row to DL_RetintSlot; 0 = none (plain flash path).
+static int dl_retint_fclevel = 0;       // fixedcolormap row this flush applies (0 = none)
+
 // Re-derive ONE slot's 16 sub-palette entries from the current master TLUT at the
 // entry's fixed PLAYPAL index (alpha forced opaque -- walls are never the key),
 // and stamp the slot with the generation its colours now track. No-op if already
 // current. The master is fetched once as a pointer and indexed directly (no
 // per-entry cross-TU call). Used by the lazy per-texture upload path.
+//
+// When a fixedcolormap is active (dl_retint_fclevel != 0) each PLAYPAL index is
+// first remapped through that colormap row before the master lookup, so the walls
+// match software's master_tlut[colormap[L][idx]] (invuln inversion / goggle level).
 static void DL_RetintSlot(dl_rowmajor_t* slot, uint32_t gen)
 {
     const uint16_t* master;
@@ -727,9 +746,17 @@ static void DL_RetintSlot(dl_rowmajor_t* slot, uint32_t gen)
     if (!slot->subpal_inited || slot->subpal_gen == gen)
         return;
     master = I_N64MasterTLUT();
-    for (k = 0; k < 16; k++)
-        slot->subpal[k] = (uint16_t)((master[slot->subpal_idx[k]]
-                                      & ~(uint16_t)1) | 1);
+    if (dl_retint_fclevel) {
+        extern lighttable_t* colormaps;
+        const lighttable_t* cmap = colormaps + dl_retint_fclevel * 256;
+        for (k = 0; k < 16; k++)
+            slot->subpal[k] = (uint16_t)((master[cmap[slot->subpal_idx[k]]]
+                                          & ~(uint16_t)1) | 1);
+    } else {
+        for (k = 0; k < 16; k++)
+            slot->subpal[k] = (uint16_t)((master[slot->subpal_idx[k]]
+                                          & ~(uint16_t)1) | 1);
+    }
     slot->subpal_gen = gen;
 }
 
@@ -744,7 +771,16 @@ static uint32_t dl_retint_gen = 0xFFFFFFFFu;    // palette gen this flush tracks
 
 static void DL_RetintSubPalettes(void)
 {
-    dl_retint_gen = I_N64PaletteGen();
+    extern lighttable_t* fixedcolormap;
+    extern lighttable_t* colormaps;
+    // The active fixedcolormap row (light-amp visor = 1, invuln = INVERSECOLORMAP).
+    // 0 when no powerup is worn -> the plain master re-tint path.
+    dl_retint_fclevel = fixedcolormap ? (int)((fixedcolormap - colormaps) / 256) : 0;
+    // Fold the fixedcolormap row into the re-tint generation so toggling a powerup
+    // (0 <-> 1 <-> 32) invalidates every drawn slot's colours and forces a re-derive
+    // through (or back out of) the colormap row. Golden-ratio hash so a row change
+    // flips many bits and never aliases a nearby palette-flash generation.
+    dl_retint_gen = I_N64PaletteGen() ^ ((uint32_t)dl_retint_fclevel * 0x9E3779B1u);
 }
 
 // --- per-texture downsample-error metric (selective S-downsample gate) -------
@@ -5197,24 +5233,36 @@ static void DL_FlushRSPEmit(void)
             // overlay B reads it for V1/V3). dA/dB are depth 16.16 (= 1/invw post warp-fix).
             {
                 extern int extralight;
-                // LIVE sector lightlevel (not the bake-time bw->light) so flicker/strobe/glow
-                // light specials are honoured -- the thinker mutates sectors[].lightlevel each
-                // tic, exactly as the door/lift edge heights are already resolved live.
-                int  light = sectors[bake_walls[batch_vislist[k]].lightsec].lightlevel;
-                int  lnum  = (light >> LIGHTSEGSHIFT) + extralight;
-                int  ziA  = (int)(r->dA >> LIGHTZSHIFT);    // near-edge (column A) depth index
-                int  ziB  = (int)(r->dB >> LIGHTZSHIFT);    // far-edge  (column B) depth index
-                long lvA, lvB;
-                if (lnum < 0) lnum = 0;
-                if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
-                if (ziA < 0) ziA = 0;  if (ziA >= MAXLIGHTZ) ziA = MAXLIGHTZ - 1;
-                if (ziB < 0) ziB = 0;  if (ziB >= MAXLIGHTZ) ziB = MAXLIGHTZ - 1;
-                lvA = (zlight[lnum][ziA] - colormaps) / 256;
-                lvB = (zlight[lnum][ziB] - colormaps) / 256;
-                if (lvA < 0) lvA = 0;  if (lvA >= NUMCOLORMAPS) lvA = NUMCOLORMAPS - 1;
-                if (lvB < 0) lvB = 0;  if (lvB >= NUMCOLORMAPS) lvB = NUMCOLORMAPS - 1;
-                r->rgba = (int32_t)dl_prim_lut[lvA];   // column-A vertex SHADE (V0,V2)
-                r->lB   = (int32_t)dl_prim_lut[lvB];   // column-B vertex SHADE (V1,V3) via BWO_lB
+                extern lighttable_t* fixedcolormap;
+                if (fixedcolormap) {
+                    // FIXEDCOLORMAP (invuln / light-amp visor): the worn colormap row is
+                    // already baked into this wall's CI4 sub-palette colours (DL_RetintSlot
+                    // remaps every entry through colormap[L]), so the per-vertex SHADE must
+                    // be neutral fullbright -- ANY distance darkening here would double-apply
+                    // the level (and, under invuln, dim the inverted texel toward black).
+                    // dl_prim_lut[0] is pure white (PLAYPAL idx 4 through the identity map).
+                    r->rgba = (int32_t)dl_prim_lut[0];   // V0,V2 flat fullbright
+                    r->lB   = (int32_t)dl_prim_lut[0];   // V1,V3 flat fullbright
+                } else {
+                    // LIVE sector lightlevel (not the bake-time bw->light) so flicker/strobe/
+                    // glow light specials are honoured -- the thinker mutates
+                    // sectors[].lightlevel each tic, like the door/lift edge heights.
+                    int  light = sectors[bake_walls[batch_vislist[k]].lightsec].lightlevel;
+                    int  lnum  = (light >> LIGHTSEGSHIFT) + extralight;
+                    int  ziA  = (int)(r->dA >> LIGHTZSHIFT);    // near-edge (col A) depth index
+                    int  ziB  = (int)(r->dB >> LIGHTZSHIFT);    // far-edge  (col B) depth index
+                    long lvA, lvB;
+                    if (lnum < 0) lnum = 0;
+                    if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+                    if (ziA < 0) ziA = 0;  if (ziA >= MAXLIGHTZ) ziA = MAXLIGHTZ - 1;
+                    if (ziB < 0) ziB = 0;  if (ziB >= MAXLIGHTZ) ziB = MAXLIGHTZ - 1;
+                    lvA = (zlight[lnum][ziA] - colormaps) / 256;
+                    lvB = (zlight[lnum][ziB] - colormaps) / 256;
+                    if (lvA < 0) lvA = 0;  if (lvA >= NUMCOLORMAPS) lvA = NUMCOLORMAPS - 1;
+                    if (lvB < 0) lvB = 0;  if (lvB >= NUMCOLORMAPS) lvB = NUMCOLORMAPS - 1;
+                    r->rgba = (int32_t)dl_prim_lut[lvA];   // column-A vertex SHADE (V0,V2)
+                    r->lB   = (int32_t)dl_prim_lut[lvB];   // column-B vertex SHADE (V1,V3) via BWO_lB
+                }
             }
             nclip++;
         }
