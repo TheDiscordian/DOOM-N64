@@ -11,6 +11,25 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit black SEAM at the wall-floor junction (mesh wall bottom not biased to cover)
+- **Symptom:** a thin BLACK line at every wall-floor junction (Ryan, ~17 frames) -- "where the
+  planes meet the walls should connect better". The RDP floor plane and the mesh wall bottom
+  don't overlap; the per-frame black colour-clear shows in the gap.
+- **Root cause:** the mesh wall bottom projects to the floor-height pixel CENTER (~yh+0.5); the
+  RDP plane top is the visplane top (yh+1, i_video_n64.c sets top[]=yh+1, the plane-poly path
+  reads it verbatim). The half-row [yh+0.5, yh+1] is painted by neither. Software's wall path
+  already biases its bottom down (DL_EmitRunPiece: `ybl += bias_bot`); the RSP-emit walls lacked it.
+- **Wrong turn (do NOT retry):** biasing ybA/ybB in DL_MeshDrawWalls -- that function RETURNS
+  EARLY (rdp_view.c:3386) in the RSP-emit build; the walls come from batch_out via overlay B, NOT
+  the CPU w-record, so that edit is DEAD CODE (junction black measured identical before/after).
+  The bias MUST go where overlay B's data is prepared.
+- **Resolution (`35451d8`):** in DL_FlushRSPEmit, bias each wall's final (post-clip) bottom
+  corners down 1px and recompute the band-emit slopes so overlay B reconstructs the extended
+  bottom. Verified: junction near-black dropped on 31/32 frames (1664 5.4->3.1%, 4096 19.5->10.8%),
+  zoomed A/B shows the line gone with no texture bleed; Ryan-confirmed.
+
+---
+
 ## FIXED: RSP-emit up-close MOTION SMEAR / whole-view ghost (world-render gate drops RSP-emit-only frames)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, "up-close it OFTEN SMEARS EVERYTHING too,
   including the gun/smoke" (Ryan) -- MOTION-dependent (only while the player moves; static
