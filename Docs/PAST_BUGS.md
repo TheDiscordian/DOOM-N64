@@ -204,6 +204,18 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
   software 19860/31840 → mesh-rsp-emit 16255/26720 us avg/p95 (−18.2% / −16.1%, 61.5/37.4 fps).
   Note: the CPU clip + wait re-introduces a `batch_out` readback the keystone removed, but it
   costs nothing measurable here; an overlay-A-side clip (truly readback-free) is a future option.
+- **DEMO-WIDE VERIFICATION (2026-06-27).** The prior session found this void was the close-wall
+  layer of a broader "~316 off-grid near-total-black frames" (doom-n64-capture-pitfalls #7), all
+  off the 128-marker grid. Built `BENCH_VOID_SCAN` (i_video_n64.c): after each present, drain the
+  RDP and count pure-black pixels in the view region of the composited 16bpp fb; log any frame
+  ≥40% black. Ran the FULL 4117-frame demo on the current full-RDP mesh+rsp-emit build: **the
+  off-grid void is GONE** -- the prior black frames (837/1274/3482, confirmed by `BENCH_MARK_VOID`
+  capture) now render. Only two things still flag, both non-voids: `frame=0` (startup, pre-render
+  black) and `frame=3213` (78-91% black) = the death→respawn level-reload MELT WIPE. The wipe is a
+  SEPARATE, minor, transient mesh-build limitation (the melt operates on the CI8 software buffer,
+  which in a mesh frame holds the key-clear, not the RDP-rendered 16bpp world, so it melts to
+  black instead of the new level) -- bracket frames 3200/3328 render fine. Tracked as a follow-up,
+  not the off-grid void.
 
 ---
 

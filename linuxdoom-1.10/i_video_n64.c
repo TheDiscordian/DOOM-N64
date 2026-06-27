@@ -1591,6 +1591,33 @@ void I_FinishUpdate(void)
     // that eventually runs -- the early-return above sits before this point).
     n64_ci8_view_keyed = false;
 
+#ifdef BENCH_VOID_SCAN
+    // DEMO-WIDE VOID DETECTOR. The off-grid near-total-BLACK voids (doom-n64-capture-
+    // pitfalls #7: ~316 frames, all off the 128-frame marker grid) cannot be sampled by
+    // a marker capture. Here, after the present blit is queued, drain the RDP and count
+    // PURE-BLACK pixels in the view region of the composited 16bpp fb -- a void leaves the
+    // per-frame black colour-clear showing through the keyed present, so the view reads
+    // black. Logs any frame >= 40% black (frame + %), across ALL ~4117 demo frames, so
+    // both full and partial voids surface. Serialises on the RDP (rspq_wait) -> timing is
+    // meaningless in this build; correctness-diagnostic only.
+    {
+        extern unsigned long N64Bench_FrameNo(void);
+        const unsigned short* fb = UncachedUShortAddr(disp->buffer);
+        int s16 = (int)(disp->stride >> 1);
+        int x, y, tot = 0, blk = 0;
+        rspq_wait();
+        for (y = viewwindowy; y < viewwindowy + viewheight; y += 4)
+            for (x = viewwindowx; x < viewwindowx + scaledviewwidth; x += 4) {
+                unsigned short px = fb[y * s16 + x];
+                tot++;
+                if (((px >> 1) & 0x7FFF) == 0) blk++;   // RGB (15 bits) all zero = pure black
+            }
+        if (tot > 0 && (blk * 100 / tot) >= 40)
+            debugf("BENCH_VOID frame=%lu black=%d%%\n",
+                   N64Bench_FrameNo(), blk * 100 / tot);
+    }
+#endif
+
     // Detach with a completion callback instead of a global rspq_wait(): the
     // CPU can render the next frame while the RDP reads this buffer. The
     // callback (RDP-done, not just RSP-done) marks the buffer free and shows

@@ -209,6 +209,14 @@ endif
 ifneq ($(BENCH_FORCE_FIXEDCOLORMAP),)
 CFLAGS += -DBENCH_FORCE_FIXEDCOLORMAP=$(BENCH_FORCE_FIXEDCOLORMAP)
 endif
+# BENCH_VOID_SCAN=1: demo-wide black-void detector. After each present, drain the RDP
+# and count pure-black pixels in the view region of the composited 16bpp fb; logs any
+# frame >= 40% black ("BENCH_VOID frame=N black=P%"). Catches the off-grid near-total-
+# black voids across ALL ~4117 demo frames (the 128-frame marker grid samples only 32).
+# Serialises on the RDP every frame -> TIMING IS MEANINGLESS; correctness-diagnostic only.
+ifeq ($(BENCH_VOID_SCAN),1)
+CFLAGS += -DBENCH_VOID_SCAN=1
+endif
 # BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
 # ISViewer every 256 retained frames) for exactly-paired cross-build
 # screenshot series. Visual-capture builds only -- never timing builds, the
