@@ -364,6 +364,17 @@ LeafFanLoop:
     nop
     beq  t6, t8, LeafFanCont
     nop
+    # ALSO skip a ZERO-HEIGHT tri (all 3 verts on one scanline -> the engine's major-edge
+    # slope dx/dy divides by dy==0 -> malformed command). Common for floor leaves projected
+    # at a grazing angle. Y is the signed low halfword of VTX_ATTR_XY (offset +2).
+    lh   t6, 2(a1)
+    lh   t7, 2(a2)
+    bne  t6, t7, LfEmit          # Y0 != Y1 -> non-zero height, emit
+    nop
+    lh   t8, 2(a3)
+    beq  t6, t8, LeafFanCont     # Y0 == Y1 == Y2 -> zero height, skip
+    nop
+LfEmit:
     li   a0, EMIT_TRICMD
     li   v0, 2                   # culling disabled (orientation handled by the fan)
     li   s3, %lo(EMIT_STAGING)
