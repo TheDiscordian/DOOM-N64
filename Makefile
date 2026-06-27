@@ -165,6 +165,12 @@ endif
 ifeq ($(BENCH_FORCE_MESH_LEAF_RSP),1)
 CFLAGS += -DBENCH_FORCE_MESH_LEAF_RSP=1
 RSPASFLAGS += -DBENCH_FORCE_MESH_LEAF_RSP=1
+#   BENCH_FORCE_MESH_LEAF_RSP_VERIFY=1 -> A/B the RSP-computed leaf vertex (cx,cy,z,u,v)
+#   against the CPU reference each frame (debugf LEAF-AB). CPU-only diagnostic; off by
+#   default so the production fold pays no per-vertex compare.
+ifeq ($(BENCH_FORCE_MESH_LEAF_RSP_VERIFY),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_RSP_VERIFY=1
+endif
 endif
 #   RSP port (Docs/RSP_PORT_PLAN.md): the wall-transform offload is now DEFAULT-ON in
 #   the mesh build -- compaction made it beat the CPU transform -6% (render-equivalent,

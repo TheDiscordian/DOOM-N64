@@ -4823,8 +4823,20 @@ static int dl_leaf_tris = 0;
 // once RSP-LEAF mism/emit_dis hold at ~0 over the demo, the draw loop can read the RSP
 // output instead of the CPU transform.
 #define DL_LEAF_VERT_MAX (DL_WALL_ARENA * 4)
-static rsp_bleaf_in_t  leaf_in_buf[DL_LEAF_VERT_MAX]  __attribute__((aligned(16)));
-static rsp_bleaf_out_t leaf_out_buf[DL_LEAF_VERT_MAX] __attribute__((aligned(16)));
+// DMA staging for the leaf transform. Sized LAZILY to the level's actual baked leaf-vert
+// count (bake_numleafverts), NOT the DL_LEAF_VERT_MAX worst case: at 16B in + 32B out per
+// vert the worst case is 96KB of static BSS, which shrinks the system heap below the
+// I_InitGraphics scratch-screen mallocs (boot I_Error). They live in the ZONE, not the
+// system heap: libdragon's malloc heap is tight (rdp_view.c:2895 moved the wall DMA bufs
+// to BSS for exactly this) and an in-render memalign there fails intermittently once the
+// heap fragments -- floors then silently vanish for a whole run. The zone holds the 128KB
+// z-buffer + textures, so 45KB more is nothing. Z_Malloc guarantees only 4B; over-allocate
+// +15 and 16-align (cache writeback/invalidate granule) -- the CI4/flat DMA pattern.
+static void*            leaf_in_raw  = NULL;  // raw Z_Malloc (16-align -> leaf_in_buf)
+static void*            leaf_out_raw = NULL;
+static rsp_bleaf_in_t*  leaf_in_buf  = NULL;
+static rsp_bleaf_out_t* leaf_out_buf = NULL;
+static int              leaf_buf_cap = 0;     // verts the in/out buffers are sized for
 static int*            leaf_rsp_slot = NULL;   // pv -> dense output slot, set this frame
 static int             leaf_rsp_slot_cap = 0;
 static int             leaf_rsp_nv = 0;        // verts dispatched this frame (0 = none)
@@ -4843,19 +4855,44 @@ static void DL_RSPLeafDispatch(void)
     fixed_t vsin = finesine[viewangle >> ANGLETOFINESHIFT];
     int ss, i, nv = 0;
 
+    static int lf_diag = 0;
+#ifdef BENCH_FORCE_MESH_LEAF_RSP_VERIFY
+    int        diag = (lf_diag < 6);   // one-shot dispatch trace (which gate / alloc result)
+#else
+    int        diag = 0; (void)lf_diag;
+#endif
     leaf_rsp_nv = 0;
     // Same gate as DL_DrawMeshLeaves -- only queue when floors will actually be drawn.
-    if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+    if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z) {
+        if (diag) { lf_diag++; debugf("LEAF-DISP gate: mf=%d route=%d leaves=%p vis=%p wz=%d\n",
+                    n64_rdp_mesh_floors, DL_MeshRouteOn(), (void*)bake_leaves,
+                    (void*)bake_leafvis, dl_wall_z); }
         return;
+    }
     if (rsp_dlwall_ovl_id == 0)
         rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
-    if (rsp_dlwall_ovl_id == 0) return;
+    if (rsp_dlwall_ovl_id == 0) { if (diag) { lf_diag++; debugf("LEAF-DISP no ovl\n"); } return; }
     if (bake_numleafverts > leaf_rsp_slot_cap) {
         if (leaf_rsp_slot) Z_Free(leaf_rsp_slot);
         leaf_rsp_slot_cap = bake_numleafverts;
         leaf_rsp_slot = (int*)Z_Malloc(sizeof(int) * leaf_rsp_slot_cap, PU_STATIC, NULL);
     }
-    if (!leaf_rsp_slot) return;
+    if (!leaf_rsp_slot) { if (diag) { lf_diag++; debugf("LEAF-DISP no slot\n"); } return; }
+    // Right-size the zone staging to this level's leaf-vert count (see decl). Grows only
+    // when a level has more leaf verts than any seen so far; +15 & 16-align for DMA.
+    if (bake_numleafverts > leaf_buf_cap) {
+        if (leaf_in_raw)  Z_Free(leaf_in_raw);
+        if (leaf_out_raw) Z_Free(leaf_out_raw);
+        leaf_buf_cap = bake_numleafverts;
+        leaf_in_raw  = Z_Malloc(sizeof(rsp_bleaf_in_t)  * leaf_buf_cap + 15, PU_STATIC, &leaf_in_raw);
+        leaf_out_raw = Z_Malloc(sizeof(rsp_bleaf_out_t) * leaf_buf_cap + 15, PU_STATIC, &leaf_out_raw);
+        leaf_in_buf  = leaf_in_raw  ? (rsp_bleaf_in_t*) (((uintptr_t)leaf_in_raw  + 15) & ~(uintptr_t)15) : NULL;
+        leaf_out_buf = leaf_out_raw ? (rsp_bleaf_out_t*)(((uintptr_t)leaf_out_raw + 15) & ~(uintptr_t)15) : NULL;
+        if (diag) { lf_diag++; debugf("LEAF-DISP zalloc cap=%d in=%p out=%p\n",
+                    leaf_buf_cap, (void*)leaf_in_buf, (void*)leaf_out_buf); }
+    }
+    if (!leaf_in_buf || !leaf_out_buf) { leaf_buf_cap = 0;
+        if (diag) { lf_diag++; debugf("LEAF-DISP zalloc FAILED\n"); } return; }
     if (!vb) vb = memalign(16, sizeof *vb);
     if (!vb) return;
     vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
@@ -4872,6 +4909,8 @@ static void DL_RSPLeafDispatch(void)
             int pv = lf->firstvert + i;
             leaf_in_buf[nv].x = bake_leaf_verts[pv][0];
             leaf_in_buf[nv].y = bake_leaf_verts[pv][1];
+            leaf_in_buf[nv].floorz = sectors[lf->sector].floorheight;   // live -> screen-y
+            leaf_in_buf[nv].pad0 = 0;
             leaf_rsp_slot[pv] = nv;
             nv++;
         }
@@ -4923,6 +4962,7 @@ static void DL_DrawMeshLeaves(void)
     vcos   = finecosine[viewangle >> ANGLETOFINESHIFT];
     vsin   = finesine[viewangle >> ANGLETOFINESHIFT];
     viewzf = (float)viewz * (1.0f / 65536.0f);
+    (void)vcos; (void)vsin;   // only the CPU-xform #else / LEAF-AB verify read these
 
     // Flat tile geometry: 64-wide x 32-tall decimated CI8, mask-6 S / mask-5 T wrap.
     {
@@ -4996,6 +5036,59 @@ static void DL_DrawMeshLeaves(void)
                 sx   = (float)ro->cx   * (1.0f / 65536.0f);
                 invw = (float)ro->invw * (1.0f / 65536.0f);
                 sc   = (float)centerx * invw;
+#ifdef BENCH_FORCE_MESH_LEAF_RSP_VERIFY
+                // A/B: the RSP computes the per-vertex invariants (cx,z,u,v + invw) --
+                // verify each against the CPU reference. Same epsilon as the wall harness
+                // (>0.5px screen, >1% invw); u/v are integer texels so they must match
+                // exactly. cy is per-surface (overlay B derives it from sc) -- not here.
+                {
+                    // Bucket ON-SCREEN verts (cx in [0,SCREENWIDTH]) separately: those are
+                    // the ones whose projection actually rasterizes. The reciprocal's
+                    // precision tail lands on near-plane / far-lateral verts that project
+                    // way off-screen (|cx| up to the 2048 cull bound) and get scissored, so
+                    // an ALL-verts epsilon flags geometry the player never sees. z is
+                    // compared ABSOLUTE (16-bit Z-buffer): relative error explodes on the
+                    // tiny z of near verts but the absolute delta there is sub-LSB.
+                    static unsigned vchk = 0, vbad = 0, von = 0, vbon = 0, vframe = 0;
+                    static float    w_cx = 0.f, w_cxon = 0.f, w_zon = 0.f; static int w_uv = 0;
+                    fixed_t tx = wx - viewx, ty = wy - viewy;
+                    fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+                    if (depth >= (4 << FRACBITS)) {
+                        fixed_t lat   = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+                        float   ci    = 65536.0f / (float)depth;
+                        float   cs    = (float)centerx * ci;
+                        float   cx_c  = (float)centerx - (float)lat * (1.0f/65536.0f) * cs;
+                        float   z_c   = DL_WallZ(ci);
+                        int     u_c   = (int)(wx >> FRACBITS);
+                        int     v_c   = (int)(wy >> FRACBITS);
+                        float   r_cx  = (float)ro->cx * (1.0f/65536.0f);
+                        float   r_z   = (float)ro->z  * (1.0f/65536.0f);
+                        float   d_cx  = fabsf(r_cx - cx_c);
+                        float   d_za  = fabsf(r_z - z_c);
+                        double  d_iw  = fabs(((double)invw - (double)ci) / (double)ci);
+                        int     d_uv  = (ro->u != u_c) + (ro->v != v_c);
+                        int     onscr = (cx_c >= 0.0f && cx_c <= (float)SCREENWIDTH);
+                        vchk++;
+                        if (d_cx > w_cx) w_cx = d_cx;
+                        if (d_uv > w_uv) w_uv = d_uv;
+                        if (d_cx > 0.5f || d_iw > 0.01 || d_uv) vbad++;
+                        if (onscr) {
+                            von++;
+                            if (d_cx > w_cxon) w_cxon = d_cx;
+                            if (d_za > w_zon)  w_zon  = d_za;
+                            if (d_cx > 0.5f || d_za > 0.0008f || d_uv) vbon++;
+                        }
+                    }
+                    if (vchk >= 4096) {            // count-based: robust to leaf culling
+                        debugf("LEAF-AB win=%u chk=%u bad=%u | onscr=%u badon=%u "
+                               "w_cxon=%d(e-3) w_zon=%d(e-6) w_uv=%d | w_cxALL=%d(e-3)\n",
+                               ++vframe, vchk, vbad, von, vbon,
+                               (int)(w_cxon*1000.0f), (int)(w_zon*1e6f), w_uv,
+                               (int)(w_cx*1000.0f));
+                        vchk = vbad = von = vbon = 0; w_cx = w_cxon = w_zon = 0.f; w_uv = 0;
+                    }
+                }
+#endif
             }
 #else
             {

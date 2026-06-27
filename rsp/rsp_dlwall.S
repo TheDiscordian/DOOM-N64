@@ -769,6 +769,22 @@ XformLeaf:
     sub  s0, t7, v1             # cx
     lw   t9, %lo(XW_out)
     sw   s0, BLO_cx(t9)
+    # cy is NOT computed here: it is the only PER-SURFACE term (floor vs ceiling differ),
+    # so overlay B derives it at emit from cy = centery - (h-viewz)*sc, sc = centerx*invw.
+    # XformLeaf emits only the per-vertex invariants the fan needs: cx, invw, z, u, v.
+    # ---- z = DL_WallZ(invw) = depth>>15 (16.16). DL_WallZ = 1/(invw*32768) =
+    #      depth/2^31 (float in [0,1]); *65536 == depth>>15. depth>=nearz>0 => in range. ----
+    lw   t0, %lo(XW_dA)
+    srl  t0, t0, 15
+    sw   t0, BLO_z(t9)
+    # ---- u = wx>>16, v = wy>>16 : world-aligned flat texel (signed arithmetic shift) ----
+    lw   t8, %lo(XW_in)
+    lw   t0, BLI_x(t8)
+    sra  t0, t0, 16
+    sw   t0, BLO_u(t9)
+    lw   t0, BLI_y(t8)
+    sra  t0, t0, 16
+    sw   t0, BLO_v(t9)
     li   t0, 1
     sw   t0, BLO_emit(t9)
     lw   ra, %lo(XW_ra)
