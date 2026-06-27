@@ -11,6 +11,33 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: RSP-emit wall LIGHTING too bright (no distance falloff; flat per-wall shade)
+- **Symptom:** in big rooms (demo frames 3712/3840/4096) the mesh walls read "too bright" /
+  "wrong lighting" vs software -- distant walls stayed full-bright while software darkens them.
+- **Wrong turns (do NOT retry):** (a) `extralight` (muzzle-flash) -- the user said firing frames;
+  but extralight is 0 on 3712 (not firing) so adding it had ZERO measured effect; the issue is
+  distance, not extralight. (b) `scalelight` indexed by `centerx*invw` -- that is the VERTICAL
+  screen scale, not software's `spryscale` (texture scale), so it mis-shaded (over-bright near
+  AND far). (c) a "keep flat base + add zlight DELTA" hybrid -- preserved near walls but the
+  zlight falloff is too steep for walls, over-darkened 3712 to near-black.
+- **Root cause:** the pack shaded each wall with FLAT sector light only,
+  `dl_prim_lut[(255-light)>>3]`, no depth term. Software walls (r_segs.c) AND the RDP planes
+  (r_plane.c, via zlight) both darken with distance; the mesh walls were the only surface that
+  didn't.
+- **Resolution (per-wall `742d8e2`, then per-corner GOURAUD `4566e5a`):** recompute the wall SHADE
+  in DL_FlushRSPEmit from (sector light + extralight, DEPTH) via the depth-indexed `zlight` table
+  (the same table the planes use; matches them for consistency). Per-corner: column-A level from
+  dA, column-B level from dB, written to batch_out.rgba (0x3C) + the dead lateral field BWO_lB
+  (0x0C); overlay B's EmitWall loads rgba for V0/V2 and lB for V1/V3 so the RDP gouraud-
+  interpolates a SMOOTH brightness ramp across each receding wall (depth constant per column -> no
+  vertical gradient). Verified: 3712 region 33->21 luminance (toward software); receding walls
+  (256/768) ramp smoothly toward software's gradient where the flat version stepped; full 32-frame
+  scan no corruption from the asm change; perf neutral (2 zlight lookups + 3 RSP lw per wall).
+  NOTE: zlight (depth) not scalelight (spryscale) because the emit path carries depth, not the
+  texture scale; the planes already use zlight so walls+floors now fall off consistently.
+
+---
+
 ## FIXED: RSP-emit black SEAM at the wall-floor junction (mesh wall bottom not biased to cover)
 - **Symptom:** a thin BLACK line at every wall-floor junction (the user, ~17 frames) -- "where the
   planes meet the walls should connect better". The RDP floor plane and the mesh wall bottom
