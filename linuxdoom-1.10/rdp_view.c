@@ -2481,6 +2481,10 @@ static uint32_t rsp_dlwall_ovl_id = 0;
 DEFINE_RSP_UCODE(rsp_dlemit);
 static uint32_t rsp_dlemit_ovl_id = 0;
 #define DLEMIT_CMD_BATCH 0     // (batch_out_RDRAM, count) -- matches rsp_dlemit.S header
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+#define DLEMIT_CMD_LEAFVIEW 1  // (centerx, centery) -- set once per frame
+#define DLEMIT_CMD_LEAFFAN  2  // (leaf_rec_RDRAM, hf16, light, packed(n|ubias|vbias))
+#endif
 #endif
 
 // ---- Phase 1 transform DMA blocks. Layouts MUST match rsp_dlwall.S byte-for-byte
@@ -4945,6 +4949,106 @@ static void DL_RSPLeafDrain(int wall_nvis)
 }
 #endif
 
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+#define DL_LEAF_EMIT_MAXV 16        // MUST match LEAF_EMIT_MAXV in rsp/rsp_dlemit.S
+// No-readback floor emit (RSP_PORT_PLAN §8.5). The leaf transform wrote the full vertex
+// records to leaf_out_buf (RDRAM) on the RSP; overlay B's DLEmitCmd_LeafFan reads them back
+// via DMA and emits the fan -- the CPU NEVER folds the geometry. The CPU only does what stays
+// cheap on it: sort leaves by flat (bind each flat's TMEM once), then per leaf-surface fire
+// LeafFan with the live height/light + the static S/T bias. Caller has set TILE0 + Z-mode.
+static void DL_LeafRSPEmitFlush(void)
+{
+    int surf;
+    int drew = 0;
+    static int vis[2048];
+    static int flats[256];
+
+    if (leaf_rsp_nv == 0) return;                   // nothing transformed -> no floors
+    if (rsp_dlemit_ovl_id == 0)
+        rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
+    if (rsp_dlemit_ovl_id == 0) return;
+
+    // Match the CPU leaf path EXACTLY: TEX0*PRIM (RDPQ_COMBINER_TEX_FLAT) with a per-leaf
+    // PRIM colour = the sector's depth-light (the wall RSP-emit left TEX_SHADE set, so reset
+    // it here). centerx/centery are frame-constant -> set once for every LeafFan.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
+
+    for (surf = 0; surf < 2; surf++)
+    {
+        int nvis = 0, nflat = 0, vi, fi, ss;
+        // Pass 1: collect visible non-sky leaves for THIS surface + their distinct flats.
+        // MUST mirror DL_RSPLeafDispatch's filter so leaf_rsp_slot[firstvert] is valid; the
+        // off-screen/near cull is the RSP's job now (LeafFan drops those leaves).
+        for (ss = 0; ss < numsubsectors; ss++)
+        {
+            bake_leaf_t* lf = &bake_leaves[ss];
+            int pic = surf ? lf->ceilingpic : lf->floorpic;
+            int fl, j, seen;
+            if (!bake_leafvis[ss]) continue;
+            if (lf->numverts < 3 || lf->numverts > DL_LEAF_EMIT_MAXV) continue;
+            if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
+            if (pic == skyflatnum) continue;            // this surface is sky -> stays CPU
+            if (nvis >= 2048) break;
+            vis[nvis++] = ss;
+            fl = flattranslation[pic];
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
+        }
+
+        // Pass 2: per distinct flat, bind TMEM ONCE, then fire LeafFan for each leaf on it.
+        for (fi = 0; fi < nflat; fi++)
+        {
+            int   flatidx = flats[fi];
+            byte* block   = DL_FlatBlock(flatidx);
+            if (!block) continue;
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
+            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);   // engine bypasses auto-upload
+
+            for (vi = 0; vi < nvis; vi++)
+            {
+                bake_leaf_t* lf = &bake_leaves[vis[vi]];
+                sector_t*    sec;
+                fixed_t      hf16;
+                int          n, lvl, ub64, vb64;
+                uint32_t     prim, packed;
+
+                if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx)
+                    continue;
+                n    = lf->numverts;
+                sec  = &sectors[lf->sector];
+                hf16 = (surf ? sec->ceilingheight : sec->floorheight) - viewz;  // live height
+                lvl  = (255 - sec->lightlevel) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                prim = dl_prim_lut[lvl];
+                rdpq_set_prim_color(color_from_packed32(prim));   // TEX*PRIM light, per leaf
+                ub64 = (lf->ubias >> 6) + 512;          // ubias/64 (multiple of 64) biased +512
+                vb64 = (lf->vbias >> 6) + 512;
+                packed = (uint32_t)(n & 0x3F)
+                       | ((uint32_t)(ub64 & 0x3FF) << 6)
+                       | ((uint32_t)(vb64 & 0x3FF) << 16);
+                rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFFAN,
+                           PhysicalAddr(&leaf_out_buf[leaf_rsp_slot[lf->firstvert]]),
+                           (uint32_t)hf16, prim, packed);
+                drew += n - 2;
+            }
+        }
+    }
+
+    dl_leaf_tris = drew;
+    {
+        static unsigned lf_n = 0;
+        if ((lf_n++ & 511) == 0)
+            debugf("MESH-LEAF-EMIT: leaf tris=%d (floor+ceil, no readback)\n", dl_leaf_tris);
+    }
+}
+#endif
+
 static void DL_DrawMeshLeaves(void)
 {
     fixed_t vcos, vsin;
@@ -4972,6 +5076,12 @@ static void DL_DrawMeshLeaves(void)
         tp.t.mask = 5;
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
     }
+
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+    (void)viewzf;
+    DL_LeafRSPEmitFlush();   // no-readback: the RSP fans the leaf tris; CPU never folds
+    return;
+#endif
 
     // Floor and ceiling share the SAME leaf polygon, so the per-vertex XY projection
     // (the 65536/depth divide, sc, screen-x, u/v, invw, z) is IDENTICAL for both --

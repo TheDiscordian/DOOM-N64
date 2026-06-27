@@ -58,6 +58,10 @@ RDPQ_Triangle_Cull:
 
 RSPQ_BeginOverlayHeader
     RSPQ_DefineCommand DLEmitCmd_Batch, 16   # 0x00: (batch_out, count, band_t_lo, band_t_hi)
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+    RSPQ_DefineCommand DLEmitCmd_LeafView, 8  # 0x01: (centerx[a0,masked], centery[a1])
+    RSPQ_DefineCommand DLEmitCmd_LeafFan, 16  # 0x02: (rec_addr[a0], hf16[a1], light[a2], packed[a3])
+#endif
 RSPQ_EndOverlayHeader
 
 RSPQ_EmptySavedState
@@ -126,6 +130,39 @@ EW_ybB:    .word 0      # corner B bottom
 # Vector-multiply staging for FixedMulVU (the band-clip dY = dT * slope). 8-byte aligned.
     .align 4
 VSCRATCH:  .ds.b 32
+
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+# ---- no-readback FLOOR emit (RSP_PORT_PLAN §8.5) ------------------------------------------
+# Leaf record layout (MUST match rsp_bleaf_out_t in rdp_view.c / BLO_* in rsp_dlwall.S).
+#define LRO_cx    0x00
+#define LRO_invw  0x08
+#define LRO_depth 0x0C
+#define LRO_u     0x10
+#define LRO_v     0x14
+#define LRO_emit  0x18
+#define LEAF_REC_BYTES 32
+#define LEAF_EMIT_MAXV 16           # per-leaf vert cap (observed maxverts=8); CPU skips bigger
+# Screen-X cull window in 16.16, matching the CPU leaf cull [-2048, SCREENWIDTH+2048] px.
+# The RSP transform already set emit=0 for these; LeafFan culls the whole leaf if any vert is.
+    .align 3
+LREC_BUF: .ds.b LEAF_EMIT_MAXV * LEAF_REC_BYTES   # the leaf's records, DMA'd in
+    .align 3
+LVBUF:    .ds.b LEAF_EMIT_MAXV * EMIT_VTX_SIZE     # all n staged verts (fan apex 0 + body)
+    .align 3
+LV_centerx: .word 0     # persistent across a frame's LeafFan dispatches (DLEmitCmd_LeafView)
+LV_centery: .word 0
+LF_n:       .word 0     # this leaf's vert count
+LF_hf:      .word 0     # (surfaceheight - viewz) 16.16, per leaf-surface
+LF_light:   .word 0     # packed RGBA shade
+LF_ubias:   .word 0     # S period bias (texels)
+LF_vbias:   .word 0     # T period bias (texels)
+LF_i:       .word 0     # staging / fan vertex index
+LF_recptr:  .word 0     # DMEM cursor into LREC_BUF for the current vertex
+LF_vbufdst: .word 0     # LVBUF slot StageLeafVtx is writing
+LF_cyval:   .word 0     # parked cy (DMEM, NOT an s-reg -- the engine owns s2..s6)
+LF_drop:    .word 0     # set if any vert's cy projects off-screen -> drop the whole leaf
+LF_ra:      .word 0     # saved ra across StageLeafVtx
+#endif
 
     .text
 
@@ -201,6 +238,188 @@ EBatchDone:
     # Wait for the last triangle's async DMA to drain, then back to the queue engine.
     j    RDPQ_Triangle_Send_End
     li   ra, %lo(RSPQ_Loop)      # (delay)
+
+#ifdef BENCH_FORCE_MESH_LEAF_EMIT
+# ============================================================================
+# DLEmitCmd_LeafView -- a0 = (id<<24)|centerx (mask the id byte), a1 = centery.
+# Frame-constant projection centre; set once before the per-leaf LeafFan dispatches.
+# ============================================================================
+DLEmitCmd_LeafView:
+    sll  t0, a0, 8              # strip the rspq command-id byte (top 8 bits)
+    srl  t0, t0, 8
+    sw   t0, %lo(LV_centerx)
+    j    RSPQ_Loop
+    sw   a1, %lo(LV_centery)     # (delay)
+
+# ============================================================================
+# DLEmitCmd_LeafFan -- a0 = leaf records RDRAM addr (id byte masked by the DMA),
+# a1 = hf16 (surfaceheight-viewz, 16.16), a2 = packed light, a3 = packed
+# (n[5:0] | (ubias/64+512)[15:6] | (vbias/64+512)[25:16]). Emits the leaf's fan:
+# n verts -> n-2 tris via the engine, with cy/S/T computed on the RSP. The whole leaf
+# is dropped if any vert's emit==0 (behind near plane or off-screen) -- the CPU leaf
+# path culls the same way and the no-readback CPU can't, so the cull moves here.
+# ============================================================================
+DLEmitCmd_LeafFan:
+    sw   a1, %lo(LF_hf)
+    sw   a2, %lo(LF_light)
+    andi t0, a3, 0x3F            # n
+    sw   t0, %lo(LF_n)
+    srl  t1, a3, 6
+    andi t1, t1, 0x3FF
+    addiu t1, t1, -512           # ubias/64 (un-bias the +512)
+    sll  t1, t1, 6               # -> ubias texels
+    sw   t1, %lo(LF_ubias)
+    srl  t2, a3, 16
+    andi t2, t2, 0x3FF
+    addiu t2, t2, -512           # vbias/64
+    sll  t2, t2, 6               # -> vbias texels
+    sw   t2, %lo(LF_vbias)
+    # ---- DMA the n records in: n * LEAF_REC_BYTES ----
+    lw   t5, %lo(LF_n)
+    sll  t6, t5, 5               # n * 32
+    addiu t6, t6, -1             # DMA width = bytes - 1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(LREC_BUF)
+    move s0, a0                  # records RDRAM addr (DMA masks the id byte)
+    jal  DMAIn
+    nop
+    # ---- cull pass: drop the whole leaf if ANY vert is behind the near plane (emit==0)
+    #      or off-screen (cx outside [-2048, SCREENWIDTH+2048] px -> s11.2 overflow). The CPU
+    #      leaf path culls the same way; the no-readback CPU can't see cx, so it moves here. ----
+    lw   t5, %lo(LF_n)
+    li   t0, %lo(LREC_BUF)
+LeafCullChk:
+    lw   t1, LRO_emit(t0)
+    beqz t1, LeafFanRet          # behind near plane
+    nop
+    lw   t1, LRO_cx(t0)
+    lui  t2, 0xF800              # -2048<<16  (-0x08000000)
+    slt  t4, t1, t2
+    bnez t4, LeafFanRet          # cx < -2048 px
+    nop
+    lui  t2, 0x0940              # (320+2048)<<16  (0x09400000)
+    slt  t4, t2, t1
+    bnez t4, LeafFanRet          # cx > 2368 px
+    nop
+    addiu t0, t0, LEAF_REC_BYTES
+    addiu t5, t5, -1
+    bgtz t5, LeafCullChk
+    nop
+    # ---- stage ALL n verts into LVBUF[i]; StageLeafVtx flags LF_drop on off-screen cy ----
+    sw   zero, %lo(LF_drop)
+    li   t0, %lo(LREC_BUF)
+    sw   t0, %lo(LF_recptr)
+    li   t0, %lo(LVBUF)
+    sw   t0, %lo(LF_vbufdst)
+    sw   zero, %lo(LF_i)
+LeafStageLoop:
+    lw   t0, %lo(LF_i)
+    lw   t1, %lo(LF_n)
+    bge  t0, t1, LeafStageDone
+    nop
+    jal  StageLeafVtx            # reads LF_recptr -> LF_vbufdst, may set LF_drop
+    nop
+    lw   t0, %lo(LF_recptr)
+    addiu t0, t0, LEAF_REC_BYTES
+    sw   t0, %lo(LF_recptr)
+    lw   t0, %lo(LF_vbufdst)
+    addiu t0, t0, EMIT_VTX_SIZE
+    sw   t0, %lo(LF_vbufdst)
+    lw   t0, %lo(LF_i)
+    addiu t0, t0, 1
+    sw   t0, %lo(LF_i)
+    j    LeafStageLoop
+    nop
+LeafStageDone:
+    lw   t0, %lo(LF_drop)
+    bnez t0, LeafFanRet          # any vert's cy off-screen -> drop the whole leaf
+    nop
+    # ---- fan: emit (LVBUF[0], LVBUF[i], LVBUF[i+1]) for i = 1 .. n-2 ----
+    li   t0, 1
+    sw   t0, %lo(LF_i)
+LeafFanLoop:
+    lw   t0, %lo(LF_i)
+    lw   t1, %lo(LF_n)
+    addiu t1, t1, -1             # last apex tri uses i = n-2
+    bge  t0, t1, LeafFanRet
+    nop
+    sll  t2, t0, 5              # i * 32
+    sll  t3, t0, 2             # i * 4   (EMIT_VTX_SIZE = 36 = 32 + 4)
+    addu t2, t2, t3            # i * 36
+    li   a1, %lo(LVBUF + 0*EMIT_VTX_SIZE)
+    li   a2, %lo(LVBUF)
+    addu a2, a2, t2            # LVBUF + i*36
+    addiu a3, a2, EMIT_VTX_SIZE # LVBUF + (i+1)*36
+    li   a0, EMIT_TRICMD
+    li   v0, 2                   # culling disabled (orientation handled by the fan)
+    li   s3, %lo(EMIT_STAGING)
+    j    RDPQ_Triangle_Send_Async
+    li   ra, %lo(LeafFanCont)    # (delay)
+LeafFanCont:
+    lw   t0, %lo(LF_i)
+    addiu t0, t0, 1
+    sw   t0, %lo(LF_i)
+    j    LeafFanLoop
+    nop
+LeafFanRet:
+    j    RDPQ_Triangle_Send_End
+    li   ra, %lo(RSPQ_Loop)      # (delay)
+
+# ---- StageLeafVtx: record at LF_recptr -> staged vertex at LF_vbufdst (LVBUF slot) ------
+# Computes the per-surface screen-Y + period-biased S/T, then the shared StageVtx packs the
+# engine vertex. CRITICAL: the rsp_rdpq_tri engine keeps persistent state in s2..s6 across
+# emits (EmitWall never touches them), so this routine uses ONLY the clobberable s-regs
+# (s0,s1,s7) + t-regs + DMEM parking -- centerx*ratio via FixedMulVU(centerx<<16, ratio),
+# NOT MulIntVU (which would need an s-reg). cy parked in LF_cyval. ra saved in LF_ra.
+StageLeafVtx:
+    sw   ra, %lo(LF_ra)
+    # cy = (centery<<16) - centerx * FixedMul(hf16, invw)   (wall ytop, rsp_dlwall.S:1088)
+    lw   t0, %lo(LF_recptr)
+    lw   a3, %lo(LF_hf)
+    jal  FixedMulVU             # hf16 * invw  (>>16)
+    lw   s7, LRO_invw(t0)        # (delay) s7 = invw (FixedMulVU input)
+    lw   t0, %lo(LV_centerx)
+    sll  t0, t0, 16            # centerx << 16
+    move s7, v1                 # ratio = hf16*invw
+    jal  FixedMulVU             # (centerx<<16)*ratio >> 16 = centerx*ratio
+    move a3, t0                 # (delay) a3 = centerx<<16
+    lw   t0, %lo(LV_centery)
+    sll  t0, t0, 16
+    subu t0, t0, v1            # cy
+    sw   t0, %lo(LF_cyval)
+    # off-screen cy cull [-2048, SCREENHEIGHT+2048] px (Y would overflow s11.2) -> flag drop
+    lui  t1, 0xF800            # -2048<<16
+    slt  t2, t0, t1
+    bnez t2, 1f
+    nop
+    lui  t1, 0x08C8           # (200+2048)<<16  (0x08C80000)
+    slt  t2, t1, t0
+    beqz t2, 2f
+    nop
+1:  li   t1, 1
+    sw   t1, %lo(LF_drop)
+2:  # assemble StageVtx inputs: t1=sx t2=sy t3=invw t4=depth t0=S s0=T s1=shade t8=dest
+    lw   t9, %lo(LF_recptr)     # record ptr (no more FixedMulVU after here)
+    lw   t1, LRO_cx(t9)
+    lw   t2, %lo(LF_cyval)
+    lw   t3, LRO_invw(t9)
+    lw   t4, LRO_depth(t9)
+    lw   t0, LRO_u(t9)
+    lw   t5, %lo(LF_ubias)
+    subu t0, t0, t5
+    sll  t0, t0, 16            # S = (u - ubias) << 16  (16.16 texels)
+    lw   s0, LRO_v(t9)
+    lw   t5, %lo(LF_vbias)
+    subu s0, s0, t5
+    sll  s0, s0, 15           # T = (v - vbias) << 15  (x0.5 for the 64->32 decimated tile)
+    lw   s1, %lo(LF_light)
+    lw   t8, %lo(LF_vbufdst)
+    jal  StageVtx
+    nop
+    lw   ra, %lo(LF_ra)
+    jr   ra
+    nop
+#endif /* BENCH_FORCE_MESH_LEAF_EMIT */
 
 # ---- EmitWall: emit ONE wall, clipped to the current TMEM T-band -----------------------
 # A wall taller than the texture's TMEM cap is drawn across several bands; each band loads

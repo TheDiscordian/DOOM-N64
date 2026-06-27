@@ -140,11 +140,21 @@ static void bake_store_leaf (int ss, const bdpt_t* poly, int n)
     lf->sector     = (short)(sec - sectors);
     lf->floorpic   = (short)sec->floorpic;
     lf->ceilingpic = (short)sec->ceilingpic;
-    for (k = 0; k < n; k++)
     {
-        bake_leaf_verts[bake_numleafverts][0] = (fixed_t)(poly[k].x * 65536.0);
-        bake_leaf_verts[bake_numleafverts][1] = (fixed_t)(poly[k].y * 65536.0);
-        bake_numleafverts++;
+        fixed_t umin = 0x7fffffff, vmin = 0x7fffffff;       // STATIC S/T period bias (>>FRACBITS
+        for (k = 0; k < n; k++)                             // world texel, min over verts; the
+        {                                                   // no-readback RSP emit never sees u/v
+            fixed_t fx = (fixed_t)(poly[k].x * 65536.0);    // so it cannot derive umin/vmin live)
+            fixed_t fy = (fixed_t)(poly[k].y * 65536.0);
+            fixed_t u  = fx >> FRACBITS, v = fy >> FRACBITS;
+            if (u < umin) umin = u;
+            if (v < vmin) vmin = v;
+            bake_leaf_verts[bake_numleafverts][0] = fx;
+            bake_leaf_verts[bake_numleafverts][1] = fy;
+            bake_numleafverts++;
+        }
+        lf->ubias = (int)(umin & ~63);                      // floor to 64-period (mask = floor
+        lf->vbias = (int)(vmin & ~63);                      // for both signs, two's complement)
     }
 }
 

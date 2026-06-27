@@ -67,6 +67,8 @@ typedef struct
     short   sector;     // owning sector index (live floor/ceiling height + light)
     short   floorpic;   // flat lump for the floor   (skyflatnum => skip, stays CPU)
     short   ceilingpic; // flat lump for the ceiling (skyflatnum => skip, stays CPU)
+    int     ubias;      // floor(min world-texel x / 64)*64 -- STATIC S period bias (no-readback emit)
+    int     vbias;      // floor(min world-texel y / 64)*64 -- STATIC T period bias
 } bake_leaf_t;
 
 extern bake_leaf_t*   bake_leaves;        // PU_LEVEL, one per subsector (sky leaves too)

@@ -193,6 +193,14 @@ endif
 ifeq ($(BENCH_FORCE_MESH_RSP_EMIT),1)
 CFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
 RSPASFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
+#   BENCH_FORCE_MESH_LEAF_EMIT=1 -> the no-readback FLOOR emit (RSP_PORT_PLAN §8.5): overlay B
+#   gains a leaf-fan command (DLEmitCmd_LeafFan); the CPU dispatches it per leaf-surface instead
+#   of folding leaf_out_buf back + emitting rdpq_triangle. Requires LEAF_RSP (the transform) +
+#   RSP_EMIT (the rsp_rdpq_tri engine). Reaches BOTH CFLAGS and the RSP assembly.
+ifeq ($(BENCH_FORCE_MESH_LEAF_EMIT),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
+RSPASFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
+endif
 endif
 endif
 endif
