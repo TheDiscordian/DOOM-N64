@@ -5185,26 +5185,32 @@ static void DL_FlushRSPEmit(void)
             r->dA = (iwl > 0.0f) ? (int32_t)((1.0f / iwl) * 65536.0f) : r->dA;
             r->dB = (iwr > 0.0f) ? (int32_t)((1.0f / iwr) * 65536.0f) : r->dB;
 
-            // DISTANCE LIGHTING: shade the wall by its DEPTH (zlight, the depth-indexed table
-            // the RDP planes use), not the flat baked sector light. The pack wrote
-            // dl_prim_lut[(255-light)>>3] -- sector light only, no distance falloff -- so distant
-            // mesh walls stayed full-bright while software darkens with depth (a big room like
-            // demo frame 3712 read "too bright"). Recompute the per-wall SHADE from
-            // (sector light + extralight, wall midpoint depth) and overwrite batch_out.rgba
-            // (overlay B's vertex SHADE). dA/dB are depth 16.16 (= 1/invw post warp-fix).
+            // DISTANCE LIGHTING (per-corner GOURAUD): shade each wall EDGE by its own depth via
+            // the zlight table (the depth-indexed table the RDP planes use), so a receding wall
+            // darkens SMOOTHLY across its width (the RDP interpolates the two edge shades) instead
+            // of one flat step -- matching software's per-column ramp. The pack wrote a flat
+            // dl_prim_lut[(255-light)>>3] (sector light only, no distance), so distant mesh walls
+            // stayed full-bright (demo frame 3712 read "too bright"). Compute the column-A shade
+            // from dA (near edge) and the column-B shade from dB (far edge); write A's into
+            // batch_out.rgba (0x3C, overlay B's V0/V2 vertex SHADE) and B's into the now-dead
+            // lateral field BWO_lB (0x0C -- overlay A's transform is done with it by emit time;
+            // overlay B reads it for V1/V3). dA/dB are depth 16.16 (= 1/invw post warp-fix).
             {
                 extern int extralight;
                 int  lnum = ((int)bake_walls[batch_vislist[k]].light >> LIGHTSEGSHIFT) + extralight;
-                int  zi   = (int)(((r->dA + r->dB) >> 1) >> LIGHTZSHIFT);
-                long lvl2;
+                int  ziA  = (int)(r->dA >> LIGHTZSHIFT);    // near-edge (column A) depth index
+                int  ziB  = (int)(r->dB >> LIGHTZSHIFT);    // far-edge  (column B) depth index
+                long lvA, lvB;
                 if (lnum < 0) lnum = 0;
                 if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
-                if (zi < 0) zi = 0;
-                if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
-                lvl2 = (zlight[lnum][zi] - colormaps) / 256;
-                if (lvl2 < 0) lvl2 = 0;
-                if (lvl2 >= NUMCOLORMAPS) lvl2 = NUMCOLORMAPS - 1;
-                r->rgba = (int32_t)dl_prim_lut[lvl2];
+                if (ziA < 0) ziA = 0;  if (ziA >= MAXLIGHTZ) ziA = MAXLIGHTZ - 1;
+                if (ziB < 0) ziB = 0;  if (ziB >= MAXLIGHTZ) ziB = MAXLIGHTZ - 1;
+                lvA = (zlight[lnum][ziA] - colormaps) / 256;
+                lvB = (zlight[lnum][ziB] - colormaps) / 256;
+                if (lvA < 0) lvA = 0;  if (lvA >= NUMCOLORMAPS) lvA = NUMCOLORMAPS - 1;
+                if (lvB < 0) lvB = 0;  if (lvB >= NUMCOLORMAPS) lvB = NUMCOLORMAPS - 1;
+                r->rgba = (int32_t)dl_prim_lut[lvA];   // column-A vertex SHADE (V0,V2)
+                r->lB   = (int32_t)dl_prim_lut[lvB];   // column-B vertex SHADE (V1,V3) via BWO_lB
             }
             nclip++;
         }

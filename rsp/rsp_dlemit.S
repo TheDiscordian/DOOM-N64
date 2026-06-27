@@ -274,7 +274,9 @@ EmitWall:
     addu t0, t0, v1
     sw   t0, %lo(EW_ybB)
 
-    lw   s1, BWO_rgba(t9)            # per-wall SHADE colour for all 4 corners (StageVtx writes it)
+    lw   s1, BWO_rgba(t9)            # column-A SHADE (V0,V2). GOURAUD: BWO_rgba = near-edge shade,
+                                    # BWO_lB (repurposed, dead after overlay A) = far-edge shade.
+                                    # Reloaded per column below so the RDP interpolates the ramp.
     # Per corner: t1=sx t2=sy t3=invw t4=depth + t0=S s0=T (16.16). Y/T are band-clipped.
     # --- stage V0 (top-left): A column, band top ---
     li   t8, %lo(VBUF + 0*EMIT_VTX_SIZE)
@@ -287,6 +289,7 @@ EmitWall:
     jal  StageVtx
     nop
     # --- stage V1 (top-right): B column, band top ---
+    lw   s1, BWO_lB(t9)             # column-B (far-edge) gouraud shade
     li   t8, %lo(VBUF + 1*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
     lw   t2, %lo(EW_ytB)
@@ -297,6 +300,7 @@ EmitWall:
     jal  StageVtx
     nop
     # --- stage V2 (bottom-left): A column, band bottom ---
+    lw   s1, BWO_rgba(t9)           # column-A (near-edge) gouraud shade
     li   t8, %lo(VBUF + 2*EMIT_VTX_SIZE)
     lw   t1, BWO_sxA(t9)
     lw   t2, %lo(EW_ybA)
@@ -307,6 +311,7 @@ EmitWall:
     jal  StageVtx
     nop
     # --- stage V3 (bottom-right): B column, band bottom ---
+    lw   s1, BWO_lB(t9)             # column-B (far-edge) gouraud shade
     li   t8, %lo(VBUF + 3*EMIT_VTX_SIZE)
     lw   t1, BWO_sxB(t9)
     lw   t2, %lo(EW_ybB)
