@@ -4968,10 +4968,11 @@ static void DL_LeafRSPEmitFlush(void)
         rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
     if (rsp_dlemit_ovl_id == 0) return;
 
-    // Match the CPU leaf path EXACTLY: TEX0*PRIM (RDPQ_COMBINER_TEX_FLAT) with a per-leaf
-    // PRIM colour = the sector's depth-light (the wall RSP-emit left TEX_SHADE set, so reset
-    // it here). centerx/centery are frame-constant -> set once for every LeafFan.
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    // TEX0*SHADE -- the SAME combiner the wall RSP-emit uses, so the rsp_rdpq_tri engine
+    // stays on its validated 1-cycle path (TEX_FLAT tripped the engine's combiner assert).
+    // Each leaf's light rides in as the flat vertex SHADE (StageLeafVtx -> VTX_ATTR_RGBA),
+    // so TEX*SHADE == the CPU path's TEX*PRIM. centerx/centery set once per frame.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
 
     for (surf = 0; surf < 2; surf++)
@@ -5025,8 +5026,7 @@ static void DL_LeafRSPEmitFlush(void)
                 lvl  = (255 - sec->lightlevel) >> 3;
                 if (lvl < 0) lvl = 0;
                 if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
-                prim = dl_prim_lut[lvl];
-                rdpq_set_prim_color(color_from_packed32(prim));   // TEX*PRIM light, per leaf
+                prim = dl_prim_lut[lvl];                // -> LeafFan a2 -> vertex SHADE
                 ub64 = (lf->ubias >> 6) + 512;          // ubias/64 (multiple of 64) biased +512
                 vb64 = (lf->vbias >> 6) + 512;
                 packed = (uint32_t)(n & 0x3F)

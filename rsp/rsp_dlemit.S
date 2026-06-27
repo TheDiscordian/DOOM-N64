@@ -284,8 +284,9 @@ DLEmitCmd_LeafFan:
     jal  DMAIn
     nop
     # ---- cull pass: drop the whole leaf if ANY vert is behind the near plane (emit==0)
-    #      or off-screen (cx outside [-2048, SCREENWIDTH+2048] px -> s11.2 overflow). The CPU
-    #      leaf path culls the same way; the no-readback CPU can't see cx, so it moves here. ----
+    #      or far enough off-screen that the projected coord (cx*4 in StageVtx) skews the RDP
+    #      edge walker. The wall emit CLIPS X to screen for this; leaves only cull, so the
+    #      window must stay coord-safe -- [-1024, SCREENWIDTH+1024] px (cx*4 <= 5376). ----
     lw   t5, %lo(LF_n)
     li   t0, %lo(LREC_BUF)
 LeafCullChk:
@@ -293,13 +294,13 @@ LeafCullChk:
     beqz t1, LeafFanRet          # behind near plane
     nop
     lw   t1, LRO_cx(t0)
-    lui  t2, 0xF800              # -2048<<16  (-0x08000000)
+    lui  t2, 0xFC00              # -1024<<16  (-0x04000000)
     slt  t4, t1, t2
-    bnez t4, LeafFanRet          # cx < -2048 px
+    bnez t4, LeafFanRet          # cx < -1024 px
     nop
-    lui  t2, 0x0940              # (320+2048)<<16  (0x09400000)
+    lui  t2, 0x0540              # (320+1024)<<16  (0x05400000)
     slt  t4, t2, t1
-    bnez t4, LeafFanRet          # cx > 2368 px
+    bnez t4, LeafFanRet          # cx > 1344 px
     nop
     addiu t0, t0, LEAF_REC_BYTES
     addiu t5, t5, -1
@@ -350,6 +351,19 @@ LeafFanLoop:
     li   a2, %lo(LVBUF)
     addu a2, a2, t2            # LVBUF + i*36
     addiu a3, a2, EMIT_VTX_SIZE # LVBUF + (i+1)*36
+    # skip a DEGENERATE tri (two coincident screen verts -> the engine's edge setup divides
+    # by zero -> a malformed command -> RDPQ_ASSERT_SEND_INVALID_SIZE). The convex leaf bake
+    # (Sutherland-Hodgman) can emit duplicate verts; the CPU rdpq_triangle drops these, the
+    # raw engine does not. Compare the packed XY word (VTX_ATTR_XY at offset 0).
+    lw   t6, 0(a1)
+    lw   t7, 0(a2)
+    beq  t6, t7, LeafFanCont
+    nop
+    lw   t8, 0(a3)
+    beq  t7, t8, LeafFanCont
+    nop
+    beq  t6, t8, LeafFanCont
+    nop
     li   a0, EMIT_TRICMD
     li   v0, 2                   # culling disabled (orientation handled by the fan)
     li   s3, %lo(EMIT_STAGING)
@@ -387,12 +401,12 @@ StageLeafVtx:
     sll  t0, t0, 16
     subu t0, t0, v1            # cy
     sw   t0, %lo(LF_cyval)
-    # off-screen cy cull [-2048, SCREENHEIGHT+2048] px (Y would overflow s11.2) -> flag drop
-    lui  t1, 0xF800            # -2048<<16
+    # off-screen cy cull [-1024, SCREENHEIGHT+1024] px (coord-safe for the edge walker) -> drop
+    lui  t1, 0xFC00            # -1024<<16
     slt  t2, t0, t1
     bnez t2, 1f
     nop
-    lui  t1, 0x08C8           # (200+2048)<<16  (0x08C80000)
+    lui  t1, 0x04C8           # (200+1024)<<16  (0x04C80000)
     slt  t2, t1, t0
     beqz t2, 2f
     nop
