@@ -175,14 +175,14 @@ BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back 
 #define BLI_y      0x04
 #define BLI_floorz 0x08    /* live surface height (fixed_t) -> screen-y */
 #define BLEAF_IN_BYTES  16
-#define BLO_cx   0x00      /* screen-x, 16.16 */
-#define BLO_cy   0x04      /* screen-y, 16.16 (from floorz) */
-#define BLO_invw 0x08      /* 65536/depth, 16.16 */
-#define BLO_z    0x0C      /* zbuf depth */
-#define BLO_u    0x10      /* world-coord flat texel x */
-#define BLO_v    0x14      /* world-coord flat texel y */
-#define BLO_emit 0x18      /* 1 = vertex in front of near plane, 0 = leaf must be culled */
-#define BLO_pad  0x1C
+#define BLO_cx    0x00     /* screen-x, 16.16 */
+#define BLO_cy    0x04     /* reserved (cy is per-surface, derived at emit) */
+#define BLO_invw  0x08     /* 65536/depth, 16.16 -> RDP INVW */
+#define BLO_depth 0x0C     /* view-space depth 16.16 -> engine Z (>>16) + W */
+#define BLO_u     0x10     /* world-coord flat texel x */
+#define BLO_v     0x14     /* world-coord flat texel y */
+#define BLO_emit  0x18     /* 1 = vertex in front of near plane, 0 = leaf must be culled */
+#define BLO_pad   0x1C
 #define BLEAF_OUT_BYTES 32
 
 # Batch loop bookkeeping (MUST be in .bss/DMEM -- the RSP scalar lw/sw only reach
@@ -772,11 +772,10 @@ XformLeaf:
     # cy is NOT computed here: it is the only PER-SURFACE term (floor vs ceiling differ),
     # so overlay B derives it at emit from cy = centery - (h-viewz)*sc, sc = centerx*invw.
     # XformLeaf emits only the per-vertex invariants the fan needs: cx, invw, z, u, v.
-    # ---- z = DL_WallZ(invw) = depth>>15 (16.16). DL_WallZ = 1/(invw*32768) =
-    #      depth/2^31 (float in [0,1]); *65536 == depth>>15. depth>=nearz>0 => in range. ----
+    # ---- depth (16.16 view-space): the emit derives Z = depth>>16 (clamped) + W from it
+    #      (StageVtx convention). The CPU fold's DL_WallZ(invw) == depth>>15 if it needs it. ----
     lw   t0, %lo(XW_dA)
-    srl  t0, t0, 15
-    sw   t0, BLO_z(t9)
+    sw   t0, BLO_depth(t9)
     # ---- u = wx>>16, v = wy>>16 : world-aligned flat texel (signed arithmetic shift) ----
     lw   t8, %lo(XW_in)
     lw   t0, BLI_x(t8)

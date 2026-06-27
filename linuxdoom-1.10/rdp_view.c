@@ -2570,9 +2570,9 @@ typedef struct {
 } rsp_bleaf_in_t;                  // 16 bytes
 typedef struct {
     int32_t cx;                    // 0x00        screen-x 16.16
-    int32_t cy;                    // 0x04        screen-y 16.16 (from floorz)
-    int32_t invw;                  // 0x08        65536/depth 16.16
-    int32_t z;                     // 0x0C        zbuf depth (DL_WallZ(invw))
+    int32_t cy;                    // 0x04        reserved (cy is per-surface, derived at emit)
+    int32_t invw;                  // 0x08        65536/depth 16.16 -> RDP INVW
+    int32_t depth;                 // 0x0C        view-space depth 16.16 -> engine Z (>>16) + W
     int32_t u, v;                  // 0x10,0x14   world-coord flat texel (x>>FRACBITS,y>>FRACBITS)
     int32_t emit;                  // 0x18        1 = in front of near plane, 0 = cull leaf
     int32_t pad;                   // 0x1C
@@ -5037,20 +5037,18 @@ static void DL_DrawMeshLeaves(void)
                 invw = (float)ro->invw * (1.0f / 65536.0f);
                 sc   = (float)centerx * invw;
 #ifdef BENCH_FORCE_MESH_LEAF_RSP_VERIFY
-                // A/B: the RSP computes the per-vertex invariants (cx,z,u,v + invw) --
+                // A/B: the RSP computes the per-vertex invariants (cx,depth,u,v + invw) --
                 // verify each against the CPU reference. Same epsilon as the wall harness
-                // (>0.5px screen, >1% invw); u/v are integer texels so they must match
+                // (>0.5px screen, >1% invw/depth); u/v are integer texels so they must match
                 // exactly. cy is per-surface (overlay B derives it from sc) -- not here.
                 {
                     // Bucket ON-SCREEN verts (cx in [0,SCREENWIDTH]) separately: those are
                     // the ones whose projection actually rasterizes. The reciprocal's
                     // precision tail lands on near-plane / far-lateral verts that project
                     // way off-screen (|cx| up to the 2048 cull bound) and get scissored, so
-                    // an ALL-verts epsilon flags geometry the player never sees. z is
-                    // compared ABSOLUTE (16-bit Z-buffer): relative error explodes on the
-                    // tiny z of near verts but the absolute delta there is sub-LSB.
+                    // an ALL-verts epsilon flags geometry the player never sees.
                     static unsigned vchk = 0, vbad = 0, von = 0, vbon = 0, vframe = 0;
-                    static float    w_cx = 0.f, w_cxon = 0.f, w_zon = 0.f; static int w_uv = 0;
+                    static float    w_cx = 0.f, w_cxon = 0.f, w_depon = 0.f; static int w_uv = 0;
                     fixed_t tx = wx - viewx, ty = wy - viewy;
                     fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
                     if (depth >= (4 << FRACBITS)) {
@@ -5058,34 +5056,32 @@ static void DL_DrawMeshLeaves(void)
                         float   ci    = 65536.0f / (float)depth;
                         float   cs    = (float)centerx * ci;
                         float   cx_c  = (float)centerx - (float)lat * (1.0f/65536.0f) * cs;
-                        float   z_c   = DL_WallZ(ci);
                         int     u_c   = (int)(wx >> FRACBITS);
                         int     v_c   = (int)(wy >> FRACBITS);
                         float   r_cx  = (float)ro->cx * (1.0f/65536.0f);
-                        float   r_z   = (float)ro->z  * (1.0f/65536.0f);
                         float   d_cx  = fabsf(r_cx - cx_c);
-                        float   d_za  = fabsf(r_z - z_c);
                         double  d_iw  = fabs(((double)invw - (double)ci) / (double)ci);
+                        double  d_dep = fabs(((double)ro->depth - (double)depth) / (double)depth);
                         int     d_uv  = (ro->u != u_c) + (ro->v != v_c);
                         int     onscr = (cx_c >= 0.0f && cx_c <= (float)SCREENWIDTH);
                         vchk++;
                         if (d_cx > w_cx) w_cx = d_cx;
                         if (d_uv > w_uv) w_uv = d_uv;
-                        if (d_cx > 0.5f || d_iw > 0.01 || d_uv) vbad++;
+                        if (d_cx > 0.5f || d_iw > 0.01 || d_dep > 0.01 || d_uv) vbad++;
                         if (onscr) {
                             von++;
-                            if (d_cx > w_cxon) w_cxon = d_cx;
-                            if (d_za > w_zon)  w_zon  = d_za;
-                            if (d_cx > 0.5f || d_za > 0.0008f || d_uv) vbon++;
+                            if (d_cx  > w_cxon)  w_cxon  = d_cx;
+                            if (d_dep > w_depon) w_depon = (float)d_dep;
+                            if (d_cx > 0.5f || d_dep > 0.01 || d_uv) vbon++;
                         }
                     }
                     if (vchk >= 4096) {            // count-based: robust to leaf culling
                         debugf("LEAF-AB win=%u chk=%u bad=%u | onscr=%u badon=%u "
-                               "w_cxon=%d(e-3) w_zon=%d(e-6) w_uv=%d | w_cxALL=%d(e-3)\n",
+                               "w_cxon=%d(e-3) w_depon=%d(e-6) w_uv=%d | w_cxALL=%d(e-3)\n",
                                ++vframe, vchk, vbad, von, vbon,
-                               (int)(w_cxon*1000.0f), (int)(w_zon*1e6f), w_uv,
+                               (int)(w_cxon*1000.0f), (int)(w_depon*1e6f), w_uv,
                                (int)(w_cx*1000.0f));
-                        vchk = vbad = von = vbon = 0; w_cx = w_cxon = w_zon = 0.f; w_uv = 0;
+                        vchk = vbad = von = vbon = 0; w_cx = w_cxon = w_depon = 0.f; w_uv = 0;
                     }
                 }
 #endif
