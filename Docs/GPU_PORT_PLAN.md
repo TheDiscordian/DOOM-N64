@@ -127,10 +127,21 @@ won't initially, vs today's per-column projection.)
   blits CI8 over the RDP — un-suppressed SW walls hid the mesh). Perspective screen-edge
   clip (`473c512`, killed the close-wall texture shear) + near-plane clip of straddlers
   (`1c73638`). **Measured: avg 16769µs / p95 28256µs = −16.6% / −30.3% vs full-RDP
-  per-column; beats the planes-only ship too.** OPEN (fidelity, not occlusion/perf):
-  texture `textureoffset`/`rowoffset`/`ML_DONTPEG*` not threaded (S=0, top-pegged →
-  misaligns vs software); grazing-angle S-precision smear.
-- **Phase 3 — Baked leaf-fan floors/ceilings** (NEXT). ⚠️ **THE HARD PART = closing
+  per-column; beats the planes-only ship too.** FIDELITY since CLOSED: texture
+  `textureoffset`/`rowoffset`/pegging ARE threaded now (bake `bake_wall_t.textureoffset/
+  rowoffset/peg_*` populated, resolved live each frame in the transform -- rdp_view.c:3500+);
+  grazing-angle S-precision smear mitigated by period-bias + S-span split (`7226518`), with
+  s10.5 saturation (>1024 texels/tri) the residual RDP physical limit.
+- **Phase 3 — Baked leaf-fan floors/ceilings** ✅ BUILT + VALIDATED, but SHELVED
+  (default-OFF, perf loss). The convex-leaf bake (`P_BakeLeafFans`, r_bake.c -- the
+  Sutherland-Hodgman partition-half-plane clip below, 237/237 E1M1 subsectors filled +
+  convex, `a5ea814`) and the per-frame leaf transform + RDP emit (`DL_DrawMeshLeaves`,
+  rdp_view.c, CPU + an RSP-leaf variant) are COMPLETE and validated (`43edf87`). But it is
+  gated behind `BENCH_FORCE_MESH_FLOORS` and **OFF by default** (`n64_rdp_mesh_floors=0`):
+  it MEASURED A PERF LOSS (~+5% avg / +21% p95) -- the baked leaf mesh is SLOWER than the
+  already-coalesced RDP plane-poly path. So shipping floors/ceilings render via
+  `DL_FlushPlanePolys` (RDP trapezoid plane polys), NOT the leaf mesh and NOT software spans.
+  (Original design note, still accurate, kept below.) ⚠️ **THE HARD PART = closing
   each subsector leaf to its convex polygon.** Vanilla nodes have NO minisegs, so
   `segs[firstline..]` only cover the leaf's *wall* edges — the boundary that runs along
   a BSP **partition line** has no seg. A centroid/seg fan therefore GAPS along every
@@ -146,11 +157,19 @@ won't initially, vs today's per-column projection.)
   (`DL_EmitPlanePoly`/`DL_FlushPlanePolys`, gouraud per-corner light, perspective on).
   Skip `picnum==skyflatnum` leaves (sky stays on the CPU column path). Validate with a
   geometry trace + A/B, not the eye.
-- **Phase 4 — Moving sectors:** the `T_MovePlane` dirty-mark + per-frame Z-patch;
-  A/B a frame mid door/lift animation.
-- **Phase 5 — Transparent midtex + flash/colormap + end-state sweep:** masked
-  midtex through the existing path; confirm flash/colormap; full RDP-vs-software
-  avg+p95 sweep.
+- **Phase 4 — Moving sectors** ✅ DONE -- but as a LIVE per-frame resolve, NOT the planned
+  `T_MovePlane` dirty-mark/Z-patch. The wall transform (`DL_MeshDrawWalls`,
+  rdp_view.c:3484-3491) re-reads `sectors[...].ceilingheight/floorheight` EVERY frame from the
+  quad's baked sector references (`bake_wall_t.ztop_sec/zbot_sec/zbot_ceil/ztop_ceil`), so
+  doors/lifts/crushers follow the geometry with no ghost (a step whose top drops to/below its
+  bottom is skipped). Same live resolve for pegging (`peg_sec`) and lighting (`lightsec`). No
+  dirty-mark needed -- it never caches a Z. (The shelved leaf-floor path, Phase 3, resolves its
+  sector heights live the same way.)
+- **Phase 5 — Transparent midtex + flash/colormap + end-state sweep:** PARTIAL.
+  Flash + colormap CONFIRMED done on the mesh path: CI4 damage-flash re-tint (`DL_RetintSlot`)
+  and fixedcolormap (invuln/light-amp visor) for walls AND RDP planes (`8c2d5e7` / `5ec60bb`).
+  STILL OPEN: transparent/masked MIDTEX is on the software path (`R_RenderMaskedSegRange`), not
+  yet meshed; and the full RDP-vs-software avg+p95 end-state sweep.
 
 ## Open go/no-go numbers (Phase 0 settles these)
 
