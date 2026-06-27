@@ -1755,6 +1755,17 @@ uint8_t DL_PlaneLightLevel(const void* colormap)
 
     if (!cm || !colormaps)
         return 0;
+    // Under a worn fixedcolormap (invuln/light-amp visor) the plane TLUT is composed
+    // through the colormap row (I_N64UploadFixedColormapTLUT), so the level is already
+    // baked into the texel -- the SHADE must be flat fullbright (level 0), NOT the
+    // clamped row index (32 -> 31 would darken the inverted floor toward black, the
+    // invuln plane bug). Checked before the cache so a coincident zlight pointer can't
+    // alias it.
+    {
+        extern lighttable_t* fixedcolormap;
+        if (fixedcolormap && cm == (const lighttable_t*)fixedcolormap)
+            return 0;
+    }
     if (cm == dl_pll_cm)
         return dl_pll_level;
 
@@ -4557,6 +4568,7 @@ static void DL_DrawPlanePoly(const rdp_ppoly_t* p, byte* block)
 extern boolean  I_N64UploadBaseTLUT(void);    // load un-flashed base TLUT into TMEM
 extern void     I_N64UploadMasterTLUT(void);  // restore flashed master after the planes
 extern uint32_t I_N64PlaneFlashARGB(void);    // active flash tint 0xRRGGBBAA, 0 = none
+extern boolean  I_N64UploadFixedColormapTLUT(int level); // master[colormap[L][i]] -> plane TLUT
 extern int      scaledviewwidth;              // r_state.h: view window width
 extern int      viewwindowx;                  // r_main.h: view window x origin
 extern int      viewheight;                   // r_main.h: view window height
@@ -4566,6 +4578,9 @@ static void DL_FlushPlanePolys(void)
     int fi;
     uint32_t flash;            // active uniform flash tint (0xRRGGBBAA), 0 = none
     boolean  unflashed;        // true once the base TLUT is resident for the planes
+    boolean  fcm_resident;     // true once a fixedcolormap-composed TLUT is resident
+    extern lighttable_t* fixedcolormap;
+    extern lighttable_t* colormaps;
 
     if (dl_ppoly_count <= 0)
         return;
@@ -4584,8 +4599,21 @@ static void DL_FlushPlanePolys(void)
     // == 0) NOTHING changes: master stays resident, no overlay -> perf-neutral.
     flash = I_N64PlaneFlashARGB();
     unflashed = false;
-    if (flash)
+    fcm_resident = false;
+    // FIXEDCOLORMAP (invuln / light-amp visor) takes precedence over the flash overlay.
+    // The flash overlay is a uniform TINT rect -- it cannot express a per-index remap,
+    // and invuln's inverted map is exactly that. So compose master[colormap[L][i]] into
+    // the plane TLUT (the CI8 analog of the CI4 walls' sub-palette colormap remap), and
+    // SKIP the overlay -- the composition is from the FLASHED master, so a simultaneous
+    // flash is already folded in. SHADE is forced fullbright (DL_PlaneLightLevel returns
+    // 0 for the fixedcolormap pointer) so the baked level isn't darkened twice. The plain
+    // master is re-asserted after the plane draws so sprites/HUD/present-blit are normal.
+    if (fixedcolormap) {
+        int lvl = (int)((fixedcolormap - colormaps) / 256);
+        fcm_resident = I_N64UploadFixedColormapTLUT(lvl);   // false until colormap loaded
+    } else if (flash) {
         unflashed = I_N64UploadBaseTLUT();   // false if base not captured yet -> skip
+    }
 
     // SHADE stays the un-flashed depth-light ramp (f35d6ce); now that TEX0 is also
     // un-flashed (base TLUT) the planes carry NO flash at all, and the overlay below
@@ -4650,7 +4678,8 @@ static void DL_FlushPlanePolys(void)
     // (already-flashed) CI8 buffer, so the overlay SURVIVES only where the RDP
     // planes drew (the key-cleared region) -- coverage-clipping for free via the
     // existing keyed present blit. The caller's view-window scissor still bounds it.
-    if (flash)
+    // SKIPPED under a fixedcolormap: the composed TLUT already folded in the flash.
+    if (flash && !fcm_resident)
     {
         // OVER-TINT CORRECTION. The recovered (target,alpha) is the EXACT linear
         // blend DOOM's palette math intends (FLASH_DBG confirmed: red flash target
@@ -4694,6 +4723,12 @@ static void DL_FlushPlanePolys(void)
         if (unflashed)
             I_N64UploadMasterTLUT();
     }
+
+    // FIXEDCOLORMAP: we swapped the plane TLUT for the composed master[colormap[L][i]]
+    // above; re-assert the plain master so the CI8 sprites/HUD/present-blit sample the
+    // normal palette again (mirror of the flash path's re-assert).
+    if (fcm_resident)
+        I_N64UploadMasterTLUT();
 
     // Restore the world combiner (TEX0*PRIM) the caller/wall path assumes -- this
     // is the only place that switched to TEX_SHADE.

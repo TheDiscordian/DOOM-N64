@@ -95,6 +95,15 @@ static void     I_N64SetFlashFromPalette(void);   // defined below; used in I_Se
 // re-tint indexes it directly (no per-entry cross-TU call on flash frames).
 const uint16_t* I_N64MasterTLUT(void) { return doom_tlut_master; }
 static uint16_t doom_tlut_up[2][256] __attribute__((aligned(16)));
+// DEDICATED scratch for the fixedcolormap-composed plane TLUT -- must NOT share
+// doom_tlut_up: rdpq_tex_upload_tlut records the source's PHYSICAL address into the
+// rspq stream and the LOAD_TLUT DMAs it at RDP-execution time (async). The plane pass
+// re-asserts the master into doom_tlut_up AFTER the plane draws; if the composed TLUT
+// lived in doom_tlut_up, that re-assert would overwrite the buffer before the RDP ran
+// the plane's deferred LOAD_TLUT, so the planes would sample the master (the floors
+// came out un-inverted under invuln). Its own buffer keeps the composed source intact
+// until the RDP consumes it (same reasoning as the CI4 walls' per-slot sub-palettes).
+static uint16_t doom_tlut_fcm[2][256] __attribute__((aligned(16)));
 static uint64_t last_menu_present_ms;
 static boolean n64_split_active;
 static int n64_split_player_count;
@@ -1781,6 +1790,36 @@ boolean I_N64UploadBaseTLUT(void)
     slot = doom_tlut_up[n64_draw_idx];
     memcpy(slot, doom_tlut_base, sizeof(doom_tlut_base));
     data_cache_hit_writeback(slot, sizeof(doom_tlut_base));
+    rdpq_tex_upload_tlut(slot, 0, 256);
+    return true;
+}
+
+// --- plane fixedcolormap (invuln / light-amp visor) support ----------------
+// Synchronously upload a FIXEDCOLORMAP-COMPOSED 256-TLUT into TMEM so the RDP
+// plane CI8 flats sample master[ colormap[level][texel] ] -- exactly software's
+// whole-view colormap remap: the inverted grey-scale map under invuln (level 32),
+// or the visor's near-fullbright level (1). The flash-overlay technique (uniform
+// translucent rect) can only express a uniform TINT, not a per-index remap/inversion,
+// so the planes need their TLUT composed through the colormap row instead. Composed
+// from the CURRENT (flashed) master, so a simultaneous palette flash is already
+// included and the caller SKIPS its uniform flash overlay. The caller re-asserts the
+// plain master via I_N64UploadMasterTLUT before returning so the CI8 sprites/HUD/
+// present-blit see the normal palette. Mirrors I_N64UploadBaseTLUT's mechanics (512 B
+// writeback + one LOAD_TLUT). No-op (false) until the colormap lump is loaded.
+extern lighttable_t* colormaps;     // r_data.c: 34-row colormap table (byte indices)
+boolean I_N64UploadFixedColormapTLUT(int level)
+{
+    uint16_t* slot;
+    const lighttable_t* cmap;
+    int i;
+
+    if (!colormaps)
+        return false;
+    cmap = colormaps + level * 256;
+    slot = doom_tlut_fcm[n64_draw_idx];   // DEDICATED buffer (see decl) -- not doom_tlut_up
+    for (i = 0; i < 256; i++)
+        slot[i] = doom_tlut_master[cmap[i]];   // master[ colormap[L][i] ], software's chain
+    data_cache_hit_writeback(slot, sizeof(doom_tlut_fcm[0]));
     rdpq_tex_upload_tlut(slot, 0, 256);
     return true;
 }
