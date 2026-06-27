@@ -49,6 +49,19 @@ static boolean n64_palette_dirty;        // TLUT needs re-upload
 // until the scan runs; the scan asserts if no index is free.
 int n64_rdp_key_index = -1;
 boolean n64_present_copy_forward;        // wipe: copy presented frame into next draw buffer
+// RDP melt-wipe (mesh fix). The CI8 wipe melts screens[], which on the RDP path hold
+// only HUD + key-clear (the world is in the 16bpp fb), so it dissolves garbage. The
+// present (I_FinishUpdate) instead melts the COMPOSITED 16bpp frames captured here:
+// _start = the old frame (last shown), _end = the new frame (this present's composite).
+// The per-column drip uses the CI8 wipe's own offsets (F_N64WipeMeltY) so no extra
+// M_Random is consumed (demo determinism). 320*200*2 = 128 KB each -- Z_Malloc'd from
+// DOOM's zone (NOT static BSS / surface_alloc: that heap is exhausted at startup, the
+// same trap the mesh z-buffer hit, and 256 KB of BSS starved the CI8 surface_alloc).
+static uint16_t* n64_wipe16_start;
+static uint16_t* n64_wipe16_end;
+static int       n64_wipe16_state;       // 0 = idle, 1 = capturing/running
+static surface_t* n64_last_shown_disp;   // the 16bpp fb most recently display_show'd
+extern int* F_N64WipeMeltY(void);        // f_wipe.c: live per-column melt offsets, or NULL
 static byte* n64_aux_screens[3];
 static boolean n64_aux_screen_owned[3];
 // I_SetPalette writes the CPU-side master; the present path copies it into an
@@ -819,7 +832,10 @@ static void I_N64BufferDone(void* arg)
 #endif
 
     if (doom_screen8_disp[idx])
+    {
         display_show(doom_screen8_disp[idx]);
+        n64_last_shown_disp = doom_screen8_disp[idx];   // old frame for the RDP melt-wipe
+    }
     doom_screen8_rdp_busy[idx] = false;
 
 #if defined(N64_BENCH) && defined(RDPWAIT_PROBE)
@@ -1617,6 +1633,72 @@ void I_FinishUpdate(void)
                    N64Bench_FrameNo(), blk * 100 / tot);
     }
 #endif
+
+    // RDP MELT-WIPE (mesh fix). During a wipe the CI8 path melts screens[], which on
+    // the RDP renderer hold only the HUD + key-clear (the world lives in this 16bpp fb),
+    // so it dissolves garbage ("mangled rotated HUD"). Instead, melt the COMPOSITED 16bpp
+    // frames: snapshot the old (last-shown) and new (this present's composite) frames once,
+    // then each present dissolve old->new using the CI8 wipe's own per-column drip offsets
+    // (F_N64WipeMeltY) -- so no extra M_Random is consumed (demo-deterministic) and the
+    // 16bpp melt stays exactly in step with the CI8 melt that drives D_Display's loop.
+    // Only the PRESENTED pixels change. Off the wipe this whole block is a no-op.
+    if (!n64_wipe16_start)           // lazily reserve the two snapshots from DOOM's zone
+    {                                // (once; PU_STATIC). NULL if the zone is full -> the
+        n64_wipe16_start = (uint16_t*)Z_Malloc(SCREENWIDTH * SCREENHEIGHT * 2, PU_STATIC, 0);
+        n64_wipe16_end   = (uint16_t*)Z_Malloc(SCREENWIDTH * SCREENHEIGHT * 2, PU_STATIC, 0);
+    }
+    if (rdp_on && n64_wipe16_start && n64_wipe16_end &&
+        (n64_present_copy_forward || n64_wipe16_state))
+    {
+        int*       my  = F_N64WipeMeltY();           // CI8 melt offsets (NULL once ended)
+        int        s16 = (int)(disp->stride >> 1);
+        uint16_t*  d   = (uint16_t*)disp->buffer;    // cached write; one writeback below
+        int        x, yy;
+
+        rspq_wait();   // the composite (DL_Flush + keyed blit) into disp must be done
+                       // before the CPU reads/overwrites it; the wipe is not perf-path.
+
+        if (n64_present_copy_forward && n64_wipe16_state == 0)
+        {
+            // First wipe present: snapshot the new composite (disp) as the END frame and
+            // the previously shown fb as the START (old) frame. Read uncached: the RDP
+            // wrote these, the CPU's cached view may be stale.
+            const uint16_t* s = UncachedUShortAddr(disp->buffer);
+            for (yy = 0; yy < SCREENHEIGHT; yy++)
+                for (x = 0; x < SCREENWIDTH; x++)
+                    n64_wipe16_end[yy * SCREENWIDTH + x] = s[yy * s16 + x];
+            if (n64_last_shown_disp && n64_last_shown_disp->buffer)
+            {
+                const uint16_t* o = UncachedUShortAddr(n64_last_shown_disp->buffer);
+                int os16 = (int)(n64_last_shown_disp->stride >> 1);
+                for (yy = 0; yy < SCREENHEIGHT; yy++)
+                    for (x = 0; x < SCREENWIDTH; x++)
+                        n64_wipe16_start[yy * SCREENWIDTH + x] = o[yy * os16 + x];
+            }
+            else
+                memcpy(n64_wipe16_start, n64_wipe16_end, SCREENWIDTH * SCREENHEIGHT * 2);
+            n64_wipe16_state = 1;
+        }
+
+        // Compose the melt into disp: per column the top `off` rows show the NEW frame
+        // (revealed), the rest show the OLD frame scrolled DOWN by `off` (the drip). `off`
+        // is the CI8 wipe's offset for the 2px short-column this pixel belongs to. Once the
+        // wipe ends (copy_forward cleared, my == NULL) every column shows the full NEW frame.
+        for (x = 0; x < SCREENWIDTH; x++)
+        {
+            int off = my ? my[x >> 1] : SCREENHEIGHT;
+            if (off < 0) off = 0;
+            if (off > SCREENHEIGHT) off = SCREENHEIGHT;
+            for (yy = 0; yy < off; yy++)
+                d[yy * s16 + x] = n64_wipe16_end[yy * SCREENWIDTH + x];
+            for (yy = off; yy < SCREENHEIGHT; yy++)
+                d[yy * s16 + x] = n64_wipe16_start[(yy - off) * SCREENWIDTH + x];
+        }
+        data_cache_hit_writeback(disp->buffer, (uint32_t)disp->stride * SCREENHEIGHT);
+
+        if (!n64_present_copy_forward)
+            n64_wipe16_state = 0;   // wipe finished this present; disarm for the next one
+    }
 
     // Detach with a completion callback instead of a global rspq_wait(): the
     // CPU can render the next frame while the RDP reads this buffer. The

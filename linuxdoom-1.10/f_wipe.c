@@ -244,8 +244,21 @@ wipe_exitMelt
   int	ticks )
 {
     Z_Free(y);
+#ifdef N64
+    y = 0;          // so F_N64WipeMeltY reports "no active melt" after the wipe
+#endif
     return 0;
 }
+
+#ifdef N64
+// The RDP melt-wipe (i_video_n64.c) dissolves the COMPOSITED 16bpp framebuffers
+// instead of the CI8 screens[] (which on the RDP path hold only HUD + key-clear, not
+// the world). It reuses THIS melt's per-column drip offsets so it consumes no extra
+// M_Random (demo determinism) and stays perfectly in step with the loop's `done`.
+// Returns the live y[] (one int per width/2 short-column = 2 horizontal px), or NULL
+// when no melt is active.
+int* F_N64WipeMeltY(void) { return y; }
+#endif
 
 int
 wipe_StartScreen
