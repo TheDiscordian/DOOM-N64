@@ -11,6 +11,33 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: melt-wipe dissolved garbage on the RDP renderer ("mangled rotated HUD")
+- **Symptom:** the death->respawn (and every level-transition) melt wipe dissolved garbage
+  instead of the level -- the user: "hardware melts random garbage that looks like a mangled
+  rotated hud". Frame 3213 read 78-91% black (BENCH_VOID_SCAN).
+- **Root cause:** the vanilla wipe melts the CI8 `screens[]` (start=screens[2], end=screens[3],
+  out=screens[0]). On the RDP renderer the WORLD is in the 16bpp framebuffer, NOT CI8 --
+  `screens[]` hold only the HUD + the keyed-present key-clear. So the melt dissolved a
+  HUD-plus-key-clear buffer, and `wipe_shittyColMajorXform` transposes it column-major -> the
+  "rotated HUD" streaks (the user's read pinned it exactly).
+- **Wrong turns (do NOT retry):** (a) capturing the new (END) frame from `disp` AFTER the keyed
+  CI8 blit -- the blit overlays the melted `screens[0]` garbage onto the clean world, so END was
+  garbage and the melt dissolved the old level into it (capture FRAME-9224 showed the streaks).
+  (b) static-BSS melt buffers -- 256 KB of BSS starved the CI8 `surface_alloc` at boot
+  (I_InitGraphics I_Error'd); the documented exhausted-heap trap (see the mesh z-buffer).
+- **Repro:** any RSP-emit ROM, `BENCH_WIPE_FREEZE=1 BENCH_MARKS=1`; `scan-marks` captures the
+  melt mid-drip as frame-9208/9216/9224 (early/mid/late). Software ground truth frozen at
+  ref-sw-frozen/frame-92{08,16,24}.png.
+- **Resolution:** `9c48d22` + `2b1b9db`. Melt the COMPOSITED 16bpp frames in the present
+  (I_FinishUpdate): snapshot the new frame right after `DL_Flush` (clean world, pre-blit) as END
+  and the previously shown fb as START into two Z_Malloc'd 16bpp buffers, then each present
+  dissolve START->END straight into disp using the CI8 wipe's OWN per-column offsets
+  (F_N64WipeMeltY -- no extra M_Random, demo-deterministic, in lockstep with the loop's `done`).
+  Verified: death-respawn melts the reloaded E1M1 cleanly (frames 9208/9216/9224 match software
+  direction + content). Known minor edges: the boot title->demo wipe is black (that frame has
+  gametic==0 -> no world render -> END black), and the final melt frame's bottom 32px
+  (status-bar region, outside the scissored world flush) is one frame stale.
+
 ## FIXED: fixedcolormap (invuln / light-amp visor) ignored by the RDP renderer
 - **Symptom:** the powerup colormaps the player wears -- invulnerability's inverted
   grey-scale map and the light-amp visor's near-fullbright level -- did not affect the RDP
