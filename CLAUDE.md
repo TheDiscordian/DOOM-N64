@@ -206,10 +206,10 @@ revive the player; a kill-only corpse probe tests the wrong state.)
   full-demo RDP-vs-software sweep flagged ZERO frames on the plane-band MAD metric, but
   that averaged number undersold the palette-flash TINT match — a localized mismatch the
   mean buries (trust the eye, not the averaged number). RESOLVED in `d76a750` via a UNIFORM
-  screen-space flash overlay (Ryan's idea): under a flash the planes draw through the
+  screen-space flash overlay (the user's idea): under a flash the planes draw through the
   un-flashed BASE palette, then one translucent tint quad (alpha 5/8) is laid over the
   plane region — uniform like software's palette filter, killing the per-quad
-  `TEX0*SHADE`-multiply mismatch; Ryan-accepted ("good enough"). Not pixel-identical (a
+  `TEX0*SHADE`-multiply mismatch; user-accepted ("good enough"). Not pixel-identical (a
   linear blend ≈ the non-linear REDS palette remap) but uniform. The loop-hoist audit's one
   candidate (memoize shared band-corner un-projections) sized BELOW jitter (92% of runs
   single-band, ~7µs) → not landed, confirming the ceiling. Perf-wise it sits at the **CPU ceiling** — every perf lever is measured to a hard

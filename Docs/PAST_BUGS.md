@@ -12,7 +12,7 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 ---
 
 ## FIXED: RSP-emit black SEAM at the wall-floor junction (mesh wall bottom not biased to cover)
-- **Symptom:** a thin BLACK line at every wall-floor junction (Ryan, ~17 frames) -- "where the
+- **Symptom:** a thin BLACK line at every wall-floor junction (the user, ~17 frames) -- "where the
   planes meet the walls should connect better". The RDP floor plane and the mesh wall bottom
   don't overlap; the per-frame black colour-clear shows in the gap.
 - **Root cause:** the mesh wall bottom projects to the floor-height pixel CENTER (~yh+0.5); the
@@ -26,13 +26,13 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 - **Resolution (`35451d8`):** in DL_FlushRSPEmit, bias each wall's final (post-clip) bottom
   corners down 1px and recompute the band-emit slopes so overlay B reconstructs the extended
   bottom. Verified: junction near-black dropped on 31/32 frames (1664 5.4->3.1%, 4096 19.5->10.8%),
-  zoomed A/B shows the line gone with no texture bleed; Ryan-confirmed.
+  zoomed A/B shows the line gone with no texture bleed; user-confirmed.
 
 ---
 
 ## FIXED: RSP-emit up-close MOTION SMEAR / whole-view ghost (world-render gate drops RSP-emit-only frames)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, "up-close it OFTEN SMEARS EVERYTHING too,
-  including the gun/smoke" (Ryan) -- MOTION-dependent (only while the player moves; static
+  including the gun/smoke" (the user) -- MOTION-dependent (only while the player moves; static
   frames fine). Separate from the wall-texture warp.
 - **Wrong turns (do NOT retry):** the "stale CI8 sprite/smoke pixels" theory (4 independent
   readers all gave it) is REFUTED -- `I_N64KeyClearView` (i_video_n64.c:1184-1228, called every
@@ -70,7 +70,7 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ## FIXED: RSP-emit wall-texture WARP (diagonal arcing bands on clipped receding walls)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, wall textures "draw, they just warp a
-  lot" (Ryan) — visible while standing still, animating only as the player moves. On a
+  lot" (the user) — visible while standing still, animating only as the player moves. On a
   receding wall a flat texture sprouts bright **diagonal arcing bands** ("triangles appear
   and pull the texture in weird directions"). Worst on long receding / near-the-camera walls.
 - **Bisection (decisive):** built RSP-transform + **CPU-emit** vs RSP-transform + **RSP-emit**
@@ -102,7 +102,7 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ## FIXED: RSP-emit close-wall BLACK VOID (near-clipped wall → off-screen Y → RDP overflow)
 - **Symptom:** under `BENCH_FORCE_MESH_RSP_EMIT`, walls "USUALLY render correctly, but
-  sometimes on some angles OR up close weird things start to happen" (Ryan). Up close / in a
+  sometimes on some angles OR up close weird things start to happen" (the user). Up close / in a
   corridor, the big close wall(s) that should fill the view render as a BLACK VOID. Bench
   frames 256 + 384 reproduce it (the demo walks into a corridor).
 - **Root cause (TWO layers):**
@@ -178,12 +178,12 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 - **Resolution:** `3230e77` (the 3 BLACK-wall fixes), `6108bcd` (T-banding), `ac413f8`
   (lighting), `7226518`+`4b61395` (S-span split, blkw-aware), `29cd5b9` (empty-band
   elision). Result: textured/lit/correct, 16616/28384 us avg/p95 vs software 19860/31840
-  (-16.3%/-10.8%). Viewpoint-dependent close-wall still pending Ryan's interactive drive.
+  (-16.3%/-10.8%). Viewpoint-dependent close-wall still pending the user's interactive drive.
 
 ---
 
 ## FIXED: HUD/status-bar shimmers after death (post-respawn arms-number flicker)
-- **Symptom:** the status bar flickers once the player dies. Ryan: "ONLY after death,
+- **Symptom:** the status bar flickers once the player dies. the user: "ONLY after death,
   maybe it just needs to be redrawn after respawn". Localised: the **arms-number digits**
   (the grey "2 3 4 / 5 6 7" grid, x=111-138 y=172-187) shimmer between grey shades at
   present rate. Single-player respawn **reloads the level** (`G_DoReborn`, g_game.c:
@@ -227,7 +227,7 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
   `I_N64SyncRegionToOtherBuffer`).
 
 ## FIXED: mesh walls render geometry that is behind them (usually mid-screen)
-- **Symptom (Ryan):** some geometry, usually in the middle, renders what's behind it.
+- **Symptom (the user):** some geometry, usually in the middle, renders what's behind it.
 - **Root cause:** `DL_MeshDrawWalls` painted walls in painter's order sorted by the
   NEAREST corner depth (`min(dA,dB)`). That key is only an approximation: two walls whose
   depth ranges overlap mis-order in the columns where the far-by-nearest-corner wall is

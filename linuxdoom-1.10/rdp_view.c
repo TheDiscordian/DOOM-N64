@@ -146,10 +146,10 @@ extern int viewwindowy; // r_draw.c
 // sees N64Bench_FrameNo() == N-1 (committed-so-far), so dump when the counter is
 // FRAME-1 to pair the lines with `BENCH_MARK frame=FRAME`. 0 disables a slot.
 #ifndef PLANE_UV_TRACE_FRAME
-#define PLANE_UV_TRACE_FRAME  128   // garbage frame (Ryan)
+#define PLANE_UV_TRACE_FRAME  128   // garbage frame (the user)
 #endif
 #ifndef PLANE_UV_TRACE_FRAME2
-#define PLANE_UV_TRACE_FRAME2 384   // clean frame (Ryan); 0 to dump one frame
+#define PLANE_UV_TRACE_FRAME2 384   // clean frame (the user); 0 to dump one frame
 #endif
 #ifndef PLANE_UV_TRACE_POLYS
 #define PLANE_UV_TRACE_POLYS  16    // dump at most this many polys per frame (high
@@ -703,7 +703,7 @@ static void DL_BuildSubPalette(int texnum, dl_rowmajor_t* slot)
 // tinting the master 256-TLUT via I_SetPalette; CI8 sprites/planes/HUD sample
 // the master so they flash. CI4 walls sample their OWN 16-entry sub-palettes,
 // built ONCE from the BASE PLAYPAL and never re-tinted -> walls stayed un-flashed
-// (Ryan: "the red that washes over everything doesn't hit the walls anymore").
+// (the user: "the red that washes over everything doesn't hit the walls anymore").
 //
 // FIX: when the palette generation changes (a real flash, not the wall pass's own
 // forced re-upload), re-derive each initialized sub-palette's 16 RGBA5551 entries
@@ -753,7 +753,7 @@ static void DL_RetintSubPalettes(void)
 // the one-quad fits_hw class). But halving width is a horizontal box-filter:
 // SAFE on art whose merged column pairs were already near-identical, a visible
 // SMEAR on art with fine vertical structure (COMPUTE2's computer bank, STARTAN3's
-// metallic striping, TEKWALL's circuitry). Ryan accepted CI4 COLOUR quantization,
+// metallic striping, TEKWALL's circuitry). the user accepted CI4 COLOUR quantization,
 // NOT resolution loss on the detailed wides -- so the downsample is DECIDED PER
 // TEXTURE from the texture's own loss under halving, conservative (when in doubt,
 // native).
@@ -818,7 +818,7 @@ static int DL_DownsampleErr(int texnum, int tw, int th)
 // visually safe; above it the wide stays NATIVE. Calibrated conservatively from
 // the routed wall set (DL_DS_DIAG build). This gate governs SUB-256 textures only
 // (>=256-wides are decided earlier by the protect boundary + dl_downsample2x_names,
-// NOT by this threshold). The sub-256 detail Ryan named -- STARTAN3 (128, metallic
+// NOT by this threshold). The sub-256 detail the user named -- STARTAN3 (128, metallic
 // striping), TEKWALL (circuit accents) -- scores above it (fine vertical structure
 // destroyed by a column-pair merge); large flat/low-frequency sub-256 wides score
 // below. NB: COMPUTE2 (256-wide) is INTENTIONALLY 2x-halved via the HALF list, not
@@ -1054,11 +1054,11 @@ static byte* DL_RowMajorBlock(int texnum, int* out_h, int* out_w)
     // (DL_DownsampleErr for sub-256; the protect boundary + dl_downsample2x_names for
     // >=256-wides), conservative -- when in doubt, native:
     //   - STARTAN3 (128, metallic striping), TEKWALL (circuit accents): high HF and
-    //     sub-256, so the error gate keeps them NATIVE -- no resolution loss. Ryan
+    //     sub-256, so the error gate keeps them NATIVE -- no resolution loss. the user
     //     rejected the blanket downsample (038c7f3/e94c39a) on exactly these.
     //   - COMPUTE2 / the other dl_downsample2x_names >=256-wides: INTENTIONALLY 2x
     //     (256->128, the HALF tier) -- a deliberate load/fidelity tradeoff agreed with
-    //     Ryan. NOT native; earlier comments that called COMPUTE2 native were stale.
+    //     the user. NOT native; earlier comments that called COMPUTE2 native were stale.
     //   - Large flat/low-frequency sub-256 wides: low HF -> halve S (the box-average
     //     lands between two near-equal columns, no visible smear), recovering loads.
     //
@@ -1549,7 +1549,7 @@ static void DL_BuildPrimLUT(void)
 // flash applied TWICE. Two sub-1.0 multiplies darken the result and, because a
 // multiply preserves the texel's channel ratios instead of remapping the index
 // like software's single palette swap, the flat's base green/brown hue bleeds
-// through (Ryan's "RDP floor keeps its texture hue where software is a fuller,
+// through (the user's "RDP floor keeps its texture hue where software is a fuller,
 // uniform red", frame 2048). Software's flashed floor is ONE remap:
 // master_tlut[ colormap[level][texel] ] -- the wash applied a single time to the
 // already-light-darkened index.
@@ -2046,7 +2046,7 @@ void DL_RouteCapture(int tier, int x, int yl, int yh, fixed_t scale,
 //
 // S: the floor admits the sub-texel residue of projective math; the adaptive
 // term (DL_SPLIT_SCOEF * local per-column S step) admits the half-column anchor
-// uncertainty at glancing minification. Ryan ACCEPTED the CI4 glancing look, so
+// uncertainty at glancing minification. the user ACCEPTED the CI4 glancing look, so
 // the floor is RAISED 1.5 -> 2.0 texels: a glancing wall whose projective S
 // already tracks software within ~2 texels no longer shatters into extra
 // sub-pieces (each split is +1 record = +2 triangles + dlbuild). The look comes
@@ -4534,7 +4534,7 @@ static void DL_FlushPlanePolys(void)
     if (dl_ppoly_count <= 0)
         return;
 
-    // PLANE DAMAGE-FLASH CORRECTNESS (screen-space uniform tint, Ryan's design).
+    // PLANE DAMAGE-FLASH CORRECTNESS (screen-space uniform tint, the user's design).
     // The plane CI8 TEX0 samples the RESIDENT master TLUT, which is the FLASHED
     // palette -- so under a flash the planes pick up the wash as a per-pixel
     // TEX0-multiply, which preserves each texel's channel ratios instead of doing
@@ -5389,7 +5389,7 @@ void DL_Flush(void)
     // in DL_MeshDrawWalls keys on each wall's NEAREST corner, which is only an
     // approximation of true depth. Two walls whose depth ranges overlap mis-order in
     // the columns where the far-by-nearest-corner wall is actually in front -- it gets
-    // overwritten and the geometry behind it shows through (Ryan's "geometry in the
+    // overwritten and the geometry behind it shows through (the user's "geometry in the
     // middle renders what's behind it"). Z-test fixes it per pixel. The z-image is
     // already attached + cleared every mesh frame (i_video_n64.c), and the RDP sits
     // idle (rdpbusy ~5us), so the per-pixel z cost barely touches the CPU-bound frame.

@@ -125,7 +125,7 @@ every frame; residual `mismatch` is sub-pixel fixed-point-vs-float (~1px, emit d
   in isolation — measuring one phase hid the dispatch cost (same trap as the early Z-buffer "loss").
 
 **Still GATED behind `BENCH_FORCE_MESH_RSP`.** To bank the −6% in the shipped build, the RSP path
-must go default-on — a Ryan call, since the fixed-point transform differs from the CPU float path
+must go default-on — a the user call, since the fixed-point transform differs from the CPU float path
 by ~1px sub-pixel (emit decisions agree, so no walls appear/vanish). Next: extend the same
 compaction to the floor-leaf transform (Phase 4), then evaluate default-on.
 
