@@ -264,9 +264,27 @@ dlbuild block — moving the per-vertex projection AND the fan emit to the RSP s
 folds the geometry. Net win is the hypothesis to MEASURE once built (some of the 3289 — flat
 sort + TMEM binds — stays CPU; the RSP emit adds RSP time the idle RDP `rdpbusy`=5µs absorbs).
 
-### 8.5 The leaf EMIT — overlay-B `LeafFan`, fully designed, NOT yet built (2026-06-27)
-The remaining keystone. Inputs de-risked (depth bit-exact, the engine Z/W convention, the cy
-projection sequence = wall `ytop` at rsp_dlwall.S:1088, rspq 24-bit-arg-0 plumbing). Plan:
+### 8.5 The leaf EMIT — overlay-B, BUILT + working (2026-06-27, commit b3dc11e)
+DONE. No-readback floor emit renders textured/lit/depth-correct floors at 60 VPS, matching the
+CPU reference A/B across E1M1. Two deviations from the original plan below:
+- **Batched, not per-leaf.** The emit is `DLEmitCmd_LeafBatch` (one rspq command per flat) that
+  loops internally over a CPU-built descriptor array (`rsp_leaf_desc_t`: rec_addr, hf16, light,
+  packed) and drains the RDP buffer ONCE at the end -- mirroring the proven wall
+  `DLEmitCmd_Batch`. The first cut used a per-leaf `DLEmitCmd_LeafFan` (one `Send_End` per
+  ~2-tri leaf); that was replaced because per-leaf granularity is the wrong shape (and masked
+  the real bug below).
+- **The cpp-comment DMEM trap.** `rsp_dlemit.S` is cpp-processed. `#define LEAF_EMIT_MAXV 16  #
+  comment` leaks the trailing `# comment` into the macro body, so `.ds.b LEAF_EMIT_MAXV *
+  LEAF_REC_BYTES` truncates to `.ds.b 16` -- LREC_BUF/LVBUF/LDESC_BUF were allocated 16 bytes
+  instead of 512/576/256. Each leaf's n*32-byte record DMA overflowed adjacent DMEM, desyncing
+  the rspq command stream (RSP drifts onto a zero word = cmd 0 = WaitNewInput, idles before the
+  buffer terminator -> CPU `rspq_next_buffer` times out 200ms on BUFDONE -> false "crash" with
+  the RSP and RDP both idle/clean). NEVER put a trailing `#` comment on a numeric `#define` used
+  in a `.ds.b`/arithmetic expression -- comment on the line above.
+
+Original design (still accurate for the per-vert math), de-risked inputs: depth bit-exact, the
+engine Z/W convention, the cy projection sequence = wall `ytop` at rsp_dlwall.S:1088, rspq
+24-bit-arg-0 plumbing. Plan as built:
 - **overlay B (`rsp_dlemit.S`):** add `MulIntVU` (centerx·ratio; the one helper B lacks —
   3 instr, tail-calls FixedMulVU). Add `DLEmitCmd_LeafView` (set frame-constant centerx/centery
   into persistent DMEM) + `DLEmitCmd_LeafFan`: DMA the leaf's records, per vert compute
