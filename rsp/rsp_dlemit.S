@@ -60,7 +60,7 @@ RSPQ_BeginOverlayHeader
     RSPQ_DefineCommand DLEmitCmd_Batch, 16   # 0x00: (batch_out, count, band_t_lo, band_t_hi)
 #ifdef BENCH_FORCE_MESH_LEAF_EMIT
     RSPQ_DefineCommand DLEmitCmd_LeafView, 8  # 0x01: (centerx[a0,masked], centery[a1])
-    RSPQ_DefineCommand DLEmitCmd_LeafFan, 16  # 0x02: (rec_addr[a0], hf16[a1], light[a2], packed[a3])
+    RSPQ_DefineCommand DLEmitCmd_LeafBatch, 8 # 0x02: (desc_array[a0], leaf_count[a1])
 #endif
 RSPQ_EndOverlayHeader
 
@@ -141,7 +141,11 @@ VSCRATCH:  .ds.b 32
 #define LRO_v     0x14
 #define LRO_emit  0x18
 #define LEAF_REC_BYTES 32
-#define LEAF_EMIT_MAXV 16           # per-leaf vert cap (observed maxverts=8); CPU skips bigger
+# per-leaf vert cap (observed maxverts=8); CPU skips bigger. NOTE: no trailing '#'
+# comment on this #define -- the .S is cpp-processed, so a trailing comment leaks into
+# the macro body and comments out the rest of any "LEAF_EMIT_MAXV * X" expression
+# (silently under-allocating LREC_BUF/LVBUF to 16 bytes -> DMEM overflow + RSP desync).
+#define LEAF_EMIT_MAXV 16
 # Screen-X cull window in 16.16, matching the CPU leaf cull [-2048, SCREENWIDTH+2048] px.
 # The RSP transform already set emit=0 for these; LeafFan culls the whole leaf if any vert is.
     .align 3
@@ -161,7 +165,25 @@ LF_recptr:  .word 0     # DMEM cursor into LREC_BUF for the current vertex
 LF_vbufdst: .word 0     # LVBUF slot StageLeafVtx is writing
 LF_cyval:   .word 0     # parked cy (DMEM, NOT an s-reg -- the engine owns s2..s6)
 LF_drop:    .word 0     # set if any vert's cy projects off-screen -> drop the whole leaf
+LF_cross:   .word 0     # parked half of the edge cross-product (degenerate-area test)
 LF_ra:      .word 0     # saved ra across StageLeafVtx
+
+# ---- LeafBatch loop state: one rspq command emits a whole flat's leaves, draining the
+# RDP buffer ONCE at the end (per-leaf Send_End granularity broke the RSP). Descriptor
+# layout (LDESC_BYTES=16, MUST match rsp_leaf_desc_t in rdp_view.c): rec_addr, hf16,
+# light, packed(n|ubias|vbias).
+#define LDESC_BYTES 16
+# leaves DMA'd per chunk. NO trailing '#' comment (see LEAF_EMIT_MAXV) -- it would
+# comment out "* LDESC_BYTES" and under-allocate LDESC_BUF.
+#define LBATCH_N 16
+    .align 3
+LDESC_BUF:  .ds.b LBATCH_N * LDESC_BYTES   # descriptor chunk DMA'd back in
+LB_outrd:   .word 0     # RDRAM read cursor into the descriptor array
+LB_remain:  .word 0     # leaves left in the batch
+LB_chunk:   .word 0     # leaves in the current DMEM chunk
+LB_idx:     .word 0     # leaf index within the chunk
+LB_descptr: .word 0     # DMEM ptr into LDESC_BUF for the current leaf
+LB_leafra:  .word 0     # saved ra across EmitLeaf (the engine calls clobber ra)
 #endif
 
     .text
@@ -252,16 +274,82 @@ DLEmitCmd_LeafView:
     sw   a1, %lo(LV_centery)     # (delay)
 
 # ============================================================================
-# DLEmitCmd_LeafFan -- a0 = leaf records RDRAM addr (id byte masked by the DMA),
-# a1 = hf16 (surfaceheight-viewz, 16.16), a2 = packed light, a3 = packed
-# (n[5:0] | (ubias/64+512)[15:6] | (vbias/64+512)[25:16]). Emits the leaf's fan:
-# n verts -> n-2 tris via the engine, with cy/S/T computed on the RSP. The whole leaf
-# is dropped if any vert's emit==0 (behind near plane or off-screen) -- the CPU leaf
-# path culls the same way and the no-readback CPU can't, so the cull moves here.
+# DLEmitCmd_LeafBatch -- a0 = leaf descriptor array RDRAM addr, a1 = leaf count.
+# DMA the descriptors back in LBATCH_N at a time and EmitLeaf each one, draining the
+# RDP command buffer ONCE for the whole flat (j RDPQ_Triangle_Send_End at the end --
+# NOT per leaf). The per-leaf-command granularity (one Send_End per ~2-tri leaf, ~100
+# tiny commands a frame) overran the RDP buffer and broke the RSP at a random PC. This
+# mirrors the proven wall DLEmitCmd_Batch: one command, internal loop, one Send_End.
+# Descriptor (LDESC_BYTES=16): rec_addr, hf16, light, packed(n|ubias|vbias).
 # ============================================================================
-DLEmitCmd_LeafFan:
-    sw   a1, %lo(LF_hf)
-    sw   a2, %lo(LF_light)
+DLEmitCmd_LeafBatch:
+    sw   a0, %lo(LB_outrd)
+    sw   a1, %lo(LB_remain)
+LBChunkLoop:
+    lw   t4, %lo(LB_remain)
+    blez t4, LBDone
+    nop
+    li   t5, LBATCH_N
+    sltu t3, t4, t5
+    beqz t3, 1f
+    nop
+    move t5, t4                  # chunk = remain (remain < LBATCH_N)
+1:  sw   t5, %lo(LB_chunk)
+    # ---- DMA this chunk of descriptors in: chunk * LDESC_BYTES ----
+    sll  t6, t5, 4               # chunk * 16
+    addiu t6, t6, -1             # DMA width word = byte_count - 1
+    andi t0, t6, 0xFFF
+    li   s4, %lo(LDESC_BUF)
+    lw   s0, %lo(LB_outrd)
+    jal  DMAIn
+    nop
+    # ---- per-leaf emit over the chunk ----
+    sw   zero, %lo(LB_idx)
+    li   t0, %lo(LDESC_BUF)
+    sw   t0, %lo(LB_descptr)
+LBLeafLoop:
+    lw   t0, %lo(LB_idx)
+    lw   t5, %lo(LB_chunk)
+    bge  t0, t5, LBChunkNext
+    nop
+    jal  EmitLeaf
+    nop
+    lw   t0, %lo(LB_idx)
+    addiu t0, t0, 1
+    sw   t0, %lo(LB_idx)
+    lw   t1, %lo(LB_descptr)
+    addiu t1, t1, LDESC_BYTES
+    sw   t1, %lo(LB_descptr)
+    j    LBLeafLoop
+    nop
+LBChunkNext:
+    lw   t5, %lo(LB_chunk)
+    lw   t1, %lo(LB_outrd)
+    sll  t6, t5, 4               # chunk * 16 -> advance the RDRAM read cursor
+    addu t1, t1, t6
+    sw   t1, %lo(LB_outrd)
+    lw   t1, %lo(LB_remain)
+    subu t1, t1, t5
+    j    LBChunkLoop
+    sw   t1, %lo(LB_remain)      # (delay)
+LBDone:
+    # ONE drain for the whole flat's batch, then back to the queue engine.
+    j    RDPQ_Triangle_Send_End
+    li   ra, %lo(RSPQ_Loop)      # (delay)
+
+# ---- EmitLeaf: emit ONE leaf's fan (n verts -> n-2 tris) via the engine, cy/S/T computed
+# on the RSP. LBLeafLoop sets LB_descptr -> the 16-byte descriptor. Returns via ra (saved
+# in LB_leafra; the engine/DMA calls clobber ra) WITHOUT Send_End -- the batch drains once.
+# The whole leaf is dropped (early return) if any vert's emit==0 (behind near) or projects
+# off-screen -- the CPU leaf path culls the same way and the no-readback CPU can't.
+EmitLeaf:
+    sw   ra, %lo(LB_leafra)
+    lw   t9, %lo(LB_descptr)
+    lw   t0, 4(t9)               # hf16 (surfaceheight - viewz, 16.16)
+    sw   t0, %lo(LF_hf)
+    lw   t0, 8(t9)               # packed light -> vertex SHADE
+    sw   t0, %lo(LF_light)
+    lw   a3, 12(t9)              # packed (n | ubias/64+512 | vbias/64+512)
     andi t0, a3, 0x3F            # n
     sw   t0, %lo(LF_n)
     srl  t1, a3, 6
@@ -280,7 +368,8 @@ DLEmitCmd_LeafFan:
     addiu t6, t6, -1             # DMA width = bytes - 1
     andi t0, t6, 0xFFF
     li   s4, %lo(LREC_BUF)
-    move s0, a0                  # records RDRAM addr (DMA masks the id byte)
+    lw   s0, %lo(LB_descptr)
+    lw   s0, 0(s0)               # rec_addr (clean phys addr from the descriptor)
     jal  DMAIn
     nop
     # ---- cull pass: drop the whole leaf if ANY vert is behind the near plane (emit==0)
@@ -291,16 +380,16 @@ DLEmitCmd_LeafFan:
     li   t0, %lo(LREC_BUF)
 LeafCullChk:
     lw   t1, LRO_emit(t0)
-    beqz t1, LeafFanRet          # behind near plane
+    beqz t1, EmitLeafRet          # behind near plane
     nop
     lw   t1, LRO_cx(t0)
     lui  t2, 0xFC00              # -1024<<16  (-0x04000000)
     slt  t4, t1, t2
-    bnez t4, LeafFanRet          # cx < -1024 px
+    bnez t4, EmitLeafRet          # cx < -1024 px
     nop
     lui  t2, 0x0540              # (320+1024)<<16  (0x05400000)
     slt  t4, t2, t1
-    bnez t4, LeafFanRet          # cx > 1344 px
+    bnez t4, EmitLeafRet          # cx > 1344 px
     nop
     addiu t0, t0, LEAF_REC_BYTES
     addiu t5, t5, -1
@@ -333,7 +422,7 @@ LeafStageLoop:
     nop
 LeafStageDone:
     lw   t0, %lo(LF_drop)
-    bnez t0, LeafFanRet          # any vert's cy off-screen -> drop the whole leaf
+    bnez t0, EmitLeafRet          # any vert's cy off-screen -> drop the whole leaf
     nop
     # ---- fan: emit (LVBUF[0], LVBUF[i], LVBUF[i+1]) for i = 1 .. n-2 ----
     li   t0, 1
@@ -342,39 +431,51 @@ LeafFanLoop:
     lw   t0, %lo(LF_i)
     lw   t1, %lo(LF_n)
     addiu t1, t1, -1             # last apex tri uses i = n-2
-    bge  t0, t1, LeafFanRet
+    bge  t0, t1, EmitLeafRet
     nop
     sll  t2, t0, 5              # i * 32
     sll  t3, t0, 2             # i * 4   (EMIT_VTX_SIZE = 36 = 32 + 4)
     addu t2, t2, t3            # i * 36
-    li   a1, %lo(LVBUF + 0*EMIT_VTX_SIZE)
-    li   a2, %lo(LVBUF)
-    addu a2, a2, t2            # LVBUF + i*36
-    addiu a3, a2, EMIT_VTX_SIZE # LVBUF + (i+1)*36
-    # skip a DEGENERATE tri (two coincident screen verts -> the engine's edge setup divides
-    # by zero -> a malformed command -> RDPQ_ASSERT_SEND_INVALID_SIZE). The convex leaf bake
-    # (Sutherland-Hodgman) can emit duplicate verts; the CPU rdpq_triangle drops these, the
-    # raw engine does not. Compare the packed XY word (VTX_ATTR_XY at offset 0).
-    lw   t6, 0(a1)
-    lw   t7, 0(a2)
-    beq  t6, t7, LeafFanCont
+    li   t4, %lo(LVBUF + 0*EMIT_VTX_SIZE)   # v0 ptr (t4..t6 survive FixedMulVU: preserves t0-t6)
+    li   t5, %lo(LVBUF)
+    addu t5, t5, t2            # vi   ptr = LVBUF + i*36
+    addiu t6, t5, EMIT_VTX_SIZE # vi+1 ptr
+    # skip a DEGENERATE (zero / near-zero AREA) tri: the raw rsp_rdpq_tri engine divides in its
+    # edge setup and emits a malformed command (RDPQ_ASSERT_SEND_INVALID_SIZE) for collinear or
+    # coincident verts -- the convex leaf bake + grazing-angle projection produce these; the CPU
+    # rdpq_triangle drops them, the engine does not. cross = (X1-X0)(Y2-Y0) - (X2-X0)(Y1-Y0),
+    # |cross| ~= 32*area_px. X = signed high half of VTX_ATTR_XY (off 0), Y = low half (off +2);
+    # (d<<8) lets the 16.16 FixedMulVU do an integer*integer product ((a<<8)(b<<8)>>16 = a*b).
+    lh   t0, 0(t5)            # X1
+    lh   t1, 0(t4)            # X0
+    subu a3, t0, t1
+    sll  a3, a3, 8            # (X1-X0)<<8
+    lh   t0, 2(t6)            # Y2
+    lh   t1, 2(t4)            # Y0
+    subu s7, t0, t1
+    jal  FixedMulVU
+    sll  s7, s7, 8            # (delay) (Y2-Y0)<<8 ; v1 = (X1-X0)(Y2-Y0)
+    sw   v1, %lo(LF_cross)
+    lh   t0, 0(t6)            # X2
+    lh   t1, 0(t4)            # X0
+    subu a3, t0, t1
+    sll  a3, a3, 8            # (X2-X0)<<8
+    lh   t0, 2(t5)            # Y1
+    lh   t1, 2(t4)            # Y0
+    subu s7, t0, t1
+    jal  FixedMulVU
+    sll  s7, s7, 8            # (delay) (Y1-Y0)<<8 ; v1 = (X2-X0)(Y1-Y0)
+    lw   t0, %lo(LF_cross)
+    subu t0, t0, v1          # cross
+    bgez t0, 1f
     nop
-    lw   t8, 0(a3)
-    beq  t7, t8, LeafFanCont
+    subu t0, zero, t0        # |cross|
+1:  sltiu t1, t0, 32         # |cross| < 32 (area < ~1px^2) -> degenerate
+    bnez t1, LeafFanCont
     nop
-    beq  t6, t8, LeafFanCont
-    nop
-    # ALSO skip a ZERO-HEIGHT tri (all 3 verts on one scanline -> the engine's major-edge
-    # slope dx/dy divides by dy==0 -> malformed command). Common for floor leaves projected
-    # at a grazing angle. Y is the signed low halfword of VTX_ATTR_XY (offset +2).
-    lh   t6, 2(a1)
-    lh   t7, 2(a2)
-    bne  t6, t7, LfEmit          # Y0 != Y1 -> non-zero height, emit
-    nop
-    lh   t8, 2(a3)
-    beq  t6, t8, LeafFanCont     # Y0 == Y1 == Y2 -> zero height, skip
-    nop
-LfEmit:
+    move a1, t4
+    move a2, t5
+    move a3, t6
     li   a0, EMIT_TRICMD
     li   v0, 2                   # culling disabled (orientation handled by the fan)
     li   s3, %lo(EMIT_STAGING)
@@ -386,9 +487,11 @@ LeafFanCont:
     sw   t0, %lo(LF_i)
     j    LeafFanLoop
     nop
-LeafFanRet:
-    j    RDPQ_Triangle_Send_End
-    li   ra, %lo(RSPQ_Loop)      # (delay)
+EmitLeafRet:
+    # back to the batch loop -- NOT Send_End (DLEmitCmd_LeafBatch drains once at the end).
+    lw   ra, %lo(LB_leafra)
+    jr   ra
+    nop
 
 # ---- StageLeafVtx: record at LF_recptr -> staged vertex at LF_vbufdst (LVBUF slot) ------
 # Computes the per-surface screen-Y + period-biased S/T, then the shared StageVtx packs the

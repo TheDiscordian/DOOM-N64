@@ -2482,8 +2482,17 @@ DEFINE_RSP_UCODE(rsp_dlemit);
 static uint32_t rsp_dlemit_ovl_id = 0;
 #define DLEMIT_CMD_BATCH 0     // (batch_out_RDRAM, count) -- matches rsp_dlemit.S header
 #ifdef BENCH_FORCE_MESH_LEAF_EMIT
-#define DLEMIT_CMD_LEAFVIEW 1  // (centerx, centery) -- set once per frame
-#define DLEMIT_CMD_LEAFFAN  2  // (leaf_rec_RDRAM, hf16, light, packed(n|ubias|vbias))
+#define DLEMIT_CMD_LEAFVIEW  1  // (centerx, centery) -- set once per frame
+#define DLEMIT_CMD_LEAFBATCH 2  // (desc_array_RDRAM, leaf_count) -- one cmd per flat
+// Per-leaf descriptor the RSP DMAs in (LDESC_BYTES=16 in rsp_dlemit.S). One LeafBatch
+// command emits a whole flat's leaves and drains the RDP buffer ONCE -- per-leaf
+// commands (one Send_End per ~2-tri leaf) overran the buffer and broke the RSP.
+typedef struct {
+    uint32_t rec_addr;  // PhysicalAddr(&leaf_out_buf[slot]) -- the leaf's records
+    uint32_t hf16;      // surfaceheight - viewz (16.16)
+    uint32_t prim;      // packed RGBA light -> vertex SHADE
+    uint32_t packed;    // n[5:0] | (ubias/64+512)[15:6] | (vbias/64+512)[25:16]
+} rsp_leaf_desc_t;
 #endif
 #endif
 
@@ -4956,6 +4965,10 @@ static void DL_RSPLeafDrain(int wall_nvis)
 // via DMA and emits the fan -- the CPU NEVER folds the geometry. The CPU only does what stays
 // cheap on it: sort leaves by flat (bind each flat's TMEM once), then per leaf-surface fire
 // LeafFan with the live height/light + the static S/T bias. Caller has set TILE0 + Z-mode.
+// One flat's leaf descriptors, built per flat then DMA'd to the RSP in a single LeafBatch.
+// 16-byte aligned for the RSP DMA; cache-flushed before each dispatch.
+static rsp_leaf_desc_t leaf_desc_buf[2048] __attribute__((aligned(16)));
+
 static void DL_LeafRSPEmitFlush(void)
 {
     int surf;
@@ -5010,6 +5023,9 @@ static void DL_LeafRSPEmitFlush(void)
             }
             rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);   // engine bypasses auto-upload
 
+            // Build this flat's leaf descriptors, then emit them ALL in one LeafBatch so the
+            // RSP drains the RDP buffer once (per-leaf Send_End broke the RSP).
+            int nd = 0;
             for (vi = 0; vi < nvis; vi++)
             {
                 bake_leaf_t* lf = &bake_leaves[vis[vi]];
@@ -5020,22 +5036,33 @@ static void DL_LeafRSPEmitFlush(void)
 
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx)
                     continue;
+                if (nd >= (int)(sizeof leaf_desc_buf / sizeof leaf_desc_buf[0])) break;
                 n    = lf->numverts;
                 sec  = &sectors[lf->sector];
                 hf16 = (surf ? sec->ceilingheight : sec->floorheight) - viewz;  // live height
                 lvl  = (255 - sec->lightlevel) >> 3;
                 if (lvl < 0) lvl = 0;
                 if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
-                prim = dl_prim_lut[lvl];                // -> LeafFan a2 -> vertex SHADE
+                prim = dl_prim_lut[lvl];                // -> vertex SHADE
                 ub64 = (lf->ubias >> 6) + 512;          // ubias/64 (multiple of 64) biased +512
                 vb64 = (lf->vbias >> 6) + 512;
                 packed = (uint32_t)(n & 0x3F)
                        | ((uint32_t)(ub64 & 0x3FF) << 6)
                        | ((uint32_t)(vb64 & 0x3FF) << 16);
-                rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFFAN,
-                           PhysicalAddr(&leaf_out_buf[leaf_rsp_slot[lf->firstvert]]),
-                           (uint32_t)hf16, prim, packed);
+                leaf_desc_buf[nd].rec_addr =
+                    PhysicalAddr(&leaf_out_buf[leaf_rsp_slot[lf->firstvert]]);
+                leaf_desc_buf[nd].hf16   = (uint32_t)hf16;
+                leaf_desc_buf[nd].prim   = prim;
+                leaf_desc_buf[nd].packed = packed;
+                nd++;
                 drew += n - 2;
+            }
+            if (nd > 0)
+            {
+                data_cache_hit_writeback(leaf_desc_buf,
+                                         (uint32_t)((size_t)nd * sizeof(rsp_leaf_desc_t)));
+                rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFBATCH,
+                           PhysicalAddr(leaf_desc_buf), (uint32_t)nd);
             }
         }
     }
