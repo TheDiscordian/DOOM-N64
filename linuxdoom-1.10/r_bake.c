@@ -28,7 +28,7 @@ static fixed_t bake_secz (int secidx, int ceil)
 static void bake_quad (bake_wall_t* arr, int* n,
                        fixed_t x1, fixed_t y1, fixed_t x2, fixed_t y2,
                        int zbot_sec, int zbot_ceil, int ztop_sec, int ztop_ceil,
-                       int tex, int light, int line,
+                       int tex, int lightsec, int line,
                        int peg_sec, int peg_ceil, int peg_addth,
                        fixed_t rowoffset, fixed_t textureoffset)
 {
@@ -42,7 +42,12 @@ static void bake_quad (bake_wall_t* arr, int* n,
     w->x1 = x1; w->y1 = y1; w->x2 = x2; w->y2 = y2;
     w->zbot_sec = (int16_t)zbot_sec; w->zbot_ceil = (uint8_t)zbot_ceil;
     w->ztop_sec = (int16_t)ztop_sec; w->ztop_ceil = (uint8_t)ztop_ceil;
-    w->texture = (short)tex; w->light = (short)light; w->line = (short)line;
+    w->texture = (short)tex; w->line = (short)line;
+    // Store the light SECTOR index so the emit can read its LIVE lightlevel (flicker/strobe/
+    // glow specials mutate sectors[].lightlevel each tic, like the door/lift heights already
+    // resolved live). w->light keeps the bake-time value as a static fallback.
+    w->lightsec = (int16_t)lightsec;
+    w->light    = (short)sectors[lightsec].lightlevel;
     // Texture pegging anchor (resolved live in DL_MeshDrawWalls).
     w->peg_sec = (int16_t)peg_sec; w->peg_ceil = (uint8_t)peg_ceil;
     w->peg_addth = (uint8_t)peg_addth;
@@ -395,7 +400,7 @@ void P_BakeWorldMesh (void)
                 int before = count;
                 bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
                            fsi, 0, fsi, 1,              // front floor .. front ceiling
-                           fs->midtexture, fsec->lightlevel, i,
+                           fs->midtexture, fsi, i,
                            fsi,                          // peg_sec: front sector
                            pegbot ? 0 : 1,               // peg_ceil: floor if DONTPEGBOTTOM else ceiling
                            pegbot ? 1 : 0,               // peg_addth: +textureheight on DONTPEGBOTTOM
@@ -434,7 +439,7 @@ void P_BakeWorldMesh (void)
             // FRONT upper: back.ceil .. front.ceil. Side frontsector = fsec.
             bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
                        bsi, 1, fsi, 1,                  // front upper: back.ceil .. front.ceil
-                       fs->toptexture, fsec->lightlevel, i,
+                       fs->toptexture, fsi, i,
                        pegtop ? fsi : bsi,              // peg_sec: front.ceil (worldtop) else back.ceil
                        1,                               // peg_ceil: both branches reference a ceiling
                        pegtop ? 0 : 1,                  // peg_addth: +th when NOT DONTPEGTOP
@@ -442,7 +447,7 @@ void P_BakeWorldMesh (void)
             // FRONT lower: front.floor .. back.floor. Side frontsector = fsec.
             bake_quad (bake_walls, &count, ld->v1->x, ld->v1->y, ld->v2->x, ld->v2->y,
                        fsi, 0, bsi, 0,                  // front lower: front.floor .. back.floor
-                       fs->bottomtexture, fsec->lightlevel, i,
+                       fs->bottomtexture, fsi, i,
                        pegbot ? fsi : bsi,              // peg_sec: DONTPEGBOTTOM->front.ceil(worldtop) else back.floor(worldlow)
                        pegbot ? 1 : 0,                  // peg_ceil: ceiling on DONTPEGBOTTOM else floor
                        0,                               // peg_addth: neither bottom-tier branch adds textureheight
@@ -450,7 +455,7 @@ void P_BakeWorldMesh (void)
             // BACK upper: front.ceil .. back.ceil. Side frontsector = bsec.
             bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
                        fsi, 1, bsi, 1,                  // back upper: front.ceil .. back.ceil
-                       bs->toptexture, bsec->lightlevel, i,
+                       bs->toptexture, bsi, i,
                        pegtop ? bsi : fsi,              // peg_sec: back.ceil (worldtop) else front.ceil
                        1,                               // peg_ceil: ceiling
                        pegtop ? 0 : 1,                  // peg_addth: +th when NOT DONTPEGTOP
@@ -458,7 +463,7 @@ void P_BakeWorldMesh (void)
             // BACK lower: back.floor .. front.floor. Side frontsector = bsec.
             bake_quad (bake_walls, &count, ld->v2->x, ld->v2->y, ld->v1->x, ld->v1->y,
                        bsi, 0, fsi, 0,                  // back lower: back.floor .. front.floor
-                       bs->bottomtexture, bsec->lightlevel, i,
+                       bs->bottomtexture, bsi, i,
                        pegbot ? bsi : fsi,              // peg_sec: DONTPEGBOTTOM->back.ceil(worldtop) else front.floor(worldlow)
                        pegbot ? 1 : 0,                  // peg_ceil: ceiling on DONTPEGBOTTOM else floor
                        0,                               // peg_addth: neither bottom-tier branch adds textureheight

@@ -5197,7 +5197,11 @@ static void DL_FlushRSPEmit(void)
             // overlay B reads it for V1/V3). dA/dB are depth 16.16 (= 1/invw post warp-fix).
             {
                 extern int extralight;
-                int  lnum = ((int)bake_walls[batch_vislist[k]].light >> LIGHTSEGSHIFT) + extralight;
+                // LIVE sector lightlevel (not the bake-time bw->light) so flicker/strobe/glow
+                // light specials are honoured -- the thinker mutates sectors[].lightlevel each
+                // tic, exactly as the door/lift edge heights are already resolved live.
+                int  light = sectors[bake_walls[batch_vislist[k]].lightsec].lightlevel;
+                int  lnum  = (light >> LIGHTSEGSHIFT) + extralight;
                 int  ziA  = (int)(r->dA >> LIGHTZSHIFT);    // near-edge (column A) depth index
                 int  ziB  = (int)(r->dB >> LIGHTZSHIFT);    // far-edge  (column B) depth index
                 long lvA, lvB;

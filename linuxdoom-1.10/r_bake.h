@@ -27,7 +27,10 @@ typedef struct
     int16_t zbot_sec, ztop_sec;
     uint8_t zbot_ceil, ztop_ceil;
     short   texture;    // wall texture index (>0; 0 = '-' sentinel, not baked)
-    short   light;      // owning sector lightlevel (SHADE through the colormap)
+    short   light;      // owning sector lightlevel AT BAKE (static fallback; the LIVE value is
+                        // sectors[lightsec].lightlevel -- use that so flickering/strobe light
+                        // specials are honoured, like software and the per-frame edge heights)
+    int16_t lightsec;   // owning sector index for the LIVE lightlevel (flicker/glow/strobe)
     short   line;       // owning linedef index (for the per-frame visibility gate)
     // --- texture pegging / offset (mirror of R_StoreWallRange, r_segs.c) ----
     // texturemid_world (the absolute world height that maps to texture row 0) is
