@@ -11,6 +11,49 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: fixedcolormap (invuln / light-amp visor) ignored by the RDP renderer
+- **Symptom:** the powerup colormaps the player wears -- invulnerability's inverted
+  grey-scale map and the light-amp visor's near-fullbright level -- did not affect the RDP
+  world. The E1M1 demo never picks up either sphere, so the state was unreachable for a
+  capture until a forced probe was built (`BENCH_FORCE_FIXEDCOLORMAP=<n>`, n=1 visor / 32
+  invuln, pins `player->fixedcolormap` every frame in `R_SetupFrame`). Two surfaces, two
+  sub-bugs:
+  - **CI4 mesh WALLS:** kept distance-shading their base sub-palettes -> under invuln the
+    walls stayed coloured/lit instead of inverting.
+  - **RDP CI8 PLANES (floors+ceilings):** rendered BLACK under invuln, then -- after the
+    shade half of the fix -- bright but UN-inverted (a tell-tale brown floor patch; inversion
+    is grey-scale, so a chromatic colour means the texel never went through the colormap).
+- **Wrong turns (do NOT retry):** (a) treating it as a palette FLASH -- it is a colormap (a
+  per-index REMAP), not a uniform tint, so the plane flash-overlay trick (un-flashed TLUT +
+  one translucent rect) cannot express invuln's inversion. (b) a SHADE multiply for invuln --
+  a multiply preserves channel ratios; inversion remaps the index, so no per-vertex shade can
+  do it. (c) for the planes, assuming the composed TLUT just had to be uploaded -- it WAS
+  uploaded but never reached the draw (see root cause).
+- **Root cause:** software draws every world texel as `master_tlut[ colormap[L][texel] ]` --
+  the index is remapped through colormap row L, THEN shown through the master palette. The RDP
+  paths skipped the colormap remap. Walls: their CI4 sub-palettes were derived straight from
+  the base PLAYPAL. Planes: their CI8 flats sample the resident master TLUT, never composed
+  through the colormap.
+  - **Plane GOTCHA (cost a build + a red-TLUT probe):** the composed plane TLUT
+    `master[colormap[L][i]]` initially had NO effect -- floors stayed un-inverted. A solid-red
+    diagnostic TLUT did NOT show red on the floor, proving the composed source was being
+    CLOBBERED before the RDP consumed it (not mis-composed). `rdpq_tex_upload_tlut` defers the
+    LOAD_TLUT DMA to RDP-execution time by PHYSICAL address; the composed upload shared the
+    `doom_tlut_up` scratch with the post-plane master re-assert, so the CPU overwrote the buffer
+    with the master before the RDP ran the plane's deferred load -> planes sampled the master.
+    Same hazard the CI4 walls avoid with per-slot sub-palette buffers.
+- **Repro:** build any RSP-emit ROM with `BENCH_FORCE_FIXEDCOLORMAP=32` (invuln) or `=1`
+  (visor) + `BENCH_MARKS=1`; `bench/scan-marks.sh` capture; A/B vs a software-rendered
+  reference built with the SAME force flag. (Building a SW reference for a NEW forced scenario
+  is legit test-building, NOT the forbidden software-perf re-run.)
+- **Resolution:** walls `8c2d5e7` (DL_RetintSlot remaps each sub-palette entry through the
+  colormap row + DL_FlushRSPEmit forces flat fullbright shade); planes `5ec60bb`
+  (I_N64UploadFixedColormapTLUT composes `master[colormap[L][i]]` into a DEDICATED
+  `doom_tlut_fcm` buffer, DL_FlushPlanePolys swaps it in + skips the flash overlay + re-asserts
+  master, DL_PlaneLightLevel returns 0 for the fixedcolormap pointer). Verified invuln + visor,
+  walls + planes, frames 768/1536 match software. Off-powerup every branch is bypassed
+  (`fixedcolormap == 0`) so normal play is byte-unchanged.
+
 ## FIXED: RSP-emit wall LIGHTING too bright (no distance falloff; flat per-wall shade)
 - **Symptom:** in big rooms (demo frames 3712/3840/4096) the mesh walls read "too bright" /
   "wrong lighting" vs software -- distant walls stayed full-bright while software darkens them.

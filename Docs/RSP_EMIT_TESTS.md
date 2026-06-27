@@ -54,3 +54,35 @@ emitted wall (~tens/frame), negligible.
 - T-band cap size (halved `DL_TMEM_HALF/pitchb`): band count unchanged, no change.
 - Geometry/perspective precision of the transform: row 2 (RSP transform + CPU emit)
   is correct, so transform precision is NOT the warp.
+
+## fixedcolormap (invuln / light-amp visor), 2026-06-27
+
+The question: do the RDP walls AND planes honour a worn fixedcolormap (invuln's
+inverted map / the visor's fullbright level) like software? The E1M1 demo never
+picks up either powerup, so force it: `BENCH_FORCE_FIXEDCOLORMAP=<n>` pins
+`player->fixedcolormap` to row n every frame in `R_SetupFrame` (renderer-independent,
+so a SW reference and the RSP-emit build can be A/B'd under the SAME forced state).
+n = 1 (light-amp visor, near-fullbright) or 32 (invuln, inverted grey-scale).
+
+Build (each side): SW reference `BENCH=1 BENCH_MARKS=1 BENCH_FORCE_FIXEDCOLORMAP=<n>`;
+RSP-emit `… BENCH_FORCE_RDP=1 BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_RSP_EMIT=1 …`.
+Building the SW reference for THIS forced scenario is legit test-building (a new
+scenario), NOT the forbidden software-perf re-run.
+
+| n | surface | before | after fix | result |
+|---|---|---|---|---|
+| 32 | CI4 mesh walls | coloured/lit (not inverted) | inverted grey, matches SW | **correct** (`8c2d5e7`) |
+| 32 | RDP CI8 planes | black -> bright but un-inverted (brown floor) | inverted grey, matches SW | **correct** (`5ec60bb`) |
+| 1 | walls + planes | distance-shaded normal | flat near-fullbright, matches SW | **correct** |
+
+Captures: `/tmp/fcm-test/cap-{sw,rsp}-{inv,gog}*` (this session). A/B verified on
+frames 768 + 1536 for both n. RMSE on two-ROM frozen grabs is NOISY (present
+sub-frame / gun-sprite offset) -- judge the floor/wall TONE by eye, not the metric.
+
+### Plane gotcha (do NOT re-debug)
+The composed plane TLUT `master[colormap[L][i]]` MUST live in its own scratch
+(`doom_tlut_fcm`), not the shared `doom_tlut_up`: `rdpq_tex_upload_tlut` defers the
+LOAD_TLUT DMA by physical address, and the post-plane master re-assert reuses
+`doom_tlut_up`, clobbering the composed source before the RDP consumes it (floors
+came out un-inverted). A solid-red probe TLUT not showing red localised it (source
+clobbered, not mis-composed). Same hazard the CI4 walls dodge with per-slot buffers.
