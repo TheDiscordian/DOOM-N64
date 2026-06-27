@@ -34,9 +34,12 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
   dissolve START->END straight into disp using the CI8 wipe's OWN per-column offsets
   (F_N64WipeMeltY -- no extra M_Random, demo-deterministic, in lockstep with the loop's `done`).
   Verified: death-respawn melts the reloaded E1M1 cleanly (frames 9208/9216/9224 match software
-  direction + content). Known minor edges: the boot title->demo wipe is black (that frame has
-  gametic==0 -> no world render -> END black), and the final melt frame's bottom 32px
-  (status-bar region, outside the scissored world flush) is one frame stale.
+  direction + content). Note: the very FIRST wipe at boot renders BLACK in BOTH software and the
+  mesh build (captured the first-wipe sentinels from each -- both ~black), i.e. a black-to-black
+  boot transition with no visible content, NOT a mesh defect -- out of scope for this fix.
+  Code-level gap (not visually confirmed): the final melt frame's bottom 32px (status-bar region)
+  falls outside the scissored world flush, so END's snapshot of it is the stale buffer, not the
+  new HUD.
 
 ## FIXED: fixedcolormap (invuln / light-amp visor) ignored by the RDP renderer
 - **Symptom:** the powerup colormaps the player wears -- invulnerability's inverted
