@@ -185,6 +185,15 @@ void N64Bench_Finish(void);
 // Called at the end of G_BuildTiccmd to overwrite real input with the script.
 void N64Bench_FillTiccmd(ticcmd_t* cmd);
 
+#if defined(BENCH_WIPE_FREEZE)
+// Melt-wipe capture hooks (BENCH_WIPE_FREEZE builds only). WipeStart resets the
+// per-wipe melt-step counter at the top of D_Display's wipe; WipeFreezeMaybe runs
+// once per melt present and, on chosen steps, emits a BENCH_MARK sentinel + holds so
+// scan-marks captures the mid-melt frame. See n64_bench.c.
+void N64Bench_WipeStart(void);
+void N64Bench_WipeFreezeMaybe(void);
+#endif
+
 // MP bench: scripted movement fields for one local player (consistancy is
 // left untouched). Player 0 follows the standard table; higher players run
 // it phase-shifted (distinct phase per player) so each pane sees different

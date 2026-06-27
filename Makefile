@@ -217,6 +217,14 @@ endif
 ifeq ($(BENCH_VOID_SCAN),1)
 CFLAGS += -DBENCH_VOID_SCAN=1
 endif
+# BENCH_WIPE_FREEZE=1: capture hook for the death->respawn MELT WIPE (a transient in
+# D_Display's melt loop that bypasses the frame markers). On a few melt steps it emits
+# BENCH_MARK sentinels (9208/9216/9224 = early/mid/late melt) + holds ~2s so a
+# BENCH_MARKS capture freezes on the mid-melt frame. Pair with BENCH_MARKS=1. Used to
+# A/B the mesh-build black wipe vs the software melt. Bench-only; no renderer effect.
+ifeq ($(BENCH_WIPE_FREEZE),1)
+CFLAGS += -DBENCH_WIPE_FREEZE=1
+endif
 # BENCH_MARKS=1: frame-keyed visual-capture markers (BENCH_MARK frame=N via
 # ISViewer every 256 retained frames) for exactly-paired cross-build
 # screenshot series. Visual-capture builds only -- never timing builds, the

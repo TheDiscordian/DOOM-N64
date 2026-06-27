@@ -844,6 +844,10 @@ void D_Display (void)
 
     wipestart = I_GetTime () - 1;
 
+#if defined(BENCH_WIPE_FREEZE)
+    N64Bench_WipeStart();   // reset per-wipe melt-step counter for the capture hook
+#endif
+
     do
     {
 	do
@@ -863,6 +867,9 @@ void D_Display (void)
 	I_UpdateNoBlit ();
 	M_Drawer ();                            // menu is drawn even on top of wipes
 	I_FinishUpdate ();                      // page flip or blit buffer
+#if defined(BENCH_WIPE_FREEZE)
+	N64Bench_WipeFreezeMaybe();             // capture-hold a few mid-melt frames
+#endif
     } while (!done);
 }
 

@@ -788,8 +788,8 @@ void N64Bench_LoopEnd(void)
         // Mark a few known-black ones so a capture can confirm the void on the
         // current build + pair RDP-walls/mesh/plane control builds at the SAME state.
         if (bench_frame_count == 837UL  || bench_frame_count == 1274UL ||
-            bench_frame_count == 3482UL)
-            marker_hit = 1;
+            bench_frame_count == 3482UL || bench_frame_count == 3213UL)
+            marker_hit = 1;     // 3213 = the death->respawn melt-wipe (mesh-build black)
 #endif
     if (marker_hit)
     {
@@ -818,6 +818,33 @@ void N64Bench_LoopEnd(void)
     }
 #endif
 }
+
+#if defined(BENCH_WIPE_FREEZE)
+// Capture hook for the death->respawn MELT WIPE. The wipe runs in d_main.c's melt
+// loop (D_Display), which bypasses N64Bench_CommitFrame -- so the normal frame
+// markers never reach it and a frozen-marker capture lands on the pre-wipe frame,
+// not the melt. WipeStart resets the per-wipe step counter; WipeFreezeMaybe is
+// called once per melt present and, on a few chosen melt steps, emits a BENCH_MARK
+// SENTINEL (9208/9216/9224 = early/mid/late melt) then holds ~2 wall-clock seconds
+// so scan-marks captures the held mid-melt frame. The demo's death-respawn wipe is
+// the LAST wipe, so its frames overwrite the earlier demo-start wipe's same
+// sentinels -> frame-92NN.png is the death-respawn melt. No VirtualTick during the
+// hold, so the melt state is frozen (same mechanism as the marker freeze above).
+static int bench_wf_iter = 0;
+void N64Bench_WipeStart(void) { bench_wf_iter = 0; }
+void N64Bench_WipeFreezeMaybe(void)
+{
+    bench_wf_iter++;
+    if (bench_wf_iter == 8 || bench_wf_iter == 16 || bench_wf_iter == 24)
+    {
+        uint64_t hold_until;
+        debugf("BENCH_MARK frame=%d\n", 9200 + bench_wf_iter);
+        hold_until = get_ticks() + (uint64_t)TICKS_PER_SECOND * 2;
+        while (get_ticks() < hold_until)
+            ;   // spin: no VirtualTick, no melt advance, present frozen
+    }
+}
+#endif
 
 void N64Bench_FillTiccmd(ticcmd_t* cmd)
 {
