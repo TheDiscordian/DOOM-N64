@@ -171,14 +171,19 @@ BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back 
 # at the cap). A leaf element is ONE vertex: in = (x,y) 8B; out = (cx, invw, emit) padded
 # to 16B. 8 verts/chunk fits BIN_BUF (8*8=64<=256) and BOUT_BUF (8*16=128<=512).
 # Layout MUST match rsp_bleaf_in_t / rsp_bleaf_out_t in rdp_view.c.
-#define BLI_x    0x00
-#define BLI_y    0x04
-#define BLEAF_IN_BYTES  8
-#define BLO_cx   0x00      /* screen-x, 16.16 (== wall sx) */
-#define BLO_invw 0x04      /* 65536/depth, 16.16 */
-#define BLO_emit 0x08      /* 1 = vertex in front of near plane, 0 = leaf must be culled */
-#define BLO_pad  0x0C
-#define BLEAF_OUT_BYTES 16
+#define BLI_x      0x00
+#define BLI_y      0x04
+#define BLI_floorz 0x08    /* live surface height (fixed_t) -> screen-y */
+#define BLEAF_IN_BYTES  16
+#define BLO_cx   0x00      /* screen-x, 16.16 */
+#define BLO_cy   0x04      /* screen-y, 16.16 (from floorz) */
+#define BLO_invw 0x08      /* 65536/depth, 16.16 */
+#define BLO_z    0x0C      /* zbuf depth */
+#define BLO_u    0x10      /* world-coord flat texel x */
+#define BLO_v    0x14      /* world-coord flat texel y */
+#define BLO_emit 0x18      /* 1 = vertex in front of near plane, 0 = leaf must be culled */
+#define BLO_pad  0x1C
+#define BLEAF_OUT_BYTES 32
 
 # Batch loop bookkeeping (MUST be in .bss/DMEM -- the RSP scalar lw/sw only reach
 # DMEM 0x000-0xFFF; a .text/IMEM address here silently corrupts every load/store).
@@ -624,8 +629,8 @@ LeafChunkLoop:
     nop
     move t5, t4
 1:  sw   t5, %lo(BS_chunk)
-    # ---- DMA this chunk of inputs in: chunk * BLEAF_IN_BYTES (8) ----
-    sll  t6, t5, 3
+    # ---- DMA this chunk of inputs in: chunk * BLEAF_IN_BYTES (16) ----
+    sll  t6, t5, 4
     addiu t6, t6, -1
     andi t0, t6, 0xFFF
     li   s4, %lo(BIN_BUF)
@@ -657,7 +662,7 @@ LeafVertLoop:
     nop
 LeafChunkEmit:
     lw   t5, %lo(BS_chunk)
-    sll  t6, t5, 4               # bytes = chunk * 16 (BLEAF_OUT_BYTES)
+    sll  t6, t5, 5               # bytes = chunk * 32 (BLEAF_OUT_BYTES)
     addiu t6, t6, -1
     andi t0, t6, 0xFFF
     li   s4, %lo(BOUT_BUF)
@@ -666,11 +671,11 @@ LeafChunkEmit:
     nop
     lw   t5, %lo(BS_chunk)
     lw   t1, %lo(BS_inrd)
-    sll  t6, t5, 3
+    sll  t6, t5, 4
     addu t1, t1, t6
     sw   t1, %lo(BS_inrd)
     lw   t1, %lo(BS_outrd)
-    sll  t6, t5, 4
+    sll  t6, t5, 5
     addu t1, t1, t6
     sw   t1, %lo(BS_outrd)
     lw   t1, %lo(BS_remain)

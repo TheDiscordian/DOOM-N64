@@ -2557,18 +2557,26 @@ typedef struct {
 
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
 // Phase 4: per-leaf-VERTEX transform on the RSP (DLWallCmd_LeafBatch). Layout MUST
-// match BLI_*/BLO_* in rsp/rsp_dlwall.S. The RSP does the divide-heavy part (cx, invw);
-// the CPU derives sc=centerx*invw, z=DL_WallZ(invw), u/v, and per-surface cy.
+// match BLI_*/BLO_* in rsp/rsp_dlwall.S. NO-READBACK FLOOR build (RSP_PORT_PLAN floor
+// lever): the RSP computes the FULL vertex -- screen x/y, z (zbuf depth), invw, and the
+// world-coord UV (floors texture by world position, a passthrough) -- so the fan emit
+// (overlay B) needs no CPU round-trip. floorz is the per-leaf live floor/ceiling height
+// (carried per-vertex; the DMA cost is trivial vs a separate per-leaf param).
 #define DLWALL_CMD_LEAFBATCH 3
 typedef struct {
     int32_t x, y;                  // 0x00,0x04   world map coords (fixed_t)
-} rsp_bleaf_in_t;                  // 8 bytes
+    int32_t floorz;                // 0x08        live surface height (fixed_t) -> screen-y
+    int32_t pad0;                  // 0x0C        (16-byte align)
+} rsp_bleaf_in_t;                  // 16 bytes
 typedef struct {
-    int32_t cx;                    // 0x00        screen-x 16.16 (== wall sx)
-    int32_t invw;                  // 0x04        65536/depth 16.16
-    int32_t emit;                  // 0x08        1 = in front of near plane, 0 = cull leaf
-    int32_t pad;                   // 0x0C
-} rsp_bleaf_out_t;                 // 16 bytes
+    int32_t cx;                    // 0x00        screen-x 16.16
+    int32_t cy;                    // 0x04        screen-y 16.16 (from floorz)
+    int32_t invw;                  // 0x08        65536/depth 16.16
+    int32_t z;                     // 0x0C        zbuf depth (DL_WallZ(invw))
+    int32_t u, v;                  // 0x10,0x14   world-coord flat texel (x>>FRACBITS,y>>FRACBITS)
+    int32_t emit;                  // 0x18        1 = in front of near plane, 0 = cull leaf
+    int32_t pad;                   // 0x1C
+} rsp_bleaf_out_t;                 // 32 bytes
 #endif
 #endif
 
