@@ -782,6 +782,15 @@ void N64Bench_LoopEnd(void)
         if (bench_frame_count == 3150UL || bench_frame_count == 3160UL)
             marker_hit = 1;
 #endif
+#if defined(BENCH_MARK_VOID) && BENCH_MARK_VOID
+        // OFF-GRID void diagnosis: the ~316 near-total-black frames found by the
+        // full-demo counter are ALL off the 128-grid (doom-n64-capture-pitfalls #7).
+        // Mark a few known-black ones so a capture can confirm the void on the
+        // current build + pair RDP-walls/mesh/plane control builds at the SAME state.
+        if (bench_frame_count == 837UL  || bench_frame_count == 1274UL ||
+            bench_frame_count == 3482UL)
+            marker_hit = 1;
+#endif
     if (marker_hit)
     {
         debugf("BENCH_MARK frame=%lu\n", bench_frame_count);

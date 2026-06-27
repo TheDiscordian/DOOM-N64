@@ -221,6 +221,13 @@ CFLAGS += -DN64_BENCH_MARKS=1
 ifeq ($(BENCH_MARK_FLASH),1)
 CFLAGS += -DBENCH_MARK_FLASH=1
 endif
+# BENCH_MARK_VOID=1: extra off-grid markers on known near-total-BLACK void frames
+# (837/1274/3482) so the off-grid-void diagnosis can confirm the void on the current
+# build and pair RDP-walls/mesh/plane control builds at the SAME state. Superset of
+# the 128-grid (those still fire). Bench-only; no renderer effect.
+ifeq ($(BENCH_MARK_VOID),1)
+CFLAGS += -DBENCH_MARK_VOID=1
+endif
 endif
 endif
 # DL_TRACE=1: one-off diagnostic builds only -- per-present RDP flush/emit
