@@ -227,6 +227,65 @@ sync disappears, and the leaf transform genuinely comes off the CPU. That is a m
 ucode effort (emit, not just compute) and is the same step walls will eventually need to
 fully leave the CPU. Tracked as the next floor lever; not attempted yet.
 
+### 8.4 Full-vertex transform built + verified — the no-readback EMIT prerequisite (2026-06-27)
+`XformLeaf` now produces the COMPLETE per-vertex invariant the fan emit consumes, not just
+`{cx, invw}`: it adds **depth** (16.16 view-space → engine Z `depth>>16` + W) and the
+world-passthrough **u/v** texels. cy stays OUT of the record — it is the only per-surface
+term (floor vs ceiling differ), derived at emit from `cy = centery − (h−viewz)·sc`,
+`sc = centerx·invw`, mirroring the CPU's per-surface reuse of `sc`. Key finding: the
+`rsp_rdpq_tri` engine takes DEPTH as Z/W (StageVtx, rsp_dlemit.S), NOT a precomputed
+`DL_WallZ` — so the leaf emit uses the same depth-as-Z convention the wall emit already does
+(walls + floors share the z-buffer). Record is `{cx, invw, depth, u, v, emit}` (32B, cy/pad
+reserved); input carries `floorz` (reserved for a possible per-vertex cy).
+
+**A/B verify (BENCH_FORCE_MESH_LEAF_RSP_VERIFY, off by default), E1M1, bucketed on-screen vs
+off-screen:** ON-SCREEN verts (the ones that rasterise) agree to **depth bit-exact**
+(`w_depon=0` at 1e-6 — RSP FixedMulVU == CPU FixedMul), **u/v exact**, **cx ~1px**. The large
+all-verts cx (20–80px) is confined to off-screen verts — the reciprocal's NORMBIT=23 tail on
+near-plane / far-lateral corners, which the RDP scissors away. Two boot/robustness bugs fixed
+en route: the widened 32B record as static BSS (2048-vert worst case = 96KB) starved the
+`I_InitGraphics` scratch-screen mallocs (boot `I_Error`); an in-render `memalign` on
+libdragon's tight heap failed intermittently once fragmented, silently dropping floors for a
+whole run. Both fixed by moving the in/out staging to the ZONE (`Z_Malloc`+16-align), sized to
+the level's actual `bake_numleafverts` (~45KB), not the cap. Commits `6488b6d`, `8f101a7`.
+
+**Floor-method bench (E1M1, 4117 frames, both mesh walls):**
+| build | avg µs | p95 µs | vs visplane |
+|---|---|---|---|
+| `mesh` (visplane floors) | 17145 | 30688 | baseline |
+| `mesh-leaf-rsp` (RSP transform, readback kept) | 16790 | 30752 | **−2.1% / +0.2%** |
+
+Per-phase, the floor cost MOVES: `planes` 4116→255 µs (visplane tessellation eliminated,
+−3861), `dlbuild` 7226→10515 µs (+3289 = the CPU leaf fold: readback of `leaf_out_buf` +
+957-vert×2-surface cy/bias float math + the `rdpq_triangle` emit). NOTE the baseline matters:
+vs *visplane* the leaf-RSP path is a small win; §8.3's +3.6% loss was vs *CPU-leaf-mesh*
+(`mesh-floors`), the readback-vs-CPU-divide pair. The emit (§9 / 8.5) targets that +3289 µs
+dlbuild block — moving the per-vertex projection AND the fan emit to the RSP so the CPU never
+folds the geometry. Net win is the hypothesis to MEASURE once built (some of the 3289 — flat
+sort + TMEM binds — stays CPU; the RSP emit adds RSP time the idle RDP `rdpbusy`=5µs absorbs).
+
+### 8.5 The leaf EMIT — overlay-B `LeafFan`, fully designed, NOT yet built (2026-06-27)
+The remaining keystone. Inputs de-risked (depth bit-exact, the engine Z/W convention, the cy
+projection sequence = wall `ytop` at rsp_dlwall.S:1088, rspq 24-bit-arg-0 plumbing). Plan:
+- **overlay B (`rsp_dlemit.S`):** add `MulIntVU` (centerx·ratio; the one helper B lacks —
+  3 instr, tail-calls FixedMulVU). Add `DLEmitCmd_LeafView` (set frame-constant centerx/centery
+  into persistent DMEM) + `DLEmitCmd_LeafFan`: DMA the leaf's records, per vert compute
+  `cy = (centery<<16) − centerx·FixedMul(hf16, invw)` (hf16 per-surface), `S=(u−ubias)<<16`,
+  `T=(v−vbias)<<15` (×0.5 for the 64→32 decimated tile), reuse `StageVtx`, then fan n−2 tris
+  via `RDPQ_Triangle_Send_Async` with a 3-slot VBUF rotation (v0 fixed, prev/cur swap).
+- **arg packing:** `a0`=rec_addr (24-bit, RDRAM<16MB fits under the id byte), `a1`=hf16,
+  `a2`=light(RGBA), `a3`=`n | (ubias/64+512)<<6 | (vbias/64+512)<<16`. ubias/vbias are STATIC
+  per leaf (min world texel of its verts) → bake them once in `P_BakeLeafFans` (bake_leaf_t),
+  NOT per frame (the no-readback CPU never sees u/v to compute umin/vmin).
+- **CPU (`rdp_view.c`):** new `DL_FlushLeafRSPEmit` — `LeafView` once/frame, then per visible
+  leaf-surface (after binding its flat in the existing Pass1/Pass2 flat sort) dispatch
+  `LeafFan`; DELETE the per-vertex fold + `rdpq_triangle` loop. Suppress the visplane path.
+- **gate:** new flag (e.g. `BENCH_FORCE_MESH_LEAF_EMIT`), strips the overlay-A Phase-0/1 probes
+  for IMEM like RSP_EMIT does. Verify overlay-B IMEM headroom holds (B ~3.2KB blob + 1.4KB
+  engine; the LeafFan loop ~120 instr must fit — confirm at link, the precise gate).
+- **then:** A/B vs `mesh-floors` (the CPU-leaf baseline §8.3 lost to) AND vs visplane; the win
+  is realised only if dlbuild drops past the ~3289 µs the fold costs now.
+
 ## §9 RSP-EMITS-TRIANGLES design (2026-06-24, workflow wf_13cf1532, FEASIBLE)
 The keystone (remove the 776us wall-transform readback stall + the 352us CPU emit). Verdict:
 FEASIBLE, lower-risk than feared. Evidence-grounded plan:
