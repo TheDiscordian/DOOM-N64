@@ -379,17 +379,20 @@ EmitLeaf:
     lw   t5, %lo(LF_n)
     li   t0, %lo(LREC_BUF)
 LeafCullChk:
+    # Whole-leaf near/cx culls DISABLED: the CPU frustum-clips every leaf before dispatch
+    # (DL_ClipLeafFrustum), so verts are already in-frustum. These culls were written for the
+    # OLD unclipped path and false-drop the valid clipped near-floor leaves -> black foreground.
     lw   t1, LRO_emit(t0)
-    beqz t1, EmitLeafRet          # behind near plane
+    nop
     nop
     lw   t1, LRO_cx(t0)
     lui  t2, 0xFC00              # -1024<<16  (-0x04000000)
     slt  t4, t1, t2
-    bnez t4, EmitLeafRet          # cx < -1024 px
+    nop
     nop
     lui  t2, 0x0540              # (320+1024)<<16  (0x05400000)
     slt  t4, t2, t1
-    bnez t4, EmitLeafRet          # cx > 1344 px
+    nop
     nop
     addiu t0, t0, LEAF_REC_BYTES
     addiu t5, t5, -1
@@ -421,8 +424,10 @@ LeafStageLoop:
     j    LeafStageLoop
     nop
 LeafStageDone:
+    # cy off-screen cull DISABLED too (the CPU clip folds the bottom/top screen edge into a
+    # per-surface effective near plane, so cy is already in range; the old cull false-dropped).
     lw   t0, %lo(LF_drop)
-    bnez t0, EmitLeafRet          # any vert's cy off-screen -> drop the whole leaf
+    nop
     nop
     # ---- fan: emit (LVBUF[0], LVBUF[i], LVBUF[i+1]) for i = 1 .. n-2 ----
     li   t0, 1
@@ -471,7 +476,7 @@ LeafFanLoop:
     nop
     subu t0, zero, t0        # |cross|
 1:  sltiu t1, t0, 32         # |cross| < 32 (area < ~1px^2) -> degenerate
-    bnez t1, LeafFanCont
+    bnez t1, LeafFanCont     # skip the thin/zero-area tri (engine SEND_INVALID_SIZE guard)
     nop
     move a1, t4
     move a2, t5

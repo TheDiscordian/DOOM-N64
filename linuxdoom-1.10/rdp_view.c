@@ -4915,7 +4915,8 @@ static int DL_ClipLeafFrustum(int firstvert, int n,
         m = outc;
         for (j = 0; j < m; j++) { px[j] = qx[j]; py[j] = qy[j]; }
     }
-    if (m < 3 || m > cap) return 0;
+    if (m < 3)   return 0;    // clipped fully away (behind near / outside frustum)
+    if (m > cap) return -1;   // too many verts for the per-leaf emit buffers
     for (i = 0; i < m; i++) {
         outx[i] = (fixed_t)(px[i] * 65536.0f);
         outy[i] = (fixed_t)(py[i] * 65536.0f);
@@ -5028,7 +5029,7 @@ static void DL_RSPLeafDispatch(void)
                 else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
                 m = DL_ClipLeafFrustum(lf->firstvert, n, vxf, vyf, vcosf, vsinf, cxf,
                                        nearz_eff, clx, cly, DL_LEAF_EMIT_MAXV);
-                if (m < 3) continue;                               // clipped away / over cap
+                if (m < 3) continue;                               // clipped away / over emit cap
                 leaf_rsp_start[slot]  = nv;
                 leaf_rsp_clipnv[slot] = m;
                 for (i = 0; i < m; i++) {
