@@ -200,6 +200,15 @@ RSPASFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
 ifeq ($(BENCH_FORCE_MESH_LEAF_EMIT),1)
 CFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
 RSPASFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
+#   BENCH_FORCE_MESH_LEAF_CELLS=1 -> draw the BAKE-tessellated floor/ceiling CELLS
+#   (r_bake.c grid cells, texel span bounded offline) instead of splitting each whole
+#   leaf into depth bands at runtime. Kills the texel-span overflow that drops ceiling
+#   triangles to the void; the residual runtime depth split now only fires for near
+#   cells (perspective precision -- view-dependent, can't bake). Reuses overlay B's
+#   LeafFan unchanged, so CFLAGS only (no RSP assembly change). Nested under LEAF_EMIT.
+ifeq ($(BENCH_FORCE_MESH_LEAF_CELLS),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_CELLS=1
+endif
 endif
 endif
 endif
