@@ -710,14 +710,19 @@ StageVtx:
     sh   t5, VTX_ATTR_XY(t8)         # X
     sra  t6, t2, 14
     sh   t6, VTX_ATTR_XY+2(t8)       # Y
-    srl  t5, t4, 16                  # depth_mapunits
-    li   t6, 32767
-    sltu t7, t6, t5                  # 32767 < depth_mapunits ?
-    beqz t7, 1f
+    # SCREEN-Z = 0x7FFF - 2*invw. The RDP interpolates the Z attribute LINEARLY in screen space;
+    # invw (= 65536/depth) is itself linear in screen space for a planar surface, so this Z is
+    # screen-affine and the interp is EXACT. The old view-depth (depth>>16) is NOT screen-linear,
+    # so a steep floor's Z overshot between its near and far verts and lost the z-test to walls it
+    # was in front of (partial / banded floors). Same formula for walls keeps them comparable.
+    sll  t5, t3, 1                   # 2*invw
+    li   t6, 0x7FFF
+    subu t5, t6, t5                  # 0x7FFF - 2*invw  (near -> ~0, far -> ~0x7FFF)
+    bgez t5, 1f
     nop
-    move t5, t6                      # clamp
+    move t5, zero                    # clamp very-near to 0
 1:
-    sh   t5, VTX_ATTR_Z(t8)          # Z
+    sh   t5, VTX_ATTR_Z(t8)          # Z (perspective screen-Z)
     # CLIPFLAGS (byte 0x06) = 0: no near/far/guard clip needed (walls are pre-clipped).
     # REJFLAGS (byte 0x07) = 0xFF: the engine CULLS unless (rej1|rej2|rej3)&0x3F == 0x3F
     # (rsp_rdpq_tri.inc:277-279 -- negated trivial-reject = "inside all 6 planes"). A
