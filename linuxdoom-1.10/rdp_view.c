@@ -4878,7 +4878,11 @@ static int DL_ClipLeafSides(int firstvert, int n,
                             float* px, float* py)
 {
     float qx[DL_LEAF_MAXV + 8], qy[DL_LEAF_MAXV + 8];
-    const float SXMIN = -900.0f, SXMAX = (float)SCREENWIDTH + 900.0f;
+    // Side-clip margin: a projected vertex past ~+/-1024 px overflows the RDP edge-walker guard
+    // band and corrupts the triangle (was +/-900 -> px 1220 > 1024 -> wide near-floors broke).
+    // +/-160 keeps the clipped polygon's verts to px<=480; the on-screen [0,SCREENWIDTH] region
+    // is untouched (clipping happens entirely off-screen), so visible coverage is unchanged.
+    const float SXMIN = -160.0f, SXMAX = (float)SCREENWIDTH + 160.0f;
     const float KHI = (cxf - SXMIN) / cxf;   // left:  keep lat <= KHI*depth
     const float KLO = (cxf - SXMAX) / cxf;   // right: keep lat >= KLO*depth
     int m = n, i, plane;
@@ -5129,6 +5133,15 @@ static void DL_LeafRSPEmitFlush(void)
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
 
+    // ROOT-CAUSE FIX (no readback): each LeafBatch is queued, not waited on, so the CPU runs
+    // ahead of the RSP. Rebuilding leaf_desc_buf from index 0 per flat/surface OVERWROTE the
+    // prior batch's descriptors before the RSP had DMA'd them -> the RSP read the LAST writer's
+    // data and earlier batches (e.g. the whole floor in a single-flat corridor) drew nothing.
+    // Give every batch its OWN region via a frame-wide cursor: the buffer is never reused before
+    // the RSP consumes it, so no rspq_wait is needed (the no-readback perf stays intact).
+    int dcur = 0;
+    const int DCAP = (int)(sizeof leaf_desc_buf / sizeof leaf_desc_buf[0]);
+
     for (surf = 0; surf < 2; surf++)
     {
         int nvis = 0, nflat = 0, vi, fi, ss;
@@ -5164,9 +5177,10 @@ static void DL_LeafRSPEmitFlush(void)
             }
             rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);   // engine bypasses auto-upload
 
-            // Build this flat's leaf descriptors, then emit them ALL in one LeafBatch so the
-            // RSP drains the RDP buffer once (per-leaf Send_End broke the RSP).
-            int nd = 0;
+            // Build this flat's descriptors into a FRESH region [dstart, dcur) -- the cursor
+            // never rewinds within a frame, so the RSP always DMAs intact descriptors (the
+            // buffer-reuse race that blanked whole floors is gone). One LeafBatch per flat.
+            int dstart = dcur;
             for (vi = 0; vi < nvis; vi++)
             {
                 bake_leaf_t* lf = &bake_leaves[vis[vi]];
@@ -5177,7 +5191,7 @@ static void DL_LeafRSPEmitFlush(void)
 
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx)
                     continue;
-                if (nd >= (int)(sizeof leaf_desc_buf / sizeof leaf_desc_buf[0])) break;
+                if (dcur >= DCAP) break;
                 n    = leaf_rsp_clipnv[surf * numsubsectors + vis[vi]];  // CLIPPED fan vert count
                 sec  = &sectors[lf->sector];
                 hf16 = (surf ? sec->ceilingheight : sec->floorheight) - viewz;  // live height
@@ -5190,21 +5204,24 @@ static void DL_LeafRSPEmitFlush(void)
                 packed = (uint32_t)(n & 0x3F)
                        | ((uint32_t)(ub64 & 0x3FF) << 6)
                        | ((uint32_t)(vb64 & 0x3FF) << 16);
-                leaf_desc_buf[nd].rec_addr =
+                leaf_desc_buf[dcur].rec_addr =
                     PhysicalAddr(&leaf_out_buf[leaf_rsp_start[surf * numsubsectors + vis[vi]]]);
-                leaf_desc_buf[nd].hf16   = (uint32_t)hf16;
-                leaf_desc_buf[nd].prim   = prim;
-                leaf_desc_buf[nd].packed = packed;
-                nd++;
+                leaf_desc_buf[dcur].hf16   = (uint32_t)hf16;
+                leaf_desc_buf[dcur].prim   = prim;
+                leaf_desc_buf[dcur].packed = packed;
+                dcur++;
                 drew += n - 2;
             }
-            if (nd > 0)
+            if (dcur > dstart)
             {
-                data_cache_hit_writeback(leaf_desc_buf,
-                                         (uint32_t)((size_t)nd * sizeof(rsp_leaf_desc_t)));
+                data_cache_hit_writeback(&leaf_desc_buf[dstart],
+                    (uint32_t)((size_t)(dcur - dstart) * sizeof(rsp_leaf_desc_t)));
                 rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFBATCH,
-                           PhysicalAddr(leaf_desc_buf), (uint32_t)nd);
+                           PhysicalAddr(&leaf_desc_buf[dstart]), (uint32_t)(dcur - dstart));
             }
+            // Buffer full (rare; >DCAP leaf-surfaces this frame): drain so reuse from 0 is safe.
+            // Common case never waits -- the no-readback path stays stall-free.
+            if (dcur >= DCAP) { rspq_wait(); dcur = 0; }
         }
     }
 
