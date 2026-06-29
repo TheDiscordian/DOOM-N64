@@ -11,6 +11,53 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
+## FIXED: no-readback mesh floors — black, then wonky/streaked, then ceilings flickering
+- **Symptom (progression, `BENCH_FORCE_MESH_LEAF_EMIT` no-readback floors):** (a) mesh floors
+  render BLACK — whole-floor in corridors, partial in rooms; (b) once drawing, floor texture
+  STREAKS/smears near the player and on deep floors ("coordinates go wonky"); (c) ceilings
+  intermittently FLICKER out, revealing the geometry/courtyard behind them.
+- **Root causes (four distinct bugs, one symptom cluster):**
+  1. **Black floors = buffer-reuse race.** Each flat's `LeafBatch` is QUEUED (no rspq_wait);
+     the CPU rebuilt `leaf_desc_buf` from index 0 per flat and ran ahead of the RSP, overwriting
+     a batch's descriptors before the RSP DMA'd them. The RSP read the LAST writer's data, so
+     every batch but the last drew nothing. Single-flat surfaces (a whole corridor floor)
+     vanished. FIX (`65dc9be`): frame-wide cursor — each batch owns its own buffer region, never
+     reused before the RSP consumes it. No wait on the common path.
+  2. **Guard-band X overflow.** Leaf side-clip margin was ±900px → projected x≈1220 > the RDP
+     edge-walker's ~±1024 guard band → wide near-floor triangles corrupted. FIX (`65dc9be`):
+     tighten to ±160 (clip is entirely off-screen, visible coverage unchanged).
+  3. **Floors lose the depth test (partial/banded) = wrong Z encoding.** StageVtx fed view-depth
+     as the Z attribute; the RDP interpolates Z LINEARLY in screen space, which overshoots for a
+     tilted plane → steep floors' Z too large → lose to walls they're in front of. FIX (`421754c`):
+     screen-Z = `0x7FFF - 2*invw` (invw is screen-affine for a plane → interp exact). Same formula
+     for walls keeps them comparable.
+  4. **Texture streak/smear = perspective S/T break across a huge W range.** One leaf spans
+     near→horizon; a single triangle's W range breaks the engine's perspective-correct S/T. FIX
+     (`421754c`): depth-band tessellation — `DL_ClipBandToFixed` splits each leaf-surface into
+     geometric depth bands (ratio 4), one LeafFan per band, so every triangle's W ratio is bounded
+     (mirrors the visplane INV_W split). `leaf_rsp_start/clipnv` gain a band dimension.
+  5. **Ceiling flicker = far-distance Z-fight.** screen-Z's 1/depth precision collapses a leaf's
+     far edge to near-equal Z with the distant geometry behind it. FIX (`3f47ec4`): small per-path
+     toward-camera Z bias (`EMIT_ZBIAS`, `LEAF_ZBIAS=32` for leaves, 0 for walls). Z-ONLY — invw
+     (and W*INVW=1) untouched, so NO texture warp; uniform-Z so near surfaces don't poke through.
+- **Wrong turns (do NOT retry):** (a) reading textured WALLS as "floors drawing" — black floors
+  stayed black while the walls beside them drew fine. (b) Dismissing the user's "coordinates go
+  wonky" from ONE Z-off frame — it was the real texture-perspective bug (#4). (c) Blaming the
+  black floors on extreme depth / W-saturation / the degenerate-area cull / the engine backface
+  cull / the RDP guard band — all measured-out; it was the buffer race (#1). (d) Fixing the black
+  floors with CPU-side mode-commit / prim-commit / rspq_sync / a warmup overlay batch /
+  double-dispatch — none worked; only the per-batch buffer region (#1) did. (e) Biasing `invw`
+  for the ceiling Z instead of Z-only — breaks W*INVW=1 → texture warp.
+- **Repro:** `BENCH=1 BENCH_MARKS=1 BENCH_FORCE_RDP=1 BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_FLOORS=1
+  BENCH_FORCE_MESH_LEAF_RSP=1 BENCH_FORCE_MESH_RSP_EMIT=1 BENCH_FORCE_MESH_LEAF_EMIT=1`, then
+  `bench/scan-marks.sh`. Black-floor corridors = frames 256/384; texture streak = 3456/4096;
+  ceiling flicker = 3456/3712. Diagnose floor geometry by forcing `RDPQ_COMBINER_FLAT` + per-surf
+  prim (floor magenta / ceiling cyan); isolate Z vs emit by toggling `rdpq_mode_zbuf` in the leaf
+  emit. NOTE: piled-up render-md windows overlap the ares grab and corrupt scan-marks frames.
+- **Resolution:** `65dc9be` (race + guard band) + `421754c` (screen-Z + tessellation) + `3f47ec4`
+  (ceiling Z-bias). Remaining/separate: wall grazing-angle blockiness (4096/2944), ceiling
+  lighting fidelity (1280), red damage-tint applied as per-surface multiply (2048/2176).
+
 ## FIXED: melt-wipe dissolved garbage on the RDP renderer ("mangled rotated HUD")
 - **Symptom:** the death->respawn (and every level-transition) melt wipe dissolved garbage
   instead of the level -- the user: "hardware melts random garbage that looks like a mangled
