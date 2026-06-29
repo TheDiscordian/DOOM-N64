@@ -5096,24 +5096,34 @@ static void DL_RSPLeafDispatch(void)
             if (cl->floorpic == skyflatnum && cl->ceilingpic == skyflatnum) continue;
             ms = DL_ClipLeafSides(cl->firstvert, n, bake_cell_verts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
             if (ms < 3) continue;                                  // off both side planes
-            for (surf = 0; surf < 2 && nv < cap; surf++) {
-                int     m, slot = surf * bake_numcells + ci;
-                fixed_t height;
-                float   hf, nearz_eff;
-                if ((surf ? cl->ceilingpic : cl->floorpic) == skyflatnum) continue;  // sky stays CPU
-                height = surf ? sectors[cl->sector].ceilingheight
-                              : sectors[cl->sector].floorheight;
-                hf = (float)height * (1.0f / 65536.0f) - viewzf;
-                nearz_eff = 6.0f;
-                if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
-                else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
-                {
-                    float zlo = nearz_eff;
-                    int   band;
+            {   // cell depth range (height-independent -> shared by floor + ceiling):
+                // bound the band split to the cell's OWN [cd0,cd1], so a far cell that
+                // fits one band costs ONE clip, not NBANDS empty-band clips. The cells
+                // already bound the texel span, so this split is W-precision only.
+                float cd0 = 1e30f, cd1 = -1e30f;
+                int   k;
+                for (k = 0; k < ms; k++) {
+                    float dep = (spx[k] - vxf) * vcosf + (spy[k] - vyf) * vsinf;
+                    if (dep < cd0) cd0 = dep;
+                    if (dep > cd1) cd1 = dep;
+                }
+                for (surf = 0; surf < 2 && nv < cap; surf++) {
+                    int     m, slot = surf * bake_numcells + ci, band;
+                    fixed_t height;
+                    float   hf, nearz_eff, zlo;
+                    if ((surf ? cl->ceilingpic : cl->floorpic) == skyflatnum) continue;  // sky stays CPU
+                    height = surf ? sectors[cl->sector].ceilingheight
+                                  : sectors[cl->sector].floorheight;
+                    hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                    nearz_eff = 6.0f;
+                    if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
+                    else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
+                    zlo = (cd0 > nearz_eff) ? cd0 : nearz_eff;
+                    if (cd1 <= zlo) continue;                      // cell behind this surface's near
                     for (band = 0; band < DL_LEAF_NBANDS && nv < cap; band++) {
                         int   bslot = slot * DL_LEAF_NBANDS + band;
-                        float zhi   = (band == DL_LEAF_NBANDS - 1)
-                                          ? DL_LEAF_FARZ : zlo * DL_LEAF_BAND_RATIO;
+                        float zhi   = zlo * DL_LEAF_BAND_RATIO;
+                        if (zhi >= cd1) zhi = DL_LEAF_FARZ;        // last band -> the cell's far edge
                         m = DL_ClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
                                                zlo, zhi, clx, cly, DL_LEAF_EMIT_MAXV);
                         if (m >= 3) {
@@ -5127,6 +5137,7 @@ static void DL_RSPLeafDispatch(void)
                                 nv++;
                             }
                         }
+                        if (zhi == DL_LEAF_FARZ) break;            // covered the cell's far edge
                         zlo = zhi;
                     }
                 }
