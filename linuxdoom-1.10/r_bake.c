@@ -79,12 +79,26 @@ fixed_t       (*bake_leaf_verts)[2] = NULL;
 int             bake_numleafverts = 0;
 byte*           bake_leafvis      = NULL;    // per-subsector visibility (PU_LEVEL)
 
+bake_cell_t*    bake_cells        = NULL;    // grid-tessellated floor/ceiling cells (PU_LEVEL)
+int             bake_numcells     = 0;
+fixed_t       (*bake_cell_verts)[2] = NULL;  // shared cell vertex pool (map x,y)
+int             bake_numcellverts = 0;
+
 #define BAKE_LEAF_MAXV  48      // clipped-leaf vertex cap (BSP depth + the 4 bound edges)
 #define BAKE_MAXDEPTH   64      // BSP recursion guard
+// Cell edge in map units. Each cell's texel span is <= BAKE_CELL_SIZE, which MUST stay
+// under the rsp_rdpq_tri per-edge s10.5 derivative limit (~1024 texels on S/world-x;
+// the observed V/world-y drop threshold sits below ~938) or the engine drops triangles
+// and the plane flickers to void. 512 keeps ~2x margin while halving the cell count vs
+// 256 (fewer triangles -> lower P95). Multiple of 64 so cell edges fall on flat-period
+// boundaries. Tunable: raise toward the limit for fewer triangles, lower for safety.
+#define BAKE_CELL_SIZE  512
+#define BAKE_CELL_MAXV  64      // a convex leaf (<=48v) clipped to a box gains <=4 verts
 
 typedef struct { double x, y; } bdpt_t;
 
 static int      bake_leafvert_cap = 0;
+static int      bake_cellvert_cap = 0;
 static bdpt_t   bake_polypool[BAKE_MAXDEPTH][BAKE_LEAF_MAXV];  // per-depth scratch (flat stack)
 
 // Clip convex poly (n verts, map units) to ONE node partition half-plane.
@@ -235,6 +249,252 @@ static double bake_pt_outside_dist (const bake_leaf_t* lf, double px, double py)
     return worst;
 }
 
+// ===========================================================================
+// Floor/ceiling CELL tessellation -- clip each leaf's convex polygon to a fixed
+// world-aligned grid (BAKE_CELL_SIZE map units) so every emitted triangle's texel
+// span stays under the rsp_rdpq_tri edge-derivative limit. Built OFFLINE (this pass)
+// so the runtime no longer needs its per-frame, view-dependent depth-band split.
+// ===========================================================================
+
+// Clip convex poly (n verts, map units) to ONE axis-aligned half-plane.
+// axis 0 == x, 1 == y. keepLE: keep points whose coord <= bound (1) or >= bound (0).
+static int bake_clip_axis (const bdpt_t* in, int n, int axis, double bound,
+                           int keepLE, bdpt_t* out)
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++)
+    {
+        const bdpt_t* A = &in[i];
+        const bdpt_t* B = &in[(i + 1) % n];
+        double ca = axis ? A->y : A->x;
+        double cb = axis ? B->y : B->x;
+        double fA = keepLE ? (ca - bound) : (bound - ca);   // <=0 == inside
+        double fB = keepLE ? (cb - bound) : (bound - cb);
+        int    inA = (fA <= 0.0), inB = (fB <= 0.0);
+        if (inA && m < BAKE_CELL_MAXV)
+            out[m++] = *A;
+        if (inA != inB && m < BAKE_CELL_MAXV)
+        {
+            double t = fA / (fA - fB);
+            out[m].x = A->x + t * (B->x - A->x);
+            out[m].y = A->y + t * (B->y - A->y);
+            m++;
+        }
+    }
+    return m;
+}
+
+// Commit one tessellated cell of leaf lf (subsector ss) into the cell table + pool.
+// Two-pass: when bake_cells is NULL this is the COUNT pass (advance counters only);
+// when allocated it stores. Both passes run the identical clip/cull, so the counts
+// match exactly and the store pass cannot overflow the sized pool.
+static void bake_store_cell (int ss, const bake_leaf_t* lf, const bdpt_t* poly, int n)
+{
+    int k;
+    if (n < 3) return;
+    if (bake_cells)                                         // STORE pass
+    {
+        bake_cell_t* c;
+        fixed_t      umin = 0x7fffffff, vmin = 0x7fffffff;
+        c = &bake_cells[bake_numcells];
+        c->firstvert  = bake_numcellverts;
+        c->numverts   = (short)n;
+        c->subsector  = (short)ss;
+        c->sector     = lf->sector;
+        c->floorpic   = lf->floorpic;
+        c->ceilingpic = lf->ceilingpic;
+        for (k = 0; k < n; k++)
+        {
+            fixed_t fx = (fixed_t)(poly[k].x * 65536.0);
+            fixed_t fy = (fixed_t)(poly[k].y * 65536.0);
+            fixed_t u  = fx >> FRACBITS, v = fy >> FRACBITS;
+            if (u < umin) umin = u;
+            if (v < vmin) vmin = v;
+            bake_cell_verts[bake_numcellverts][0] = fx;
+            bake_cell_verts[bake_numcellverts][1] = fy;
+            bake_numcellverts++;
+        }
+        c->ubias = (int)(umin & ~63);                       // floor to 64-texel flat period
+        c->vbias = (int)(vmin & ~63);
+    }
+    else                                                    // COUNT pass
+    {
+        bake_numcellverts += n;
+    }
+    bake_numcells++;
+}
+
+// Tight axis-aligned bbox (map units) of a sector, over all its linedef vertices.
+// Bounds the real floor footprint: a peripheral BSP leaf's convex region can keep
+// edges of the map-bounds quad (overhang past the sector's walls -- pure overdraw the
+// runtime hides under nearer geometry + the z-buffer), and tessellating that raw emits
+// thousands of dead cells. The sector AABB provably contains every pixel of that
+// sector's floor (the floor is the interior of the sector's linedefs), so clipping a
+// leaf to it before gridding trims ONLY dead overhang. Returns 0 if the sector has no
+// lines (leave the leaf untrimmed).
+static int bake_sector_bbox (int sec, double* xlo, double* ylo, double* xhi, double* yhi)
+{
+    const sector_t* s;
+    double lo_x = 1e30, lo_y = 1e30, hi_x = -1e30, hi_y = -1e30;
+    int    i;
+    if ((unsigned)sec >= (unsigned)numsectors) return 0;
+    s = &sectors[sec];
+    if (s->linecount <= 0 || !s->lines) return 0;
+    for (i = 0; i < s->linecount; i++)
+    {
+        const line_t* ln = s->lines[i];
+        double vx[2], vy[2];
+        int    k;
+        vx[0] = ln->v1->x / 65536.0; vy[0] = ln->v1->y / 65536.0;
+        vx[1] = ln->v2->x / 65536.0; vy[1] = ln->v2->y / 65536.0;
+        for (k = 0; k < 2; k++)
+        {
+            if (vx[k] < lo_x) lo_x = vx[k];
+            if (vx[k] > hi_x) hi_x = vx[k];
+            if (vy[k] < lo_y) lo_y = vy[k];
+            if (vy[k] > hi_y) hi_y = vy[k];
+        }
+    }
+    *xlo = lo_x; *ylo = lo_y; *xhi = hi_x; *yhi = hi_y;
+    return 1;
+}
+
+// Tessellate one leaf's convex polygon into world-grid cells. Cells are aligned to a
+// global grid (floor(x / BAKE_CELL_SIZE)) so neighbouring leaves share cell seams and
+// each cell edge falls on a 64-texel flat-period boundary.
+static void bake_tessellate_leaf (int ss)
+{
+    const bake_leaf_t* lf = &bake_leaves[ss];
+    bdpt_t src[BAKE_CELL_MAXV], a[BAKE_CELL_MAXV], b[BAKE_CELL_MAXV];
+    double xmin = 1e30, xmax = -1e30, ymin = 1e30, ymax = -1e30;
+    double sxlo, sylo, sxhi, syhi;
+    int    n, i, gx0, gx1, gy0, gy1, gx, gy;
+    int    produced = bake_numcells;     // diagnostic: cells this leaf emits
+
+    n = lf->numverts;
+    if (n < 3) return;
+    if (n > BAKE_CELL_MAXV) n = BAKE_CELL_MAXV;             // leaf maxv 48; guard anyway
+    for (i = 0; i < n; i++)
+    {
+        src[i].x = bake_leaf_verts[lf->firstvert + i][0] / 65536.0;
+        src[i].y = bake_leaf_verts[lf->firstvert + i][1] / 65536.0;
+    }
+
+    // Trim the leaf to its sector's real footprint FIRST -- kills the map-bounds
+    // overhang that peripheral BSP leaves carry. Normal leaves sit inside their sector
+    // AABB, so this is a no-op for them; a degenerate clip (<3 verts) leaves src as-is.
+    if (bake_sector_bbox (lf->sector, &sxlo, &sylo, &sxhi, &syhi))
+    {
+        int cn;
+        cn = bake_clip_axis (src, n, 0, sxlo, 0, a);                  // x >= sxlo
+        cn = (cn >= 3) ? bake_clip_axis (a, cn, 0, sxhi, 1, b) : 0;   // x <= sxhi
+        cn = (cn >= 3) ? bake_clip_axis (b, cn, 1, sylo, 0, a) : 0;   // y >= sylo
+        cn = (cn >= 3) ? bake_clip_axis (a, cn, 1, syhi, 1, b) : 0;   // y <= syhi
+        if (cn >= 3) { memcpy (src, b, (size_t)cn * sizeof(bdpt_t)); n = cn; }
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        double x = src[i].x, y = src[i].y;
+        if (x < xmin) xmin = x;
+        if (x > xmax) xmax = x;
+        if (y < ymin) ymin = y;
+        if (y > ymax) ymax = y;
+    }
+    gx0 = (int)floor(xmin / BAKE_CELL_SIZE);
+    gx1 = (int)floor((xmax - 1e-4) / BAKE_CELL_SIZE);
+    gy0 = (int)floor(ymin / BAKE_CELL_SIZE);
+    gy1 = (int)floor((ymax - 1e-4) / BAKE_CELL_SIZE);
+    if (gx1 < gx0) gx1 = gx0;
+    if (gy1 < gy0) gy1 = gy0;
+    if (gx0 == gx1 && gy0 == gy1)                           // already within one cell
+    {
+        bake_store_cell (ss, lf, src, n);
+        return;
+    }
+    for (gy = gy0; gy <= gy1; gy++)
+    {
+        double ylo = (double)gy * BAKE_CELL_SIZE, yhi = ylo + BAKE_CELL_SIZE;
+        for (gx = gx0; gx <= gx1; gx++)
+        {
+            double xlo = (double)gx * BAKE_CELL_SIZE, xhi = xlo + BAKE_CELL_SIZE;
+            int m;
+            m = bake_clip_axis (src, n, 0, xlo, 0, a);      // x >= xlo
+            if (m < 3) continue;
+            m = bake_clip_axis (a, m, 0, xhi, 1, b);        // x <= xhi
+            if (m < 3) continue;
+            m = bake_clip_axis (b, m, 1, ylo, 0, a);        // y >= ylo
+            if (m < 3) continue;
+            m = bake_clip_axis (a, m, 1, yhi, 1, b);        // y <= yhi
+            if (m < 3) continue;
+            bake_store_cell (ss, lf, b, m);
+        }
+    }
+    produced = bake_numcells - produced;
+    if (bake_cells && produced > 256)                      // STORE pass only; flag the outliers
+        debugf ("  leaf ss=%d sec=%d nv=%d bbox=%dx%d units -> %d cells\n",
+                ss, lf->sector, n, (int)(xmax - xmin), (int)(ymax - ymin), produced);
+}
+
+// Allocate the cell table + vertex pool exactly (sizes from the count pass). PU_LEVEL.
+static void bake_cell_cap_alloc (int ncells, int nverts)
+{
+    int nc = (ncells > 0) ? ncells : 1;
+    int nv = (nverts > 0) ? nverts : 1;
+    bake_cellvert_cap = nv;
+    bake_cells      = Z_Malloc (sizeof(bake_cell_t) * nc, PU_LEVEL, NULL);
+    bake_cell_verts = Z_Malloc (sizeof(fixed_t) * 2 * nv, PU_LEVEL, NULL);
+}
+
+//
+// P_BakeLeafCells -- grid-tessellate every filled leaf into the cell pool. Two passes:
+// pass 1 counts cells+verts with the pool NULL, pass 2 stores into the exactly-sized
+// PU_LEVEL pool. Leaves bake_leaves / bake_leaf_verts and the whole runtime untouched;
+// nothing consumes the cells yet (STEP 1). Reports the baked counts for verification.
+//
+static void P_BakeLeafCells (void)
+{
+    int ss, cells_per_leaf_max = 0, maxv = 0;
+
+    bake_cells = NULL; bake_numcells = 0;
+    bake_cell_verts = NULL; bake_numcellverts = 0; bake_cellvert_cap = 0;
+    if (numsubsectors <= 0 || !bake_leaves)
+        return;
+
+    // Pass 1: count (pool NULL).
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        int before = bake_numcells;
+        if (bake_leaves[ss].numverts < 3) continue;
+        bake_tessellate_leaf (ss);
+        if (bake_numcells - before > cells_per_leaf_max)
+            cells_per_leaf_max = bake_numcells - before;
+    }
+    if (bake_numcells <= 0)
+    {
+        debugf ("P_BakeLeafCells: 0 cells (no filled leaves)\n");
+        return;
+    }
+
+    // Allocate exactly, then re-run to store.
+    bake_cell_cap_alloc (bake_numcells, bake_numcellverts);
+    {
+        int want_cells = bake_numcells, want_verts = bake_numcellverts;
+        bake_numcells = 0; bake_numcellverts = 0;
+        for (ss = 0; ss < numsubsectors; ss++)
+        {
+            if (bake_leaves[ss].numverts < 3) continue;
+            bake_tessellate_leaf (ss);
+        }
+        for (ss = 0; ss < bake_numcells; ss++)
+            if (bake_cells[ss].numverts > maxv) maxv = bake_cells[ss].numverts;
+        debugf ("P_BakeLeafCells: %d cells, %d verts (cellsize=%d), maxv=%d, "
+                "max-cells/leaf=%d (want %d/%d)\n",
+                bake_numcells, bake_numcellverts, BAKE_CELL_SIZE, maxv,
+                cells_per_leaf_max, want_cells, want_verts);
+    }
+}
+
 //
 // P_BakeLeafFans -- build the convex floor/ceiling polygon for every subsector and
 // validate it numerically (convexity + every seg endpoint inside-or-on its leaf, which
@@ -294,6 +554,10 @@ static void P_BakeLeafFans (void)
             "nonconvex=%d, seg-outside(>1u)=%d worst=%dunits, vpool %d/%d\n",
             numsubsectors, filled, empty, maxv, nonconvex, segout,
             (int)(worstseg + 0.5), bake_numleafverts, bake_leafvert_cap);
+
+    // STEP 1: grid-tessellate the leaves into the cell pool. Nothing consumes the cells
+    // yet -- the runtime still draws from bake_leaves -- so this cannot regress rendering.
+    P_BakeLeafCells ();
 }
 
 //
