@@ -4859,46 +4859,42 @@ static int             leaf_rsp_clipnv_cap = 0;// (clipnv 0 = leaf clipped away 
 #define DL_LEAF_EMIT_MAXV 16        // MUST match LEAF_EMIT_MAXV in rsp/rsp_dlemit.S (per-leaf cap)
 #define DL_LEAF_CLIP_PAD  4096      // extra leaf_in/out slots: frustum clip can add verts per leaf
 
-// Frustum-clip a convex leaf polygon (world XY) against the near plane and the two side
-// planes, so the projected verts always land inside the edge-walker guard band. WHY: the
-// mesh leaf path has no per-edge clip -- it DROPS any leaf with a vertex past the near
-// plane (rdp_view.c near cull) and SUPPRESSES the visplane fallback (r_plane.c), so the
-// subsector under the player (always straddling the near plane) renders BLACK. Clipping
-// here, on the CPU in view space (cheap -- no divide), feeds in-frustum verts to the RSP
-// transform, so the no-readback path stays readback-free and the floor draws. Sutherland-
-// Hodgman, float world-units; writes clipped XY (fixed_t) to outx/outy. Returns the
-// clipped vertex count, or 0 if fully clipped away or it would exceed `cap`.
-static int DL_ClipLeafFrustum(int firstvert, int n,
-                              float vxf, float vyf, float vcosf, float vsinf, float cxf,
-                              float nearzf, fixed_t* outx, fixed_t* outy, int cap)
-{
-    float px[DL_LEAF_MAXV + 8], py[DL_LEAF_MAXV + 8];
-    float qx[DL_LEAF_MAXV + 8], qy[DL_LEAF_MAXV + 8];
-    int   m = n, i, plane;
-    // nearzf is the EFFECTIVE near plane: max(true near, the depth at which this surface's
-    // height projects to the bottom/top screen edge) -- cy depends only on depth, so folding
-    // the vertical screen plane into a constant-depth near plane bounds cy without a separate
-    // top/bottom clip. Sides kept INSIDE the RSP cull window (+/-900px) so rounding can't trip it.
-    const float NEARZF = nearzf;
-    const float SXMIN  = -900.0f, SXMAX = (float)SCREENWIDTH + 900.0f;
-    const float KHI    = (cxf - SXMIN) / cxf;   // left  plane: keep lat <= KHI*depth
-    const float KLO    = (cxf - SXMAX) / cxf;   // right plane: keep lat >= KLO*depth
+// Frustum-clip a convex leaf polygon so the projected verts land inside the edge-walker guard
+// band. WHY: the mesh leaf path has no per-edge clip -- it DROPS any leaf with a vertex past the
+// near plane and SUPPRESSES the visplane fallback, so the subsector under the player (always
+// straddling the near plane) renders BLACK. Clipping here on the CPU in view space (no divide)
+// feeds in-frustum verts to the RSP transform, keeping the no-readback path readback-free.
+//
+// Split in two so the cost stays low: the two SIDE planes are height-independent, so they are
+// clipped ONCE per leaf (DL_ClipLeafSides) and shared by floor + ceiling; only the near plane is
+// per-surface (DL_ClipNearToFixed, run on the already-smaller sides-clipped polygon). The near
+// plane is EFFECTIVE -- max(true near, the depth at which this surface's height projects to the
+// bottom/top screen edge) -- so cy is bounded without a separate vertical clip.
 
+// Clip against the 2 side planes (left/right). Loads bake_leaf_verts -> float world XY in px/py.
+// Returns the vertex count. Sides kept inside the RSP cull window (+/-900px) so rounding is safe.
+static int DL_ClipLeafSides(int firstvert, int n,
+                            float vxf, float vyf, float vcosf, float vsinf, float cxf,
+                            float* px, float* py)
+{
+    float qx[DL_LEAF_MAXV + 8], qy[DL_LEAF_MAXV + 8];
+    const float SXMIN = -900.0f, SXMAX = (float)SCREENWIDTH + 900.0f;
+    const float KHI = (cxf - SXMIN) / cxf;   // left:  keep lat <= KHI*depth
+    const float KLO = (cxf - SXMAX) / cxf;   // right: keep lat >= KLO*depth
+    int m = n, i, plane;
     if (n < 3 || n > DL_LEAF_MAXV) return 0;
     for (i = 0; i < n; i++) {
         px[i] = (float)bake_leaf_verts[firstvert + i][0] * (1.0f / 65536.0f);
         py[i] = (float)bake_leaf_verts[firstvert + i][1] * (1.0f / 65536.0f);
     }
-    for (plane = 0; plane < 3 && m >= 3; plane++) {
+    for (plane = 0; plane < 2 && m >= 3; plane++) {
         float f[DL_LEAF_MAXV + 8];
         int   outc = 0, j;
         for (j = 0; j < m; j++) {
             float dx = px[j] - vxf, dy = py[j] - vyf;
             float depth = dx * vcosf + dy * vsinf;
             float lat   = dy * vcosf - dx * vsinf;
-            f[j] = (plane == 0) ? (NEARZF - depth)
-                 : (plane == 1) ? (lat - KHI * depth)
-                 :                (KLO * depth - lat);
+            f[j] = (plane == 0) ? (lat - KHI * depth) : (KLO * depth - lat);
         }
         for (j = 0; j < m; j++) {
             int   k   = (j + 1 == m) ? 0 : j + 1;
@@ -4915,13 +4911,42 @@ static int DL_ClipLeafFrustum(int firstvert, int n,
         m = outc;
         for (j = 0; j < m; j++) { px[j] = qx[j]; py[j] = qy[j]; }
     }
-    if (m < 3)   return 0;    // clipped fully away (behind near / outside frustum)
-    if (m > cap) return -1;   // too many verts for the per-leaf emit buffers
-    for (i = 0; i < m; i++) {
-        outx[i] = (fixed_t)(px[i] * 65536.0f);
-        outy[i] = (fixed_t)(py[i] * 65536.0f);
-    }
     return m;
+}
+
+// Clip the sides-clipped polygon (float world XY in px/py, m verts) against the per-surface
+// EFFECTIVE near plane nearzf, writing clipped XY (fixed_t) to outx/outy. Returns the clipped
+// count, 0 if fully clipped away, -1 if it exceeds `cap`.
+static int DL_ClipNearToFixed(const float* px, const float* py, int m,
+                              float vxf, float vyf, float vcosf, float vsinf, float nearzf,
+                              fixed_t* outx, fixed_t* outy, int cap)
+{
+    float f[DL_LEAF_MAXV + 8];
+    int   outc = 0, j;
+    if (m < 3) return 0;
+    for (j = 0; j < m; j++) {
+        float dx = px[j] - vxf, dy = py[j] - vyf;
+        f[j] = nearzf - (dx * vcosf + dy * vsinf);   // inside (in front) if <= 0
+    }
+    for (j = 0; j < m; j++) {
+        int   k   = (j + 1 == m) ? 0 : j + 1;
+        int   ain = (f[j] <= 0.0f), bin = (f[k] <= 0.0f);
+        if (ain) {
+            outx[outc] = (fixed_t)(px[j] * 65536.0f);
+            outy[outc] = (fixed_t)(py[j] * 65536.0f);
+            outc++;
+        }
+        if (ain != bin) {
+            float t = f[j] / (f[j] - f[k]);
+            outx[outc] = (fixed_t)((px[j] + t * (px[k] - px[j])) * 65536.0f);
+            outy[outc] = (fixed_t)((py[j] + t * (py[k] - py[j])) * 65536.0f);
+            outc++;
+        }
+        if (outc >= DL_LEAF_MAXV + 6) break;
+    }
+    if (outc < 3)   return 0;
+    if (outc > cap) return -1;
+    return outc;
 }
 
 // Phase 4 FOLD: QUEUE every visible leaf's verts to the RSP -- but DO NOT wait. Called
@@ -4994,40 +5019,43 @@ static void DL_RSPLeafDispatch(void)
     vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
 
     {
-        // CPU frustum clip (float world-units). Per surface (floor/ceiling) because the
-        // bottom/top screen edge folds into a per-surface effective near plane.
+        // CPU frustum clip (float world-units). Side planes are height-independent so they are
+        // clipped ONCE per leaf (DL_ClipLeafSides) and shared by floor+ceiling; only the near
+        // plane is per-surface (DL_ClipNearToFixed on the smaller sides-clipped polygon).
         float vxf = (float)viewx * (1.0f / 65536.0f), vyf = (float)viewy * (1.0f / 65536.0f);
         float vcosf = (float)vcos * (1.0f / 65536.0f), vsinf = (float)vsin * (1.0f / 65536.0f);
         float cxf = (float)centerx, viewzf = (float)viewz * (1.0f / 65536.0f);
-        // cy = centery - hf*centerx/depth, so a vert clears the bottom/top screen edge only
-        // for depth >= |hf|*centerx/EDGE. Folding that into the near plane keeps cy inside the
-        // RSP cy-cull window ([-1024, SCREENHEIGHT+1024]) -- the cull then never drops a leaf.
-        // Clip the bottom/top edge to SCREENHEIGHT+256 / -256 -- well inside the RSP cy-cull
-        // window (+/-1024 past the screen) so rounding at the clip boundary never trips it.
-        // The visible floor (cy in [0,SCREENHEIGHT]) is always kept; the 256px margin is scissored.
+        // cy = centery - hf*centerx/depth, so a vert clears the bottom/top screen edge only for
+        // depth >= |hf|*centerx/EDGE. Folding that into the near plane keeps cy inside the RSP
+        // cy-cull window. Clip the edge to SCREENHEIGHT+256 / -256 -- inside the window so
+        // boundary rounding never trips it; the visible floor [0,SCREENHEIGHT] is always kept.
         float EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;    // floor (hf<0) bottom edge
         float EDGET = (float)centery + 256.0f;                         // ceiling (hf>0) top edge
+        float spx[DL_LEAF_MAXV + 8], spy[DL_LEAF_MAXV + 8];
         fixed_t clx[DL_LEAF_MAXV + 8], cly[DL_LEAF_MAXV + 8];
         int     cap = leaf_buf_cap - (DL_LEAF_EMIT_MAXV + 1);
         int     surf;
         memset(leaf_rsp_clipnv, 0, sizeof(int) * 2 * numsubsectors);
-        for (surf = 0; surf < 2; surf++) {
-            for (ss = 0; ss < numsubsectors && nv < cap; ss++) {
-                bake_leaf_t* lf = &bake_leaves[ss];
-                int     n = lf->numverts, m, slot = surf * numsubsectors + ss;
+        for (ss = 0; ss < numsubsectors && nv < cap; ss++) {
+            bake_leaf_t* lf = &bake_leaves[ss];
+            int n = lf->numverts, ms;
+            if (!bake_leafvis[ss]) continue;
+            if (n < 3 || n > DL_LEAF_MAXV) continue;
+            if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
+            ms = DL_ClipLeafSides(lf->firstvert, n, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
+            if (ms < 3) continue;                                  // off both side planes
+            for (surf = 0; surf < 2 && nv < cap; surf++) {
+                int     m, slot = surf * numsubsectors + ss;
                 fixed_t height;
                 float   hf, nearz_eff;
-                if (!bake_leafvis[ss]) continue;
-                if (n < 3 || n > DL_LEAF_MAXV) continue;
-                if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
                 if ((surf ? lf->ceilingpic : lf->floorpic) == skyflatnum) continue;  // sky stays CPU
                 height = surf ? sectors[lf->sector].ceilingheight
                               : sectors[lf->sector].floorheight;
-                hf = (float)height * (1.0f / 65536.0f) - viewzf;        // surface height vs eye
-                nearz_eff = 6.0f;                                       // true near (margin > 4)
+                hf = (float)height * (1.0f / 65536.0f) - viewzf;   // surface height vs eye
+                nearz_eff = 6.0f;                                  // true near (margin > 4)
                 if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
                 else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
-                m = DL_ClipLeafFrustum(lf->firstvert, n, vxf, vyf, vcosf, vsinf, cxf,
+                m = DL_ClipNearToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
                                        nearz_eff, clx, cly, DL_LEAF_EMIT_MAXV);
                 if (m < 3) continue;                               // clipped away / over emit cap
                 leaf_rsp_start[slot]  = nv;
