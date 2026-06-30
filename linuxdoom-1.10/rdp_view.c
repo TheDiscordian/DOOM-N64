@@ -5263,6 +5263,13 @@ static void DL_LeafRSPEmitFlush(void)
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
     int dbg_desc[2] = {0,0}, dbg_dcap = 0, dbg_mvis[2] = {0,0}, dbg_nflat[2] = {0,0};  // emit diag
+    int dbg_rb = 0;   // readback diag: how many ceiling bands we've ground-truthed this frame
+    // ceiling-band ground truth, accumulated across the flat loop for surf==1:
+    int dbg_cz_cells = 0;   // ceiling bands inspected
+    int dbg_cz_above = 0;   // bands entirely above the screen top (cy_max < 0)  -> correct overhead cull
+    int dbg_cz_onscr = 0;   // bands with >=1 vert on-screen (cy in [0,SCREENH])
+    int dbg_cz_tris  = 0;   // total fan triangles in on-screen bands
+    int dbg_cz_cull  = 0;   // fan triangles in on-screen bands the |cross|<32 cull would drop
 
     // ROOT-CAUSE FIX (no readback): each LeafBatch is queued, not waited on, so the CPU runs
     // ahead of the RSP. Rebuilding leaf_desc_buf from index 0 per flat/surface OVERWROTE the
@@ -5338,6 +5345,50 @@ static void DL_LeafRSPEmitFlush(void)
                 for (b = 0; b < DL_LEAF_NBANDS; b++) {
                     int n = cell_rsp_clipnv[sl + b];
                     if (n < 3) continue;
+                    {   // READBACK: ground-truth the RSP leaf transform output for every CEILING
+                        // band. leaf_out_buf is CPU-coherent here (invalidated in DL_RSPLeafDrain).
+                        // For each band: project cy per-vertex (the emit-overlay formula), count
+                        // on-screen verts, and REPLICATE the rsp_dlemit |cross|<32 degenerate cull
+                        // per fan triangle. Distinguishes: visible ceiling bands absent (projection/
+                        // gate bug) vs present-but-degenerate-culled (cull too aggressive) vs
+                        // present-and-survive (loss is downstream in the engine/scissor).
+                        extern unsigned long N64Bench_FrameNo(void);
+                        unsigned long fno = N64Bench_FrameNo();
+                        if (surf == 1 && (fno == 3711 || fno == 3712)) {
+                            int j, st = cell_rsp_start[sl + b], onscr = 0, culled = 0, tris = 0;
+                            int cxmin = 99999, cxmax = -99999, cymin = 99999, cymax = -99999;
+                            int X[16], Y[16], nn = (n > 16) ? 16 : n;
+                            for (j = 0; j < nn; j++) {
+                                const rsp_bleaf_out_t* ro = &leaf_out_buf[st + j];
+                                int cxp  = ro->cx >> 16;
+                                int cy16 = ((int)centery << 16) - centerx * FixedMul(hf16, ro->invw);
+                                int cyp  = cy16 >> 16;
+                                X[j] = ro->cx  >> 14;     // staged VTX_ATTR_XY (s11.2) -- cull input
+                                Y[j] = cy16    >> 14;
+                                if (cyp >= 0 && cyp <= SCREENHEIGHT) onscr++;
+                                if (cxp < cxmin) cxmin = cxp;
+                                if (cxp > cxmax) cxmax = cxp;
+                                if (cyp < cymin) cymin = cyp;
+                                if (cyp > cymax) cymax = cyp;
+                            }
+                            for (j = 1; j < nn - 1; j++) {        // fan (v0, vj, vj+1)
+                                int cr = (X[j]-X[0])*(Y[j+1]-Y[0]) - (X[j+1]-X[0])*(Y[j]-Y[0]);
+                                if (cr < 0) cr = -cr;
+                                tris++;
+                                if (cr < 32) culled++;
+                            }
+                            dbg_cz_cells++;
+                            if (cymax < 0) dbg_cz_above++;
+                            if (onscr > 0) { dbg_cz_onscr++; dbg_cz_tris += tris; dbg_cz_cull += culled; }
+                            if (dbg_rb < 24) {
+                                debugf("LEAFRB f=%lu cell=%d b=%d n=%d cx[%d..%d] cy[%d..%d] "
+                                       "onscr=%d tris=%d cull=%d\n",
+                                       fno, cellvis[vi], b, n, cxmin, cxmax, cymin, cymax,
+                                       onscr, tris, culled);
+                                dbg_rb++;
+                            }
+                        }
+                    }
                     if (dcur >= DCAP) { dbg_dcap++; break; }
                     leaf_desc_buf[dcur].rec_addr = PhysicalAddr(&leaf_out_buf[cell_rsp_start[sl + b]]);
                     leaf_desc_buf[dcur].hf16   = (uint32_t)hf16;
@@ -5452,6 +5503,9 @@ static void DL_LeafRSPEmitFlush(void)
         if (fno==127||fno==128||fno==3199||fno==3200||fno==3711||fno==3712||dbg_dcap>0)
             debugf("EMITDIAG f=%lu floor[vis=%d flat=%d desc=%d] ceil[vis=%d flat=%d desc=%d] dcap_break=%d DCAP=%d\n",
                    fno, dbg_mvis[0],dbg_nflat[0],dbg_desc[0], dbg_mvis[1],dbg_nflat[1],dbg_desc[1], dbg_dcap, DCAP);
+        if (fno==3711||fno==3712)
+            debugf("LEAFRBSUM f=%lu ceilbands=%d above=%d onscreen=%d onscr_tris=%d onscr_culled=%d\n",
+                   fno, dbg_cz_cells, dbg_cz_above, dbg_cz_onscr, dbg_cz_tris, dbg_cz_cull);
     }
 
     dl_leaf_tris = drew;
