@@ -5262,6 +5262,7 @@ static void DL_LeafRSPEmitFlush(void)
     // so TEX*SHADE == the CPU path's TEX*PRIM. centerx/centery set once per frame.
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
+    int dbg_desc[2] = {0,0}, dbg_dcap = 0, dbg_mvis[2] = {0,0}, dbg_nflat[2] = {0,0};  // emit diag
 
     // ROOT-CAUSE FIX (no readback): each LeafBatch is queued, not waited on, so the CPU runs
     // ahead of the RSP. Rebuilding leaf_desc_buf from index 0 per flat/surface OVERWROTE the
@@ -5298,6 +5299,7 @@ static void DL_LeafRSPEmitFlush(void)
             for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
             if (!seen && nflat < 256) flats[nflat++] = fl;
         }
+        dbg_mvis[surf] = nvis; dbg_nflat[surf] = nflat;   // emit diag: visible cells / flats this surf
 
         // Pass 2: per distinct flat, bind TMEM ONCE, then fire LeafFan for each cell on it.
         for (fi = 0; fi < nflat; fi++)
@@ -5336,12 +5338,13 @@ static void DL_LeafRSPEmitFlush(void)
                 for (b = 0; b < DL_LEAF_NBANDS; b++) {
                     int n = cell_rsp_clipnv[sl + b];
                     if (n < 3) continue;
-                    if (dcur >= DCAP) break;
+                    if (dcur >= DCAP) { dbg_dcap++; break; }
                     leaf_desc_buf[dcur].rec_addr = PhysicalAddr(&leaf_out_buf[cell_rsp_start[sl + b]]);
                     leaf_desc_buf[dcur].hf16   = (uint32_t)hf16;
                     leaf_desc_buf[dcur].prim   = prim;
                     leaf_desc_buf[dcur].packed = (uint32_t)(n & 0x3F) | packhdr;
                     dcur++;
+                    dbg_desc[surf]++;
                     drew += n - 2;
                 }
             }
@@ -5441,6 +5444,14 @@ static void DL_LeafRSPEmitFlush(void)
             if (dcur >= DCAP) { rspq_wait(); dcur = 0; }
         }
 #endif
+    }
+
+    {   // emit diag: floor vs ceiling descriptors actually emitted + cap state, busy vs quiet frame
+        extern unsigned long N64Bench_FrameNo(void);
+        unsigned long fno = N64Bench_FrameNo();
+        if (fno==127||fno==128||fno==3199||fno==3200||fno==3711||fno==3712||dbg_dcap>0)
+            debugf("EMITDIAG f=%lu floor[vis=%d flat=%d desc=%d] ceil[vis=%d flat=%d desc=%d] dcap_break=%d DCAP=%d\n",
+                   fno, dbg_mvis[0],dbg_nflat[0],dbg_desc[0], dbg_mvis[1],dbg_nflat[1],dbg_desc[1], dbg_dcap, DCAP);
     }
 
     dl_leaf_tris = drew;
