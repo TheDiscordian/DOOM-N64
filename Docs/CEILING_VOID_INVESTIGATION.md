@@ -101,9 +101,39 @@ Source of the straddle: the dispatch keeps a 256px OVERSCAN above the screen
 (`EDGET = centery + 256`, rdp_view.c) so cy stays inside a now-DISABLED RSP cy-cull window.
 That overscan is what lets the straddler reach the engine.
 
-## FIX UNDER TEST
-Clip ceilings at the EXACT top edge: `EDGET = centery` (was `centery + 256`). The above-screen
-part is removed; cell 84's on-screen sliver becomes a clean triangle the engine rasterises.
-FLOOR EDGEB keeps its 256 overscan (its bottom straddlers hide behind the status bar/weapon;
-tightening it is untested and floors are not reported broken). Verifying on frame 3712: the
-top-left grey ceiling should appear and stop showing the green sector behind it.
+## FIX TESTED -- FAILED (EDGET = centery)
+Clipped ceilings at the EXACT top edge: `EDGET = centery` (was `centery + 256`). Structurally
+it did what was intended -- LEAFRBSUM f=3712 went `above=19 -> above=0`, cell 84 became
+`cy[0..15]` (was `cy[-38..15]`), a clean fully-on-screen non-degenerate triangle that emits and
+survives the cull. Ryan tested the build: **the grey ceiling is STILL missing / still flickers**.
+So clean on-screen grey triangles STILL do not rasterise -> TOP-EDGE STRADDLING IS RULED OUT.
+The drop is something these clean on-screen grey triangles share that the green ones beside them
+do not. Commit `e014c77` (EDGET clip) is on the parked branch; it did not fix it.
+
+## STILL OPEN (the real question)
+Why do clean, fully-on-screen, non-degenerate GREY (near, h=191) ceiling fan triangles generate
+ZERO fragments, while the GREEN (far, h=231) bands right next to them rasterise normally? Ruled
+out so far: emit, the |cross|<32 degenerate cull, z (z-off = no change), projection/clip, and now
+straddling. The grey band differs from the green by: NEARER (larger invw / smaller W), a different
+flat (TMEM), and it is the case that most diverges from WALLS.
+
+## WALL vs PLANE (Ryan's lead -- they are NOT "the same")
+- Walls are vertical QUADS: V0/V1 top edge, V2/V3 bottom edge; transform clips them L/R to the
+  frustum, emit clips them to TMEM *texture* bands and lerps corner-Y to the band edges. Never thin.
+- Planes are horizontal polygons FANNED into n-2 tris from a shared v0, clipped to *depth* bands,
+  per-vertex screen-Y via `cy = centery - centerx*FixedMul(hf16,invw)`. Near the horizon they go
+  THIN + GRAZING (wide X, few px Y) -- a shape walls structurally cannot make.
+- The leaf emit (rsp_dlemit.S ~387) flags that leaf coords are NOT clipped to screen the way wall
+  coords are: "the projected coord (cx*4 in StageVtx) skews the RDP edge walker". The whole-leaf
+  cx/near culls there are DISABLED. Next probe should look HERE: whether the grey (near) fan tris
+  carry an off-screen-X vertex (the side-clip is +-160 world, not screen px) or a near/grazing
+  W/INVW that skews the rsp_rdpq_tri edge setup so the RDP emits no spans. A per-vertex readback of
+  cx (full range, not just on-screen count) + the staged INVW/W on the grey vs green bands is the
+  untested measurement.
+
+## STATUS: PARKED (2026-06-30)
+Mesh floors/ceilings do not render correctly in busy scenes; cause unresolved. Checkpointed the
+tree back to mesh-walls + poly-planes (`383cd05`); this whole experiment lives on branch
+`perf/rdp-mesh-planes-wip`. Resume from "STILL OPEN" + "WALL vs PLANE" above. Build the parked
+experiment with the full BENCH_FORCE_MESH_FLOORS + LEAF_* flag set; the working checkpoint builds
+with just `BENCH=1 BENCH_FORCE_RDP=1 BENCH_FORCE_MESH=1`.
