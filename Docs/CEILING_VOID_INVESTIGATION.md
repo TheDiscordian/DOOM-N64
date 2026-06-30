@@ -41,11 +41,25 @@ untested: the emit's per-flat / frame-wide `DCAP=2048` descriptor cursor and its
 be starved in dense frames), or the flat/cellvis caps, or the RSP transform output for those
 cells.
 
-## OPEN TEST (in progress)
-`EMITDIAG` log (rdp_view.c, this commit): per-frame floor-vs-ceiling **descriptors actually
-emitted**, visible-cell count, distinct flats, and `dcap_break` count, on busy frames
-(3200/3712) vs a quiet frame (128). If ceilings emit far fewer descriptors than are visible
-on busy frames, or `dcap_break>0`, that localises the drop. RESULT: _pending build_.
+## RULED OUT (cont.)
+8. **Emit descriptor drop / DCAP / flat-cap** — EMITDIAG result:
+   - quiet f=128:  floor[vis=40 desc=43] ceil[vis=43 desc=45] dcap_break=0
+   - void  f=3200: floor[vis=21 desc=26] ceil[vis=20 desc=22] dcap_break=0
+   - void  f=3712: floor[vis=40 desc=43] ceil[vis=43 desc=43] dcap_break=0
+   Every visible ceiling cell emits a descriptor (vis≈desc), `dcap_break=0` always, and the
+   void frames are NOT denser than the quiet one (3200 has FEWER cells). So the emit builds
+   and queues all ceiling descriptors; the cap is never hit. The loss is **downstream of the
+   emit** (RSP leaf transform or the LeafFan/rdpq_tri engine or the scissor), and the
+   floor-vs-ceiling asymmetry is purely **screen-Y** (ceiling=top, floor=bottom). "Busy scene"
+   is NOT about cell count.
+
+## CURRENT CONCLUSION (updated)
+Ceiling descriptors are emitted but the triangles don't rasterise, it's not z (z-off = no
+change), and it's specific to top-of-screen (ceiling) vs bottom (floor). Candidates, untested:
+(a) the RDP **scissor / view rect** excludes the top band where ceilings project; (b) the RSP
+**leaf transform output** (leaf_out_buf cx/cy/invw/emit) is bad for those cells; (c) the engine
+drops them on the per-edge S/T derivative (screen-space, NOT world span -- grazing top
+ceilings have a tiny screen edge so dS/dx blows up even though the cell span is ≤512).
 
 ## NEXT CANDIDATES (if EMITDIAG is clean)
 - Read back `leaf_out_buf` for the void ceiling cells at 3712 to see what the RSP transform
