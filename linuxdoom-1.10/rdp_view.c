@@ -5114,6 +5114,11 @@ static void DL_RSPLeafDispatch(void)
                     if ((surf ? cl->ceilingpic : cl->floorpic) == skyflatnum) continue;  // sky stays CPU
                     height = surf ? sectors[cl->sector].ceilingheight
                                   : sectors[cl->sector].floorheight;
+                    // Match R_Subsector's plane gate (r_bsp.c): a floor is only visible BELOW the
+                    // eye, a ceiling only ABOVE -- software makes no visplane otherwise. Without
+                    // this the mesh draws a floor-above / ceiling-below that software culls, which
+                    // the z-test then floats over the view as wrong geometry.
+                    if (surf ? (height <= viewz) : (height >= viewz)) continue;
                     hf = (float)height * (1.0f / 65536.0f) - viewzf;
                     nearz_eff = 6.0f;
                     if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
@@ -5160,6 +5165,8 @@ static void DL_RSPLeafDispatch(void)
                 if ((surf ? lf->ceilingpic : lf->floorpic) == skyflatnum) continue;  // sky stays CPU
                 height = surf ? sectors[lf->sector].ceilingheight
                               : sectors[lf->sector].floorheight;
+                // Match R_Subsector's plane gate (r_bsp.c): floor only below eye, ceiling only above.
+                if (surf ? (height <= viewz) : (height >= viewz)) continue;
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;   // surface height vs eye
                 nearz_eff = 6.0f;                                  // true near (margin > 4)
                 if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
