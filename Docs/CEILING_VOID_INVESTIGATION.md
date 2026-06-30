@@ -66,3 +66,44 @@ ceilings have a tiny screen edge so dS/dx blows up even though the cell span is 
   actually produced (cx/cy/invw/emit) — is the transform itself dropping them in dense frames?
 - Per-frame leaf-transform queue: does the wall batch's rspq_wait actually drain the leaf
   transform before the emit reads in busy frames?
+
+## READBACK GROUND TRUTH (decisive) -- LEAFRB / LEAFRBSUM, frame 3712
+Added a CPU readback in the cell emit pass-2 (leaf_out_buf is coherent there): per ceiling
+band, project cy with the emit-overlay formula, count on-screen verts, and replicate the
+rsp_dlemit `|cross|<32` degenerate cull in C.
+
+    LEAFRBSUM f=3712 ceilbands=43 above=19 onscreen=24 onscr_tris=48 onscr_culled=1
+
+- emit0 = 0 on every band -> NOTHING near-plane culled (emit flag clean).
+- 24 ceiling bands land ON-SCREEN, 48 fan tris -> the visible ceiling IS staged + emitted.
+- Only 1 of 48 on-screen tris hits the degenerate cull -> the `|cross|<32` cull is INNOCENT
+  (the doc's earlier "symmetry" rule-out was right in effect; the cull barely fires).
+
+Per-band, the on-screen ceiling is two surfaces:
+- FAR sector h=231: cells 102..141, fully on-screen at cy~18..37, cx~150..252 -> DRAW (this is
+  the green that shows through).
+- NEAR sector h=191 (the grey ceiling that should occlude): cells 84..89. They step UP to the
+  231 sector, so the near grey ceiling ends at ~depth 370 and almost all of it projects
+  OVERHEAD (cy<0, correctly clipped). Its ONLY on-screen footprint is the farthest grey cell,
+  cell 84 `cx[48..136] cy[-38..15]` -- a TOP-EDGE STRADDLER (one vert 38px above the screen,
+  the rest on-screen). It emits, survives the cull, but does NOT rasterise.
+
+## ROOT CAUSE (the only mechanism left after emit/cull/z/projection cleared)
+TOP-EDGE-STRADDLING ceiling triangles -- a vert tens of px above the top edge, the rest
+on-screen -- are dropped/mangled by the raw rsp_rdpq_tri LeafFan engine (verts well outside
+the guard band; REJFLAGS=0xFF disables trivial reject so they are NOT clipped, they are sent
+raw). The bands that DRAW (far green) are fully on-screen; the band that VANISHES (near grey,
+cell 84) is the straddler. This is why z-off changes nothing (the tri never rasterises), why
+emit/cull are clean, and why it is "busy-scene"-shaped: it needs a near ceiling that steps up
+to a higher far sector so the near ceiling's on-screen footprint is a thin top-edge straddle.
+
+Source of the straddle: the dispatch keeps a 256px OVERSCAN above the screen
+(`EDGET = centery + 256`, rdp_view.c) so cy stays inside a now-DISABLED RSP cy-cull window.
+That overscan is what lets the straddler reach the engine.
+
+## FIX UNDER TEST
+Clip ceilings at the EXACT top edge: `EDGET = centery` (was `centery + 256`). The above-screen
+part is removed; cell 84's on-screen sliver becomes a clean triangle the engine rasterises.
+FLOOR EDGEB keeps its 256 overscan (its bottom straddlers hide behind the status bar/weapon;
+tightening it is untested and floors are not reported broken). Verifying on frame 3712: the
+top-left grey ceiling should appear and stop showing the green sector behind it.

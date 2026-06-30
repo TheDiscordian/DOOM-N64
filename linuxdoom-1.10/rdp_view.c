@@ -5072,11 +5072,18 @@ static void DL_RSPLeafDispatch(void)
         float vcosf = (float)vcos * (1.0f / 65536.0f), vsinf = (float)vsin * (1.0f / 65536.0f);
         float cxf = (float)centerx, viewzf = (float)viewz * (1.0f / 65536.0f);
         // cy = centery - hf*centerx/depth, so a vert clears the bottom/top screen edge only for
-        // depth >= |hf|*centerx/EDGE. Folding that into the near plane keeps cy inside the RSP
-        // cy-cull window. Clip the edge to SCREENHEIGHT+256 / -256 -- inside the window so
-        // boundary rounding never trips it; the visible floor [0,SCREENHEIGHT] is always kept.
+        // depth >= |hf|*centerx/EDGE. Folding that into the near plane caps cy at the edge.
+        // CEILING (EDGET): clip at the EXACT top edge (centery), NOT centery+256. The +256
+        // overscan was to keep cy inside a now-DISABLED RSP cy-cull window, but it let near
+        // ceilings that step up to a higher far sector reach the LeafFan engine as TOP-EDGE
+        // STRADDLERS (one vert tens of px above screen, the rest on-screen). The raw rsp_rdpq_tri
+        // engine drops/mangles those (verts well outside the guard band) -- emitted but never
+        // rasterised -- so the near grey ceiling vanished and the far sector showed through
+        // (frame 3712). Clipping at centery removes the above-screen part; the on-screen sliver
+        // becomes a clean triangle the engine draws. FLOOR (EDGEB) keeps the 256 overscan: its
+        // bottom straddlers hide behind the status bar / weapon, and tightening it is untested.
         float EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;    // floor (hf<0) bottom edge
-        float EDGET = (float)centery + 256.0f;                         // ceiling (hf>0) top edge
+        float EDGET = (float)centery;                                  // ceiling (hf>0) top edge
         float spx[DL_LEAF_MAXV + 8], spy[DL_LEAF_MAXV + 8];
         fixed_t clx[DL_LEAF_MAXV + 8], cly[DL_LEAF_MAXV + 8];
         int     cap = leaf_buf_cap - (DL_LEAF_EMIT_MAXV + 1);
@@ -5380,11 +5387,11 @@ static void DL_LeafRSPEmitFlush(void)
                             dbg_cz_cells++;
                             if (cymax < 0) dbg_cz_above++;
                             if (onscr > 0) { dbg_cz_onscr++; dbg_cz_tris += tris; dbg_cz_cull += culled; }
-                            if (dbg_rb < 24) {
-                                debugf("LEAFRB f=%lu cell=%d b=%d n=%d cx[%d..%d] cy[%d..%d] "
-                                       "onscr=%d tris=%d cull=%d\n",
-                                       fno, cellvis[vi], b, n, cxmin, cxmax, cymin, cymax,
-                                       onscr, tris, culled);
+                            if (onscr > 0 && dbg_rb < 40) {
+                                debugf("LEAFRB f=%lu cell=%d h=%d cy[%d..%d] cx[%d..%d] "
+                                       "onscr=%d/%d tris=%d cull=%d\n",
+                                       fno, cellvis[vi], (int)(hf16 >> 16), cymin, cymax, cxmin, cxmax,
+                                       onscr, n, tris, culled);
                                 dbg_rb++;
                             }
                         }
