@@ -4853,9 +4853,20 @@ static int              leaf_buf_cap = 0;     // verts the in/out buffers are si
 static int*            leaf_rsp_slot = NULL;   // pv -> dense output slot, set this frame
 static int             leaf_rsp_slot_cap = 0;
 static int             leaf_rsp_nv = 0;        // verts dispatched this frame (0 = none)
+#ifndef BENCH_FORCE_MESH_LEAF_CELLS
 static int*            leaf_rsp_clipnv = NULL; // [surf*numsubsectors+ss] CLIPPED vert count
 static int*            leaf_rsp_start  = NULL; // [surf*numsubsectors+ss] start slot in leaf_out_buf
 static int             leaf_rsp_clipnv_cap = 0;// (clipnv 0 = leaf clipped away / not dispatched)
+#endif
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+// STEP 2: same staging as the leaf band arrays but keyed by BAKE CELL, not subsector.
+// Index [(surf*bake_numcells + ci)*NBANDS + band]. The cells already bound the texel span
+// offline (r_bake.c), so the only runtime split left is the view-dependent W-range one --
+// it fires only for near cells (a 512-unit cell at depth>=~170 fits one band).
+static int* cell_rsp_clipnv = NULL;   // clipped vert count per cell-surf-band (0 = empty)
+static int* cell_rsp_start  = NULL;   // start slot in leaf_out_buf
+static int  cell_rsp_cap    = 0;      // cells the arrays are sized for
+#endif
 #define DL_LEAF_EMIT_MAXV 16        // MUST match LEAF_EMIT_MAXV in rsp/rsp_dlemit.S (per-leaf cap)
 #define DL_LEAF_CLIP_PAD  4096      // extra leaf_in/out slots: frustum clip can add verts per leaf
 // Depth-band tessellation: a floor leaf is one steeply-tilted polygon spanning near->horizon, so a
@@ -4881,7 +4892,7 @@ static int             leaf_rsp_clipnv_cap = 0;// (clipnv 0 = leaf clipped away 
 
 // Clip against the 2 side planes (left/right). Loads bake_leaf_verts -> float world XY in px/py.
 // Returns the vertex count. Sides kept inside the RSP cull window (+/-900px) so rounding is safe.
-static int DL_ClipLeafSides(int firstvert, int n,
+static int DL_ClipLeafSides(int firstvert, int n, fixed_t (*verts)[2],
                             float vxf, float vyf, float vcosf, float vsinf, float cxf,
                             float* px, float* py)
 {
@@ -4896,8 +4907,8 @@ static int DL_ClipLeafSides(int firstvert, int n,
     int m = n, i, plane;
     if (n < 3 || n > DL_LEAF_MAXV) return 0;
     for (i = 0; i < n; i++) {
-        px[i] = (float)bake_leaf_verts[firstvert + i][0] * (1.0f / 65536.0f);
-        py[i] = (float)bake_leaf_verts[firstvert + i][1] * (1.0f / 65536.0f);
+        px[i] = (float)verts[firstvert + i][0] * (1.0f / 65536.0f);
+        py[i] = (float)verts[firstvert + i][1] * (1.0f / 65536.0f);
     }
     for (plane = 0; plane < 2 && m >= 3; plane++) {
         float f[DL_LEAF_MAXV + 8];
@@ -5001,6 +5012,17 @@ static void DL_RSPLeafDispatch(void)
         leaf_rsp_slot = (int*)Z_Malloc(sizeof(int) * leaf_rsp_slot_cap, PU_STATIC, NULL);
     }
     if (!leaf_rsp_slot) { if (diag) { lf_diag++; debugf("LEAF-DISP no slot\n"); } return; }
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+    // CELL staging arrays: [(surf*bake_numcells + ci)*NBANDS + band]. Sized by cell count.
+    if (bake_numcells > cell_rsp_cap) {
+        if (cell_rsp_clipnv) Z_Free(cell_rsp_clipnv);
+        if (cell_rsp_start)  Z_Free(cell_rsp_start);
+        cell_rsp_cap = bake_numcells;
+        cell_rsp_clipnv = (int*)Z_Malloc(sizeof(int) * 2 * cell_rsp_cap * DL_LEAF_NBANDS, PU_STATIC, NULL);
+        cell_rsp_start  = (int*)Z_Malloc(sizeof(int) * 2 * cell_rsp_cap * DL_LEAF_NBANDS, PU_STATIC, NULL);
+    }
+    if (!cell_rsp_clipnv || !cell_rsp_start) { if (diag) { lf_diag++; debugf("CELL-DISP no clipnv\n"); } return; }
+#else
     if (numsubsectors > leaf_rsp_clipnv_cap) {
         if (leaf_rsp_clipnv) Z_Free(leaf_rsp_clipnv);
         if (leaf_rsp_start)  Z_Free(leaf_rsp_start);
@@ -5010,20 +5032,29 @@ static void DL_RSPLeafDispatch(void)
         leaf_rsp_start  = (int*)Z_Malloc(sizeof(int) * 2 * leaf_rsp_clipnv_cap * DL_LEAF_NBANDS, PU_STATIC, NULL);
     }
     if (!leaf_rsp_clipnv || !leaf_rsp_start) { if (diag) { lf_diag++; debugf("LEAF-DISP no clipnv\n"); } return; }
+#endif
     // Right-size the zone staging to this level's leaf-vert count (see decl). Grows only
     // when a level has more leaf verts than any seen so far; +15 & 16-align for DMA.
     // 2x for floor+ceiling dispatched separately (per-surface effective-near clip), plus
     // DL_LEAF_CLIP_PAD: the frustum clip can add verts beyond the baked count.
-    if (2 * bake_numleafverts + DL_LEAF_CLIP_PAD > leaf_buf_cap) {
+    {
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+    // Each cell-surface stages up to NBANDS fans; size to the worst case over all cells.
+    int want_buf_cap = 2 * (bake_numcellverts + bake_numcells * DL_LEAF_NBANDS) + DL_LEAF_CLIP_PAD;
+#else
+    int want_buf_cap = 2 * bake_numleafverts + DL_LEAF_CLIP_PAD;
+#endif
+    if (want_buf_cap > leaf_buf_cap) {
         if (leaf_in_raw)  Z_Free(leaf_in_raw);
         if (leaf_out_raw) Z_Free(leaf_out_raw);
-        leaf_buf_cap = 2 * bake_numleafverts + DL_LEAF_CLIP_PAD;
+        leaf_buf_cap = want_buf_cap;
         leaf_in_raw  = Z_Malloc(sizeof(rsp_bleaf_in_t)  * leaf_buf_cap + 15, PU_STATIC, &leaf_in_raw);
         leaf_out_raw = Z_Malloc(sizeof(rsp_bleaf_out_t) * leaf_buf_cap + 15, PU_STATIC, &leaf_out_raw);
         leaf_in_buf  = leaf_in_raw  ? (rsp_bleaf_in_t*) (((uintptr_t)leaf_in_raw  + 15) & ~(uintptr_t)15) : NULL;
         leaf_out_buf = leaf_out_raw ? (rsp_bleaf_out_t*)(((uintptr_t)leaf_out_raw + 15) & ~(uintptr_t)15) : NULL;
         if (diag) { lf_diag++; debugf("LEAF-DISP zalloc cap=%d in=%p out=%p\n",
                     leaf_buf_cap, (void*)leaf_in_buf, (void*)leaf_out_buf); }
+    }
     }
     if (!leaf_in_buf || !leaf_out_buf) { leaf_buf_cap = 0;
         if (diag) { lf_diag++; debugf("LEAF-DISP zalloc FAILED\n"); } return; }
@@ -5041,15 +5072,90 @@ static void DL_RSPLeafDispatch(void)
         float vcosf = (float)vcos * (1.0f / 65536.0f), vsinf = (float)vsin * (1.0f / 65536.0f);
         float cxf = (float)centerx, viewzf = (float)viewz * (1.0f / 65536.0f);
         // cy = centery - hf*centerx/depth, so a vert clears the bottom/top screen edge only for
-        // depth >= |hf|*centerx/EDGE. Folding that into the near plane keeps cy inside the RSP
-        // cy-cull window. Clip the edge to SCREENHEIGHT+256 / -256 -- inside the window so
-        // boundary rounding never trips it; the visible floor [0,SCREENHEIGHT] is always kept.
+        // depth >= |hf|*centerx/EDGE. Folding that into the near plane caps cy at the edge.
+        // CEILING (EDGET): clip at the EXACT top edge (centery), NOT centery+256. The +256
+        // overscan was to keep cy inside a now-DISABLED RSP cy-cull window, but it let near
+        // ceilings that step up to a higher far sector reach the LeafFan engine as TOP-EDGE
+        // STRADDLERS (one vert tens of px above screen, the rest on-screen). The raw rsp_rdpq_tri
+        // engine drops/mangles those (verts well outside the guard band) -- emitted but never
+        // rasterised -- so the near grey ceiling vanished and the far sector showed through
+        // (frame 3712). Clipping at centery removes the above-screen part; the on-screen sliver
+        // becomes a clean triangle the engine draws. FLOOR (EDGEB) keeps the 256 overscan: its
+        // bottom straddlers hide behind the status bar / weapon, and tightening it is untested.
         float EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;    // floor (hf<0) bottom edge
-        float EDGET = (float)centery + 256.0f;                         // ceiling (hf>0) top edge
+        float EDGET = (float)centery;                                  // ceiling (hf>0) top edge
         float spx[DL_LEAF_MAXV + 8], spy[DL_LEAF_MAXV + 8];
         fixed_t clx[DL_LEAF_MAXV + 8], cly[DL_LEAF_MAXV + 8];
         int     cap = leaf_buf_cap - (DL_LEAF_EMIT_MAXV + 1);
         int     surf;
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+        // STEP 2: stage BAKE CELLS, not whole leaves. The cell's texel span is already
+        // bounded (r_bake.c), so the depth-band split here is now ONLY for W-range
+        // precision and fires only for near cells. Side-clip shared by floor+ceiling.
+        int ci;
+        (void)ss;
+        memset(cell_rsp_clipnv, 0, sizeof(int) * 2 * bake_numcells * DL_LEAF_NBANDS);
+        for (ci = 0; ci < bake_numcells && nv < cap; ci++) {
+            bake_cell_t* cl = &bake_cells[ci];
+            int n = cl->numverts, ms, css = cl->subsector;
+            if ((unsigned)css >= (unsigned)numsubsectors || !bake_leafvis[css]) continue;
+            if (n < 3 || n > DL_LEAF_MAXV) continue;
+            if (cl->floorpic == skyflatnum && cl->ceilingpic == skyflatnum) continue;
+            ms = DL_ClipLeafSides(cl->firstvert, n, bake_cell_verts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
+            if (ms < 3) continue;                                  // off both side planes
+            {   // cell depth range (height-independent -> shared by floor + ceiling):
+                // bound the band split to the cell's OWN [cd0,cd1], so a far cell that
+                // fits one band costs ONE clip, not NBANDS empty-band clips. The cells
+                // already bound the texel span, so this split is W-precision only.
+                float cd0 = 1e30f, cd1 = -1e30f;
+                int   k;
+                for (k = 0; k < ms; k++) {
+                    float dep = (spx[k] - vxf) * vcosf + (spy[k] - vyf) * vsinf;
+                    if (dep < cd0) cd0 = dep;
+                    if (dep > cd1) cd1 = dep;
+                }
+                for (surf = 0; surf < 2 && nv < cap; surf++) {
+                    int     m, slot = surf * bake_numcells + ci, band;
+                    fixed_t height;
+                    float   hf, nearz_eff, zlo;
+                    if ((surf ? cl->ceilingpic : cl->floorpic) == skyflatnum) continue;  // sky stays CPU
+                    height = surf ? sectors[cl->sector].ceilingheight
+                                  : sectors[cl->sector].floorheight;
+                    // Match R_Subsector's plane gate (r_bsp.c): a floor is only visible BELOW the
+                    // eye, a ceiling only ABOVE -- software makes no visplane otherwise. Without
+                    // this the mesh draws a floor-above / ceiling-below that software culls, which
+                    // the z-test then floats over the view as wrong geometry.
+                    if (surf ? (height <= viewz) : (height >= viewz)) continue;
+                    hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                    nearz_eff = 6.0f;
+                    if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
+                    else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
+                    zlo = (cd0 > nearz_eff) ? cd0 : nearz_eff;
+                    if (cd1 <= zlo) continue;                      // cell behind this surface's near
+                    for (band = 0; band < DL_LEAF_NBANDS && nv < cap; band++) {
+                        int   bslot = slot * DL_LEAF_NBANDS + band;
+                        float zhi   = zlo * DL_LEAF_BAND_RATIO;
+                        if (zhi >= cd1) zhi = DL_LEAF_FARZ;        // last band -> the cell's far edge
+                        m = DL_ClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
+                                               zlo, zhi, clx, cly, DL_LEAF_EMIT_MAXV);
+                        if (m >= 3) {
+                            cell_rsp_start[bslot]  = nv;
+                            cell_rsp_clipnv[bslot] = m;
+                            for (i = 0; i < m; i++) {
+                                leaf_in_buf[nv].x = clx[i];
+                                leaf_in_buf[nv].y = cly[i];
+                                leaf_in_buf[nv].floorz = height;
+                                leaf_in_buf[nv].pad0 = 0;
+                                nv++;
+                            }
+                        }
+                        if (zhi == DL_LEAF_FARZ) break;            // covered the cell's far edge
+                        zlo = zhi;
+                    }
+                }
+            }
+        }
+#else
         memset(leaf_rsp_clipnv, 0, sizeof(int) * 2 * numsubsectors * DL_LEAF_NBANDS);
         for (ss = 0; ss < numsubsectors && nv < cap; ss++) {
             bake_leaf_t* lf = &bake_leaves[ss];
@@ -5057,7 +5163,7 @@ static void DL_RSPLeafDispatch(void)
             if (!bake_leafvis[ss]) continue;
             if (n < 3 || n > DL_LEAF_MAXV) continue;
             if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
-            ms = DL_ClipLeafSides(lf->firstvert, n, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
+            ms = DL_ClipLeafSides(lf->firstvert, n, bake_leaf_verts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
             if (ms < 3) continue;                                  // off both side planes
             for (surf = 0; surf < 2 && nv < cap; surf++) {
                 int     m, slot = surf * numsubsectors + ss;
@@ -5066,6 +5172,8 @@ static void DL_RSPLeafDispatch(void)
                 if ((surf ? lf->ceilingpic : lf->floorpic) == skyflatnum) continue;  // sky stays CPU
                 height = surf ? sectors[lf->sector].ceilingheight
                               : sectors[lf->sector].floorheight;
+                // Match R_Subsector's plane gate (r_bsp.c): floor only below eye, ceiling only above.
+                if (surf ? (height <= viewz) : (height >= viewz)) continue;
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;   // surface height vs eye
                 nearz_eff = 6.0f;                                  // true near (margin > 4)
                 if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
@@ -5097,6 +5205,7 @@ static void DL_RSPLeafDispatch(void)
                 }
             }
         }
+#endif
     }
     if (nv == 0) return;
 
@@ -5142,10 +5251,15 @@ static void DL_LeafRSPEmitFlush(void)
 {
     int surf;
     int drew = 0;
-    static int vis[2048];
     static int flats[256];
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+    static int cellvis[4096];                       // visible cell indices for THIS surface
+#else
+    static int vis[2048];
+#endif
 
     if (leaf_rsp_nv == 0) return;                   // nothing transformed -> no floors
+#ifndef BENCH_FORCE_MESH_LEAF_CPU_EMIT
     if (rsp_dlemit_ovl_id == 0)
         rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
     if (rsp_dlemit_ovl_id == 0) return;
@@ -5156,6 +5270,19 @@ static void DL_LeafRSPEmitFlush(void)
     // so TEX*SHADE == the CPU path's TEX*PRIM. centerx/centery set once per frame.
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
+#else
+    // Diagnostic: same RSP-transformed cell geometry, but final fan emit goes through
+    // libdragon's normal rdpq_triangle() path (TEX*PRIM) instead of overlay-B.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+#endif
+    int dbg_desc[2] = {0,0}, dbg_dcap = 0, dbg_mvis[2] = {0,0}, dbg_nflat[2] = {0,0};  // emit diag
+    int dbg_rb = 0;   // readback diag: how many ceiling bands we've ground-truthed this frame
+    // ceiling-band ground truth, accumulated across the flat loop for surf==1:
+    int dbg_cz_cells = 0;   // ceiling bands inspected
+    int dbg_cz_above = 0;   // bands entirely above the screen top (cy_max < 0)  -> correct overhead cull
+    int dbg_cz_onscr = 0;   // bands with >=1 vert on-screen (cy in [0,SCREENH])
+    int dbg_cz_tris  = 0;   // total fan triangles in on-screen bands
+    int dbg_cz_cull  = 0;   // fan triangles in on-screen bands the |cross|<32 cull would drop
 
     // ROOT-CAUSE FIX (no readback): each LeafBatch is queued, not waited on, so the CPU runs
     // ahead of the RSP. Rebuilding leaf_desc_buf from index 0 per flat/surface OVERWROTE the
@@ -5168,6 +5295,205 @@ static void DL_LeafRSPEmitFlush(void)
 
     for (surf = 0; surf < 2; surf++)
     {
+#ifdef BENCH_FORCE_MESH_LEAF_CELLS
+        int nvis = 0, nflat = 0, vi, fi, ci;
+        // Pass 1: collect visible non-sky CELLS for this surface + their distinct flats.
+        // MUST mirror DL_RSPLeafDispatch's cell filter so the staging slot is valid.
+        for (ci = 0; ci < bake_numcells; ci++)
+        {
+            bake_cell_t* cl = &bake_cells[ci];
+            int pic = surf ? cl->ceilingpic : cl->floorpic;
+            int fl, j, seen, css = cl->subsector;
+            if ((unsigned)css >= (unsigned)numsubsectors || !bake_leafvis[css]) continue;
+            {   // skip if EVERY depth band of this cell-surface was clipped away
+                int b, any = 0, sl = (surf * bake_numcells + ci) * DL_LEAF_NBANDS;
+                for (b = 0; b < DL_LEAF_NBANDS; b++) if (cell_rsp_clipnv[sl + b] >= 3) { any = 1; break; }
+                if (!any) continue;
+            }
+            if (cl->floorpic == skyflatnum && cl->ceilingpic == skyflatnum) continue;
+            if (pic == skyflatnum) continue;            // this surface is sky -> stays CPU
+            if (nvis >= (int)(sizeof cellvis / sizeof cellvis[0])) break;
+            cellvis[nvis++] = ci;
+            fl = flattranslation[pic];
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
+        }
+        dbg_mvis[surf] = nvis; dbg_nflat[surf] = nflat;   // emit diag: visible cells / flats this surf
+
+        // Pass 2: per distinct flat, bind TMEM ONCE, then fire LeafFan for each cell on it.
+        for (fi = 0; fi < nflat; fi++)
+        {
+            int   flatidx = flats[fi];
+            byte* block   = DL_FlatBlock(flatidx);
+            if (!block) continue;
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
+            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);   // engine bypasses auto-upload
+            // The custom RSP leaf emitter bypasses rdpq_triangle(), so it also bypasses
+            // libdragon's per-triangle AUTOSYNC_PIPE|AUTOSYNC_TILE|AUTOSYNC_TMEMS. Make
+            // the dependency explicit before handing the just-loaded flat to overlay B.
+            rdpq_sync_load();
+            rdpq_sync_tile();
+
+            int dstart = dcur;
+            for (vi = 0; vi < nvis; vi++)
+            {
+                bake_cell_t* cl = &bake_cells[cellvis[vi]];
+                sector_t*    sec;
+                fixed_t      hf16;
+                int          lvl, ub64, vb64, b, sl;
+                uint32_t     prim, packhdr;
+
+                if (flattranslation[surf ? cl->ceilingpic : cl->floorpic] != flatidx)
+                    continue;
+                sec  = &sectors[cl->sector];
+                hf16 = (surf ? sec->ceilingheight : sec->floorheight) - viewz;  // live height
+                lvl  = (255 - sec->lightlevel) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                prim = dl_prim_lut[lvl];                // -> vertex SHADE
+                ub64 = (cl->ubias >> 6) + 512;          // per-cell S/T period bias (+512 biased)
+                vb64 = (cl->vbias >> 6) + 512;
+                packhdr = ((uint32_t)(ub64 & 0x3FF) << 6) | ((uint32_t)(vb64 & 0x3FF) << 16);
+                // one LeafFan descriptor per non-empty depth band of this cell.
+                sl = (surf * bake_numcells + cellvis[vi]) * DL_LEAF_NBANDS;
+                for (b = 0; b < DL_LEAF_NBANDS; b++) {
+                    int n = cell_rsp_clipnv[sl + b];
+                    if (n < 3) continue;
+                    {   // READBACK: ground-truth the RSP leaf transform output for every CEILING
+                        // band. leaf_out_buf is CPU-coherent here (invalidated in DL_RSPLeafDrain).
+                        // For each band: project cy per-vertex (the emit-overlay formula), count
+                        // on-screen verts, and REPLICATE the rsp_dlemit |cross|<32 degenerate cull
+                        // per fan triangle. Distinguishes: visible ceiling bands absent (projection/
+                        // gate bug) vs present-but-degenerate-culled (cull too aggressive) vs
+                        // present-and-survive (loss is downstream in the engine/scissor).
+                        extern unsigned long N64Bench_FrameNo(void);
+                        unsigned long fno = N64Bench_FrameNo();
+                        if (surf == 1 && (fno == 3711 || fno == 3712)) {
+                            int j, st = cell_rsp_start[sl + b], onscr = 0, culled = 0, tris = 0;
+                            int cxmin = 99999, cxmax = -99999, cymin = 99999, cymax = -99999;
+                            int X[16], Y[16], nn = (n > 16) ? 16 : n;
+                            for (j = 0; j < nn; j++) {
+                                const rsp_bleaf_out_t* ro = &leaf_out_buf[st + j];
+                                int cxp  = ro->cx >> 16;
+                                int cy16 = ((int)centery << 16) - centerx * FixedMul(hf16, ro->invw);
+                                int cyp  = cy16 >> 16;
+                                X[j] = ro->cx  >> 14;     // staged VTX_ATTR_XY (s11.2) -- cull input
+                                Y[j] = cy16    >> 14;
+                                if (cyp >= 0 && cyp <= SCREENHEIGHT) onscr++;
+                                if (cxp < cxmin) cxmin = cxp;
+                                if (cxp > cxmax) cxmax = cxp;
+                                if (cyp < cymin) cymin = cyp;
+                                if (cyp > cymax) cymax = cyp;
+                            }
+                            for (j = 1; j < nn - 1; j++) {        // fan (v0, vj, vj+1)
+                                int cr = (X[j]-X[0])*(Y[j+1]-Y[0]) - (X[j+1]-X[0])*(Y[j]-Y[0]);
+                                if (cr < 0) cr = -cr;
+                                tris++;
+                                if (cr < 32) culled++;
+                            }
+                            dbg_cz_cells++;
+                            if (cymax < 0) dbg_cz_above++;
+                            if (onscr > 0) { dbg_cz_onscr++; dbg_cz_tris += tris; dbg_cz_cull += culled; }
+                            if (onscr > 0 && dbg_rb < 40) {
+                                debugf("LEAFRB f=%lu cell=%d h=%d cy[%d..%d] cx[%d..%d] "
+                                       "onscr=%d/%d tris=%d cull=%d\n",
+                                       fno, cellvis[vi], (int)(hf16 >> 16), cymin, cymax, cxmin, cxmax,
+                                       onscr, n, tris, culled);
+                                dbg_rb++;
+                            }
+                            if (fno == 3712 && surf == 1 &&
+                                (cellvis[vi] == 84 || cellvis[vi] == 98 || cellvis[vi] == 144 || cellvis[vi] == 150)) {
+                                int ubias = cl->ubias;
+                                int vbias = cl->vbias;
+                                debugf("LEAFATTR cell=%d h=%d n=%d ub=%d vb=%d prim=%08lx\n",
+                                       cellvis[vi], (int)(hf16 >> 16), n, ubias, vbias, (unsigned long)prim);
+                                for (j = 0; j < nn; j++) {
+                                    const rsp_bleaf_out_t* ro = &leaf_out_buf[st + j];
+                                    int cy16 = ((int)centery << 16) - centerx * FixedMul(hf16, ro->invw);
+                                    int xq = ro->cx >> 14;
+                                    int yq = cy16 >> 14;
+                                    int st_s = (ro->u - ubias) << 5;
+                                    int st_t = (ro->v - vbias) << 4;  // V decimated 64->32, so <<15 then >>11
+                                    int wi = ro->depth >> 16;
+                                    int wf = ro->depth & 0xFFFF;
+                                    int ii = ro->invw >> 16;
+                                    int iff = ro->invw & 0xFFFF;
+                                    long prod = (long)(((long long)ro->depth * (long long)ro->invw) >> 16);
+                                    debugf("LEAFATTR v%d cx=%ld cy=%d Xq=%d Yq=%d z=%ld S32=%d T32=%d "
+                                           "W=%d.%04x IW=%d.%04x WxIW=%ld emit=%ld u=%ld v=%ld\n",
+                                           j, (long)(ro->cx >> 16), cy16 >> 16, xq, yq,
+                                           (long)(0x7FFF - 2 * ro->invw - 32), st_s, st_t,
+                                           wi, wf & 0xFFFF, ii, iff & 0xFFFF, prod,
+                                           (long)ro->emit, (long)ro->u, (long)ro->v);
+                                }
+                            }
+                        }
+                    }
+#ifdef BENCH_FORCE_MESH_LEAF_CPU_EMIT
+                    {
+                        int st = cell_rsp_start[sl + b];
+                        int j;
+                        fixed_t cv = finecosine[viewangle >> ANGLETOFINESHIFT];
+                        fixed_t sv = finesine[viewangle >> ANGLETOFINESHIFT];
+#define CPUCELL_VTX(IN, OUT) do { \
+                            fixed_t tx = (IN)->x - viewx; \
+                            fixed_t ty = (IN)->y - viewy; \
+                            fixed_t dep = FixedMul(tx, cv) + FixedMul(ty, sv); \
+                            fixed_t lat = FixedMul(ty, cv) - FixedMul(tx, sv); \
+                            float iw = 65536.0f / (float)dep; \
+                            float sc = (float)centerx * iw; \
+                            (OUT)[0] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc; \
+                            (OUT)[1] = (float)centery - ((float)hf16 * (1.0f / 65536.0f)) * sc; \
+                            (OUT)[2] = DL_WallZ(iw); \
+                            (OUT)[3] = (float)(((IN)->x >> FRACBITS) - cl->ubias); \
+                            (OUT)[4] = (float)(((IN)->y >> FRACBITS) - cl->vbias) * 0.5f; \
+                            (OUT)[5] = iw; \
+                        } while (0)
+                        rdpq_set_prim_color(color_from_packed32(prim));
+                        for (j = 1; j < n - 1; j++) {
+                            const rsp_bleaf_in_t* i0 = &leaf_in_buf[st];
+                            const rsp_bleaf_in_t* i1 = &leaf_in_buf[st + j];
+                            const rsp_bleaf_in_t* i2 = &leaf_in_buf[st + j + 1];
+                            float v0[6], v1[6], v2[6];
+                            CPUCELL_VTX(i0, v0);
+                            CPUCELL_VTX(i1, v1);
+                            CPUCELL_VTX(i2, v2);
+                            rdpq_triangle(&TRIFMT_ZBUF_TEX, v0, v1, v2);
+                            drew++;
+                        }
+#undef CPUCELL_VTX
+                        dbg_desc[surf]++;
+                    }
+#else
+                    if (dcur >= DCAP) { dbg_dcap++; break; }
+                    leaf_desc_buf[dcur].rec_addr = PhysicalAddr(&leaf_out_buf[cell_rsp_start[sl + b]]);
+                    leaf_desc_buf[dcur].hf16   = (uint32_t)hf16;
+                    leaf_desc_buf[dcur].prim   = prim;
+                    leaf_desc_buf[dcur].packed = (uint32_t)(n & 0x3F) | packhdr;
+                    dcur++;
+                    dbg_desc[surf]++;
+                    drew += n - 2;
+#endif
+                }
+            }
+#ifndef BENCH_FORCE_MESH_LEAF_CPU_EMIT
+            if (dcur > dstart)
+            {
+                data_cache_hit_writeback(&leaf_desc_buf[dstart],
+                    (uint32_t)((size_t)(dcur - dstart) * sizeof(rsp_leaf_desc_t)));
+                rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFBATCH,
+                           PhysicalAddr(&leaf_desc_buf[dstart]), (uint32_t)(dcur - dstart));
+            }
+            if (dcur >= DCAP) { rspq_wait(); dcur = 0; }
+#else
+            (void)dstart;
+#endif
+        }
+#else
         int nvis = 0, nflat = 0, vi, fi, ss;
         // Pass 1: collect visible non-sky leaves for THIS surface + their distinct flats.
         // MUST mirror DL_RSPLeafDispatch's filter so leaf_rsp_slot[firstvert] is valid; the
@@ -5204,6 +5530,11 @@ static void DL_LeafRSPEmitFlush(void)
                 rdpq_set_texture_image(&fs);
             }
             rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);   // engine bypasses auto-upload
+            // The custom RSP leaf emitter bypasses rdpq_triangle(), so it also bypasses
+            // libdragon's per-triangle AUTOSYNC_PIPE|AUTOSYNC_TILE|AUTOSYNC_TMEMS. Make
+            // the dependency explicit before handing the just-loaded flat to overlay B.
+            rdpq_sync_load();
+            rdpq_sync_tile();
 
             // Build this flat's descriptors into a FRESH region [dstart, dcur) -- the cursor
             // never rewinds within a frame, so the RSP always DMAs intact descriptors (the
@@ -5253,6 +5584,18 @@ static void DL_LeafRSPEmitFlush(void)
             // Common case never waits -- the no-readback path stays stall-free.
             if (dcur >= DCAP) { rspq_wait(); dcur = 0; }
         }
+#endif
+    }
+
+    {   // emit diag: floor vs ceiling descriptors actually emitted + cap state, busy vs quiet frame
+        extern unsigned long N64Bench_FrameNo(void);
+        unsigned long fno = N64Bench_FrameNo();
+        if (fno==127||fno==128||fno==3199||fno==3200||fno==3711||fno==3712||dbg_dcap>0)
+            debugf("EMITDIAG f=%lu floor[vis=%d flat=%d desc=%d] ceil[vis=%d flat=%d desc=%d] dcap_break=%d DCAP=%d\n",
+                   fno, dbg_mvis[0],dbg_nflat[0],dbg_desc[0], dbg_mvis[1],dbg_nflat[1],dbg_desc[1], dbg_dcap, DCAP);
+        if (fno==3711||fno==3712)
+            debugf("LEAFRBSUM f=%lu ceilbands=%d above=%d onscreen=%d onscr_tris=%d onscr_culled=%d\n",
+                   fno, dbg_cz_cells, dbg_cz_above, dbg_cz_onscr, dbg_cz_tris, dbg_cz_cull);
     }
 
     dl_leaf_tris = drew;

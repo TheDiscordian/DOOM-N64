@@ -200,6 +200,21 @@ RSPASFLAGS += -DBENCH_FORCE_MESH_RSP_EMIT=1
 ifeq ($(BENCH_FORCE_MESH_LEAF_EMIT),1)
 CFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
 RSPASFLAGS += -DBENCH_FORCE_MESH_LEAF_EMIT=1
+#   The floor/ceiling emit draws the BAKE-tessellated CELLS (r_bake.c grid cells) by
+#   DEFAULT -- it is the faster path (p95 32096 vs the whole-leaf band split 34400 us)
+#   and renders the same. The residual runtime depth split fires per-cell only for near
+#   cells. Reuses overlay B's LeafFan unchanged (CFLAGS only). Opt OUT to the legacy
+#   whole-leaf depth-band split with BENCH_FORCE_MESH_LEAF_BANDS=1. Nested under LEAF_EMIT.
+ifneq ($(BENCH_FORCE_MESH_LEAF_BANDS),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_CELLS=1
+endif
+#   BENCH_FORCE_MESH_LEAF_CPU_EMIT=1 -> diagnostic: keep the RSP leaf transform
+#   and baked cell staging, but emit those cell fans through libdragon rdpq_triangle()
+#   on the CPU instead of overlay-B. This isolates cell geometry/transform from the
+#   custom no-readback LeafBatch emitter.
+ifeq ($(BENCH_FORCE_MESH_LEAF_CPU_EMIT),1)
+CFLAGS += -DBENCH_FORCE_MESH_LEAF_CPU_EMIT=1
+endif
 endif
 endif
 endif
