@@ -130,6 +130,16 @@ by ~1px sub-pixel (emit decisions agree, so no walls appear/vanish). Next: exten
 compaction to the floor-leaf transform (Phase 4), then evaluate default-on.
 
 ## 8. Phase 4 design — floor-leaf transform on the RSP (examined 2026-06-24)
+
+> **SUPERSEDED (2026-06-30).** The whole §8/§8.1–8.5 floor-leaf-on-the-RSP effort assumed
+> mesh floors/ceilings would be a drop-in for the RDP poly planes. The mesh-plane retry
+> refuted that (leaf fans cannot reproduce the visplane per-column opening masks — see
+> `Docs/CEILING_VOID_INVESTIGATION.md`). The project pivoted to **Option 3: a full-scene
+> Z-buffered renderer** where planes are opaque Z geometry, not visplane-masked. Read
+> `Docs/GPU_PORT_PLAN.md` §DIRECTION CHANGE (2026-06-30): Option 3. §8 below is kept as
+> reference for the RSP leaf transform mechanics (still reusable in Option 3 Phase A), but
+> its "make floors-on a win vs poly planes" goal is no longer the plan.
+
 Goal: move the floor/ceiling leaf-vertex projection off the CPU (it's what makes floors-on a
 p95 loss). The leaf transform is the SAME per-vertex projection as a wall corner — project
 world XY → screen-x `cx`, scale `sc`, `invw`, depth `z` — only `cy = centery - hf*sc` (the

@@ -11,12 +11,18 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
 
 ---
 
-## FIXED: no-readback mesh floors — black, then wonky/streaked, then ceilings flickering
+## PARTIAL / SUPERSEDED: no-readback mesh floors — black, wonky/streaked, ceiling flicker
+- **Status (2026-06-30):** the early black-floor / guard-band / texture-streak issues below were
+  real and were fixed, but the later **ceiling/plane flicker was NOT actually solved** as a
+  drop-in replacement for poly planes. The mesh-plane retry found a design mismatch: leaf/cell
+  fans do not consume DOOM's visplane `top[]/bottom[]` opening masks, so busy scenes diverge
+  broadly from the working mesh-walls + poly-planes baseline. See
+  `Docs/CEILING_VOID_INVESTIGATION.md` and `Docs/GPU_PORT_PLAN.md` §DIRECTION CHANGE (Option 3).
 - **Symptom (progression, `BENCH_FORCE_MESH_LEAF_EMIT` no-readback floors):** (a) mesh floors
   render BLACK — whole-floor in corridors, partial in rooms; (b) once drawing, floor texture
-  STREAKS/smears near the player and on deep floors ("coordinates go wonky"); (c) ceilings
-  intermittently FLICKER out, revealing the geometry/courtyard behind them.
-- **Root causes (four distinct bugs, one symptom cluster):**
+  STREAKS/smears near the player and on deep floors ("coordinates go wonky"); (c) ceilings /
+  planes intermittently FLICKER or darken/underdraw in busy scenes.
+- **Root causes fixed before the superseded design finding:**
   1. **Black floors = buffer-reuse race.** Each flat's `LeafBatch` is QUEUED (no rspq_wait);
      the CPU rebuilt `leaf_desc_buf` from index 0 per flat and ran ahead of the RSP, overwriting
      a batch's descriptors before the RSP DMA'd them. The RSP read the LAST writer's data, so
@@ -36,10 +42,11 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
      (`421754c`): depth-band tessellation — `DL_ClipBandToFixed` splits each leaf-surface into
      geometric depth bands (ratio 4), one LeafFan per band, so every triangle's W ratio is bounded
      (mirrors the visplane INV_W split). `leaf_rsp_start/clipnv` gain a band dimension.
-  5. **Ceiling flicker = far-distance Z-fight.** screen-Z's 1/depth precision collapses a leaf's
-     far edge to near-equal Z with the distant geometry behind it. FIX (`3f47ec4`): small per-path
-     toward-camera Z bias (`EMIT_ZBIAS`, `LEAF_ZBIAS=32` for leaves, 0 for walls). Z-ONLY — invw
-     (and W*INVW=1) untouched, so NO texture warp; uniform-Z so near surfaces don't poke through.
+  5. **Ceiling flicker was initially misattributed to far-distance Z-fight.** A small per-path
+     toward-camera Z bias (`EMIT_ZBIAS`, `LEAF_ZBIAS=32` for leaves, 0 for walls; `3f47ec4`) was a
+     reasonable local fix and may reduce ordinary z precision loss, but the 2026-06-30 retry showed
+     it does **not** solve the busy-scene plane mismatch. The remaining issue is coverage/visibility
+     model mismatch vs visplane openings, not just z precision.
 - **Wrong turns (do NOT retry):** (a) reading textured WALLS as "floors drawing" — black floors
   stayed black while the walls beside them drew fine. (b) Dismissing the user's "coordinates go
   wonky" from ONE Z-off frame — it was the real texture-perspective bug (#4). (c) Blaming the
@@ -54,9 +61,10 @@ over the RDP world (i_video_n64.c). 3 hardware framebuffers, 2 CI8 software buff
   ceiling flicker = 3456/3712. Diagnose floor geometry by forcing `RDPQ_COMBINER_FLAT` + per-surf
   prim (floor magenta / ceiling cyan); isolate Z vs emit by toggling `rdpq_mode_zbuf` in the leaf
   emit. NOTE: piled-up render-md windows overlap the ares grab and corrupt scan-marks frames.
-- **Resolution:** `65dc9be` (race + guard band) + `421754c` (screen-Z + tessellation) + `3f47ec4`
-  (ceiling Z-bias). Remaining/separate: wall grazing-angle blockiness (4096/2944), ceiling
-  lighting fidelity (1280), red damage-tint applied as per-surface multiply (2048/2176).
+- **Resolution:** `65dc9be` (race + guard band) + `421754c` (screen-Z + tessellation) fixed the
+  early black/streak symptoms; `3f47ec4` added a leaf Z-bias but did NOT make mesh planes viable as
+  a poly-plane replacement. **Final disposition:** mesh-leaf planes are parked; the chosen path is
+  Option 3 (full-scene Z-buffered renderer) rather than more leaf-fan imitation of visplanes.
 
 ## FIXED: melt-wipe dissolved garbage on the RDP renderer ("mangled rotated HUD")
 - **Symptom:** the death->respawn (and every level-transition) melt wipe dissolved garbage
