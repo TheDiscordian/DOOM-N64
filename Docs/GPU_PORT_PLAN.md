@@ -461,12 +461,16 @@ setup + command volume are real limits; measure every phase).
   is hole-free AND not a perf loss.
   - Acceptance: frames 3200/3712 (and the demo-wide `BENCH_VOID_SCAN`) show correct floors/
     ceilings with poly planes SUPPRESSED and Z the sole authority; avg/p95 ≤ shipping build.
-  - **First slice landed (`BENCH_FORCE_MESH_WORLDZ`, 2026-06-30):** CPU-emitted baked leaf
-    planes draw as opaque Z-tested world geometry and suppress non-sky poly planes. Full E1M1
-    bench completes: `avg_us=21222 p95_us=46112` (void-scan build `22883/50848`, slower due
-    to scan drain). `BENCH_VOID_SCAN` reports only known startup frame 0 + death/respawn wipe
-    frame 3213 — no 3200/3712 black void. This is a correctness stepping stone, not a perf win;
-    next Phase-A work is coarse culling + RSP/no-readback emit for the world-Z plane geometry.
+  - **First slice landed (`BENCH_FORCE_MESH_WORLDZ`, 2026-06-30, commit `1e8b9cc`):** CPU-emitted
+    baked leaf planes draw as opaque Z-tested world geometry and suppress non-sky poly planes.
+    Full E1M1 bench completes: shipping `mesh` = `17667/32416`; first `mesh-worldz` =
+    `21222/46112` (`+20.1% avg / +42.3% p95`). A cheap per-leaf depth-range bound on band
+    clipping improved it to `20784/44128` (`dlbuild mean/p95 9169/25120`, still a clear loss).
+    `BENCH_VOID_SCAN` reports only known startup frame 0 + death/respawn wipe frame 3213 — no
+    3200/3712 black void. Phase table confirms the trade: `planes` CPU work collapses
+    `1744->59us`, but CPU `rdpq_triangle` world-Z emit moves cost into `dlbuild`. This is a
+    correctness stepping stone, not a perf win; next Phase-A work is coarse culling +
+    RSP/no-readback emit for the world-Z plane geometry.
 - **Phase B — GPU masked/transparent midtextures.** Move two-sided midtex quads
   (`R_RenderMaskedSegRange`) to RDP geometry with alpha-compare / keyed transparency, Z-tested
   against the opaque world, Z-write on opaque texels. Removes one of the two remaining

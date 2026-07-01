@@ -4982,7 +4982,7 @@ static void DL_DrawWorldZPlanes(void)
                 fixed_t height;
                 float spx[DL_WZ_MAXV + 8], spy[DL_WZ_MAXV + 8];
                 fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
-                float hf, nearz_eff, zlo, EDGEB, EDGET;
+                float hf, nearz_eff, zlo, EDGEB, EDGET, cd0, cd1;
                 int ms, band, lvl;
                 uint32_t prim;
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx) continue;
@@ -4991,6 +4991,19 @@ static void DL_DrawWorldZPlanes(void)
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;
                 ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
                 if (ms < 3) continue;
+                // Bound depth-band tessellation to THIS leaf's side-clipped depth range.
+                // Without this, far leaves run all NBANDS clip passes even though only one
+                // band intersects them; pure CPU waste inside dlbuild.
+                {
+                    int k;
+                    cd0 = 1.0e30f;
+                    cd1 = -1.0e30f;
+                    for (k = 0; k < ms; k++) {
+                        float dep = (spx[k] - vxf) * vcosf + (spy[k] - vyf) * vsinf;
+                        if (dep < cd0) cd0 = dep;
+                        if (dep > cd1) cd1 = dep;
+                    }
+                }
 
                 lvl = (255 - sec->lightlevel) >> 3;
                 if (lvl < 0) lvl = 0;
@@ -5004,11 +5017,13 @@ static void DL_DrawWorldZPlanes(void)
                 if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
                 else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
 
-                zlo = nearz_eff;
+                zlo = (cd0 > nearz_eff) ? cd0 : nearz_eff;
+                if (cd1 <= zlo) continue;
                 for (band = 0; band < DL_WZ_NBANDS; band++)
                 {
                     int n, i, tri;
-                    float zhi = (band == DL_WZ_NBANDS - 1) ? DL_WZ_FARZ : zlo * DL_WZ_BAND_RATIO;
+                    float zhi = zlo * DL_WZ_BAND_RATIO;
+                    if (zhi >= cd1 || band == DL_WZ_NBANDS - 1) zhi = DL_WZ_FARZ;
                     float umin = 1.0e30f, vmin = 1.0e30f;
                     float vx[DL_WZ_MAXV][6];
                     n = DL_WZClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
@@ -5046,6 +5061,7 @@ static void DL_DrawWorldZPlanes(void)
                             drew++;
                         }
                     }
+                    if (zhi == DL_WZ_FARZ) break;
                     zlo = zhi;
                 }
             }
