@@ -4914,6 +4914,7 @@ static int DL_WZClipBandToFixed(const float* px, const float* py, int m,
 
 static void DL_DrawWorldZPlanes(void)
 {
+    extern fixed_t yslope[SCREENHEIGHT];   // r_plane.h: per-row plane distance scale (not incl. here)
     fixed_t vcos, vsin;
     float vxf, vyf, vcosf, vsinf, cxf, viewzf;
     int surf, ss, drew = 0;
@@ -4939,7 +4940,10 @@ static void DL_DrawWorldZPlanes(void)
         tp.t.mask = 5;
         rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
     }
-    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    // TEX0*SHADE: the flat texel is modulated by the per-vertex depth-light SHADE
+    // (gouraud), matching the poly-plane path. Was TEX_FLAT (single PRIM) in the first
+    // slice, which produced the frame-3200 near-floor underdraw band.
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rdpq_mode_persp(true);
 
     for (surf = 0; surf < 2; surf++)
@@ -4983,12 +4987,14 @@ static void DL_DrawWorldZPlanes(void)
                 float spx[DL_WZ_MAXV + 8], spy[DL_WZ_MAXV + 8];
                 fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
                 float hf, nearz_eff, zlo, EDGEB, EDGET, cd0, cd1;
-                int ms, band, lvl;
-                uint32_t prim;
+                float planeheight;
+                int ms, band, wz_lnum, wz_fcm_level;
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx) continue;
 
                 height = surf ? sec->ceilingheight : sec->floorheight;
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                // planeheight = |sector height - viewz| (fixed_t), the R_MapPlane distance base.
+                planeheight = (hf < 0.0f) ? -hf : hf;
                 ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
                 if (ms < 3) continue;
                 // Bound depth-band tessellation to THIS leaf's side-clipped depth range.
@@ -5005,11 +5011,31 @@ static void DL_DrawWorldZPlanes(void)
                     }
                 }
 
-                lvl = (255 - sec->lightlevel) >> 3;
-                if (lvl < 0) lvl = 0;
-                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
-                prim = dl_prim_lut[lvl];
-                rdpq_set_prim_color(color_from_packed32(prim));
+                // DISTANCE LIGHTING (per-vertex GOURAUD). The poly-plane path shades floors
+                // by PLANAR distance (planeheight*yslope[row] >> LIGHTZSHIFT -> planezlight),
+                // gouraud-interpolated corner->corner (DL_DrawPlanePoly / R_PlaneCornerColormap).
+                // The first world-Z slice used a single flat sector-light PRIM per leaf, so a
+                // bright near floor stayed dark (~46 lum vs software ~98) -- a broad underdrawn
+                // band at E1M1 frame 3200. Reproduce the software depth ramp: compute each
+                // vertex's colormap level from its own screen row via yslope + zlight, feed it
+                // as SHADE (TRIFMT_ZBUF_SHADE_TEX). fixedcolormap (invuln/visor) forces the
+                // worn level flat, matching R_PlaneCornerColormap. lnum is the live sector
+                // light + extralight, same as the wall RSP-emit distance path.
+                {
+                    extern int extralight;
+                    extern lighttable_t* fixedcolormap;
+                    int ln = (sec->lightlevel >> LIGHTSEGSHIFT) + extralight;
+                    if (ln < 0) ln = 0;
+                    if (ln >= LIGHTLEVELS) ln = LIGHTLEVELS - 1;
+                    wz_lnum = ln;
+                    wz_fcm_level = -1;
+                    if (fixedcolormap) {
+                        long fl = (fixedcolormap - colormaps) / 256;
+                        if (fl < 0) fl = 0;
+                        if (fl > NUMCOLORMAPS - 1) fl = NUMCOLORMAPS - 1;
+                        wz_fcm_level = (int)fl;
+                    }
+                }
 
                 nearz_eff = 6.0f;
                 EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;
@@ -5025,7 +5051,8 @@ static void DL_DrawWorldZPlanes(void)
                     float zhi = zlo * DL_WZ_BAND_RATIO;
                     if (zhi >= cd1 || band == DL_WZ_NBANDS - 1) zhi = DL_WZ_FARZ;
                     float umin = 1.0e30f, vmin = 1.0e30f;
-                    float vx[DL_WZ_MAXV][6];
+                    // TRIFMT_ZBUF_SHADE_TEX vertex: {X,Y,Z, R,G,B,A, S,T, INV_W} (10 floats).
+                    float vx[DL_WZ_MAXV][10];
                     n = DL_WZClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
                                              zlo, zhi, clx, cly, DL_WZ_MAXV);
                     if (n >= 3)
@@ -5041,23 +5068,49 @@ static void DL_DrawWorldZPlanes(void)
                             float sc = (float)centerx * invw;
                             float u = (float)(wx >> FRACBITS);
                             float v = (float)(wy >> FRACBITS);
+                            float cyf = (float)centery - hf * sc;
+                            int   lv;
+                            // Per-vertex distance light: match R_PlaneCornerColormap exactly
+                            // (distance = planeheight*yslope[row]; index >> LIGHTZSHIFT). The
+                            // RDP gouraud-interpolates the resulting shade across the fan.
+                            if (wz_fcm_level >= 0) {
+                                lv = wz_fcm_level;
+                            } else {
+                                int yrow = (int)(cyf + 0.5f);
+                                fixed_t dist; unsigned zi;
+                                if (yrow < 0) yrow = 0;
+                                if (yrow >= viewheight) yrow = viewheight - 1;
+                                dist = FixedMul((fixed_t)(planeheight * 65536.0f), yslope[yrow]);
+                                zi = (unsigned)dist >> LIGHTZSHIFT;
+                                if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+                                lv = (int)((zlight[wz_lnum][zi] - colormaps) / 256);
+                                if (lv < 0) lv = 0;
+                                if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+                            }
+                            {
+                                uint32_t c = dl_prim_lut[lv];
+                                vx[i][3] = (float)((c >> 24) & 0xFF) * (1.0f / 255.0f); // R
+                                vx[i][4] = (float)((c >> 16) & 0xFF) * (1.0f / 255.0f); // G
+                                vx[i][5] = (float)((c >>  8) & 0xFF) * (1.0f / 255.0f); // B
+                                vx[i][6] = 1.0f;                                        // A
+                            }
                             vx[i][0] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
-                            vx[i][1] = (float)centery - hf * sc;
+                            vx[i][1] = cyf;
                             vx[i][2] = DL_WallZ(invw);
-                            vx[i][3] = u;
-                            vx[i][4] = v;
-                            vx[i][5] = invw;
+                            vx[i][7] = u;
+                            vx[i][8] = v;
+                            vx[i][9] = invw;
                             if (u < umin) umin = u;
                             if (v < vmin) vmin = v;
                         }
                         ubias = IFLOOR(umin / 64.0f) * 64;
                         vbias = IFLOOR(vmin / 64.0f) * 64;
                         for (i = 0; i < n; i++) {
-                            vx[i][3] -= (float)ubias;
-                            vx[i][4] = (vx[i][4] - (float)vbias) * 0.5f;
+                            vx[i][7] -= (float)ubias;
+                            vx[i][8] = (vx[i][8] - (float)vbias) * 0.5f;
                         }
                         for (tri = 1; tri < n - 1; tri++) {
-                            rdpq_triangle(&TRIFMT_ZBUF_TEX, vx[0], vx[tri], vx[tri + 1]);
+                            rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx[0], vx[tri], vx[tri + 1]);
                             drew++;
                         }
                     }
