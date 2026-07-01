@@ -4918,9 +4918,52 @@ static int DL_WZClipBandToFixed(const float* px, const float* py, int m,
     return outc;
 }
 
-static void DL_DrawWorldZPlanes(void)
+static int DL_WZLightLevel(int lightlevel, float planeheight, float cy)
 {
     extern fixed_t yslope[SCREENHEIGHT];   // r_plane.h: per-row plane distance scale (not incl. here)
+    extern int extralight;
+    extern lighttable_t* fixedcolormap;
+    int yrow, lnum;
+    fixed_t dist;
+    unsigned zi;
+    long lv;
+
+    if (fixedcolormap) {
+        lv = (fixedcolormap - colormaps) / 256;
+        if (lv < 0) lv = 0;
+        if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+        return (int)lv;
+    }
+
+    yrow = (int)(cy + 0.5f);
+    if (yrow < 0) yrow = 0;
+    if (yrow >= viewheight) yrow = viewheight - 1;
+
+    lnum = (lightlevel >> LIGHTSEGSHIFT) + extralight;
+    if (lnum < 0) lnum = 0;
+    if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+
+    dist = FixedMul((fixed_t)(planeheight * 65536.0f), yslope[yrow]);
+    zi = (unsigned)dist >> LIGHTZSHIFT;
+    if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+
+    lv = (zlight[lnum][zi] - colormaps) / 256;
+    if (lv < 0) lv = 0;
+    if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+    return (int)lv;
+}
+
+static void DL_WZShade4(int level, float out[4])
+{
+    uint32_t c = (level < NUMCOLORMAPS) ? dl_prim_lut[level] : dl_unlit_prim;
+    out[0] = (float)((c >> 24) & 0xFF) * (1.0f / 255.0f);
+    out[1] = (float)((c >> 16) & 0xFF) * (1.0f / 255.0f);
+    out[2] = (float)((c >>  8) & 0xFF) * (1.0f / 255.0f);
+    out[3] = 1.0f;
+}
+
+static void DL_DrawWorldZPlanes(void)
+{
     fixed_t vcos, vsin;
     float vxf, vyf, vcosf, vsinf, cxf, viewzf;
     int surf, ss, drew = 0;
@@ -4994,7 +5037,7 @@ static void DL_DrawWorldZPlanes(void)
                 fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
                 float hf, nearz_eff, zlo, EDGEB, EDGET, cd0, cd1;
                 float planeheight;
-                int ms, band, wz_lnum, wz_fcm_level;
+                int ms, band;
                 if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx) continue;
 
                 height = surf ? sec->ceilingheight : sec->floorheight;
@@ -5022,26 +5065,7 @@ static void DL_DrawWorldZPlanes(void)
                 // gouraud-interpolated corner->corner (DL_DrawPlanePoly / R_PlaneCornerColormap).
                 // The first world-Z slice used a single flat sector-light PRIM per leaf, so a
                 // bright near floor stayed dark (~46 lum vs software ~98) -- a broad underdrawn
-                // band at E1M1 frame 3200. Reproduce the software depth ramp: compute each
-                // vertex's colormap level from its own screen row via yslope + zlight, feed it
-                // as SHADE (TRIFMT_ZBUF_SHADE_TEX). fixedcolormap (invuln/visor) forces the
-                // worn level flat, matching R_PlaneCornerColormap. lnum is the live sector
-                // light + extralight, same as the wall RSP-emit distance path.
-                {
-                    extern int extralight;
-                    extern lighttable_t* fixedcolormap;
-                    int ln = (sec->lightlevel >> LIGHTSEGSHIFT) + extralight;
-                    if (ln < 0) ln = 0;
-                    if (ln >= LIGHTLEVELS) ln = LIGHTLEVELS - 1;
-                    wz_lnum = ln;
-                    wz_fcm_level = -1;
-                    if (fixedcolormap) {
-                        long fl = (fixedcolormap - colormaps) / 256;
-                        if (fl < 0) fl = 0;
-                        if (fl > NUMCOLORMAPS - 1) fl = NUMCOLORMAPS - 1;
-                        wz_fcm_level = (int)fl;
-                    }
-                }
+                // band at E1M1 frame 3200. Reproduce the software depth ramp per vertex below.
 
                 nearz_eff = 6.0f;
                 EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;
@@ -5075,31 +5099,12 @@ static void DL_DrawWorldZPlanes(void)
                             float u = (float)(wx >> FRACBITS);
                             float v = (float)(wy >> FRACBITS);
                             float cyf = (float)centery - hf * sc;
-                            int   lv;
+                            int lv;
                             // Per-vertex distance light: match R_PlaneCornerColormap exactly
                             // (distance = planeheight*yslope[row]; index >> LIGHTZSHIFT). The
                             // RDP gouraud-interpolates the resulting shade across the fan.
-                            if (wz_fcm_level >= 0) {
-                                lv = wz_fcm_level;
-                            } else {
-                                int yrow = (int)(cyf + 0.5f);
-                                fixed_t dist; unsigned zi;
-                                if (yrow < 0) yrow = 0;
-                                if (yrow >= viewheight) yrow = viewheight - 1;
-                                dist = FixedMul((fixed_t)(planeheight * 65536.0f), yslope[yrow]);
-                                zi = (unsigned)dist >> LIGHTZSHIFT;
-                                if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
-                                lv = (int)((zlight[wz_lnum][zi] - colormaps) / 256);
-                                if (lv < 0) lv = 0;
-                                if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
-                            }
-                            {
-                                uint32_t c = dl_prim_lut[lv];
-                                vx[i][3] = (float)((c >> 24) & 0xFF) * (1.0f / 255.0f); // R
-                                vx[i][4] = (float)((c >> 16) & 0xFF) * (1.0f / 255.0f); // G
-                                vx[i][5] = (float)((c >>  8) & 0xFF) * (1.0f / 255.0f); // B
-                                vx[i][6] = 1.0f;                                        // A
-                            }
+                            lv = DL_WZLightLevel(sec->lightlevel, planeheight, cyf);
+                            DL_WZShade4(lv, &vx[i][3]);
                             vx[i][0] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
                             vx[i][1] = cyf;
                             vx[i][2] = DL_WallZ(invw);
