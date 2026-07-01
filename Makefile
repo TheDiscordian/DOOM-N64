@@ -152,6 +152,13 @@ CFLAGS += -DBENCH_FORCE_MESH=1
 ifeq ($(BENCH_FORCE_MESH_FLOORS),1)
 CFLAGS += -DBENCH_FORCE_MESH_FLOORS=1
 endif
+#   BENCH_FORCE_MESH_WORLDZ=1 -> Option 3 Phase A candidate: draw baked floor/ceiling
+#   leaves as opaque Z-tested world geometry alongside mesh walls, suppressing non-sky
+#   poly planes. Distinct from the old visplane-replacement BENCH_FORCE_MESH_FLOORS path:
+#   this is a full-scene-Z stepping stone, not a drop-in mask-equivalence attempt.
+ifeq ($(BENCH_FORCE_MESH_WORLDZ),1)
+CFLAGS += -DBENCH_FORCE_MESH_WORLDZ=1
+endif
 #   BENCH_FORCE_MESH_CULL=1 -> the mesh's OWN visibility: mark walls by frustum (every
 #   wall in a frustum-visible subsector) instead of the BSP solidsegs occlusion. Wall-Z
 #   handles overdraw. First step toward replacing the per-seg BSP occlusion walk.

@@ -2231,6 +2231,13 @@ void D_DoomMain (void)
     n64_rdp_mesh_floors = 1;
     debugf("BENCH: MESH floors ON (baked leaf fans; perf-loss experiment)\n");
 #endif
+#ifdef BENCH_FORCE_MESH_WORLDZ
+    // Option 3 Phase A candidate: floors/ceilings as opaque Z-tested world geometry.
+    // This suppresses non-sky poly planes and lets the shared Z-buffer govern visibility.
+    extern int n64_rdp_mesh_worldz;
+    n64_rdp_mesh_worldz = 1;
+    debugf("BENCH: MESH WORLD-Z planes ON (Option 3 Phase A candidate)\n");
+#endif
 #ifdef BENCH_FORCE_MESH_CULL
     // The mesh's OWN visibility: mark walls by frustum (every wall in a frustum-visible
     // subsector), not the BSP solidsegs occlusion. Wall-Z handles overdraw. First step

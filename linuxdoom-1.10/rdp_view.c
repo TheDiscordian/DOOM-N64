@@ -2441,6 +2441,8 @@ int n64_rdp_mesh_floors = 0;// BENCH_FORCE_MESH_FLOORS gate -- Phase 3 floor lea
                             // default: measured a PERF LOSS (mesh floors slower than the
                             // already-coalesced visplane path). Separate flag so the
                             // default mesh build keeps the validated wall-only perf.
+int n64_rdp_mesh_worldz = 0;// BENCH_FORCE_MESH_WORLDZ: Option 3 Phase A candidate -- draw
+                            // floor/ceiling leaves as opaque Z-tested world geometry.
 int dl_wall_z       = 0;    // mesh wall pass: draw with the Z-buffer (set in DL_Flush)
 int dl_zbuf_attached = 0;   // set by i_video each frame: 1 iff a z-image is attached
 
@@ -4829,6 +4831,235 @@ static void DL_FlushSpans(void)
 #define DL_LEAF_MAXV 64
 static int dl_leaf_tris = 0;
 
+// Option 3 Phase A candidate: draw floor/ceiling leaves as opaque world-Z geometry.
+// This deliberately does NOT try to reproduce visplane top[]/bottom[] masks. It draws
+// conservative baked leaf geometry through the same Z-buffer as mesh walls and lets Z
+// decide visibility. First slice is CPU-emitted (rdpq_triangle) for correctness; RSP
+// no-readback emit can be reintroduced once the render model is proven.
+#define DL_WZ_NBANDS      6
+#define DL_WZ_BAND_RATIO  4.0f
+#define DL_WZ_FARZ        32767.0f
+#define DL_WZ_MAXV        DL_LEAF_MAXV
+
+static int DL_WZClipLeafSides(int firstvert, int n,
+                              float vxf, float vyf, float vcosf, float vsinf, float cxf,
+                              float* px, float* py)
+{
+    float qx[DL_WZ_MAXV + 8], qy[DL_WZ_MAXV + 8];
+    const float SXMIN = -160.0f, SXMAX = (float)SCREENWIDTH + 160.0f;
+    const float KHI = (cxf - SXMIN) / cxf;
+    const float KLO = (cxf - SXMAX) / cxf;
+    int m = n, i, plane;
+    if (n < 3 || n > DL_WZ_MAXV) return 0;
+    for (i = 0; i < n; i++) {
+        px[i] = (float)bake_leaf_verts[firstvert + i][0] * (1.0f / 65536.0f);
+        py[i] = (float)bake_leaf_verts[firstvert + i][1] * (1.0f / 65536.0f);
+    }
+    for (plane = 0; plane < 2 && m >= 3; plane++) {
+        float f[DL_WZ_MAXV + 8];
+        int outc = 0, j;
+        for (j = 0; j < m; j++) {
+            float dx = px[j] - vxf, dy = py[j] - vyf;
+            float depth = dx * vcosf + dy * vsinf;
+            float lat   = dy * vcosf - dx * vsinf;
+            f[j] = (plane == 0) ? (lat - KHI * depth) : (KLO * depth - lat);
+        }
+        for (j = 0; j < m; j++) {
+            int k = (j + 1 == m) ? 0 : j + 1;
+            int ain = (f[j] <= 0.0f), bin = (f[k] <= 0.0f);
+            if (ain) { qx[outc] = px[j]; qy[outc] = py[j]; outc++; }
+            if (ain != bin) {
+                float t = f[j] / (f[j] - f[k]);
+                qx[outc] = px[j] + t * (px[k] - px[j]);
+                qy[outc] = py[j] + t * (py[k] - py[j]);
+                outc++;
+            }
+            if (outc >= DL_WZ_MAXV + 6) break;
+        }
+        m = outc;
+        for (j = 0; j < m; j++) { px[j] = qx[j]; py[j] = qy[j]; }
+    }
+    return m;
+}
+
+static int DL_WZClipBandToFixed(const float* px, const float* py, int m,
+                                float vxf, float vyf, float vcosf, float vsinf,
+                                float zlo, float zhi, fixed_t* outx, fixed_t* outy, int cap)
+{
+    float ax[DL_WZ_MAXV + 8], ay[DL_WZ_MAXV + 8], f[DL_WZ_MAXV + 8];
+    int m2 = 0, outc = 0, j;
+    if (m < 3) return 0;
+    for (j = 0; j < m; j++) { float dx = px[j]-vxf, dy = py[j]-vyf; f[j] = zlo - (dx*vcosf + dy*vsinf); }
+    for (j = 0; j < m; j++) {
+        int k = (j + 1 == m) ? 0 : j + 1, ain = (f[j] <= 0.0f), bin = (f[k] <= 0.0f);
+        if (ain) { ax[m2] = px[j]; ay[m2] = py[j]; m2++; }
+        if (ain != bin) { float t = f[j]/(f[j]-f[k]);
+            ax[m2] = px[j]+t*(px[k]-px[j]); ay[m2] = py[j]+t*(py[k]-py[j]); m2++; }
+        if (m2 >= DL_WZ_MAXV + 6) break;
+    }
+    if (m2 < 3) return 0;
+    for (j = 0; j < m2; j++) { float dx = ax[j]-vxf, dy = ay[j]-vyf; f[j] = (dx*vcosf + dy*vsinf) - zhi; }
+    for (j = 0; j < m2; j++) {
+        int k = (j + 1 == m2) ? 0 : j + 1, ain = (f[j] <= 0.0f), bin = (f[k] <= 0.0f);
+        if (ain) { outx[outc] = (fixed_t)(ax[j]*65536.0f); outy[outc] = (fixed_t)(ay[j]*65536.0f); outc++; }
+        if (ain != bin) { float t = f[j]/(f[j]-f[k]);
+            outx[outc] = (fixed_t)((ax[j]+t*(ax[k]-ax[j]))*65536.0f);
+            outy[outc] = (fixed_t)((ay[j]+t*(ay[k]-ay[j]))*65536.0f); outc++; }
+        if (outc >= DL_WZ_MAXV + 6) break;
+    }
+    if (outc < 3) return 0;
+    if (outc > cap) return -1;
+    return outc;
+}
+
+static void DL_DrawWorldZPlanes(void)
+{
+    fixed_t vcos, vsin;
+    float vxf, vyf, vcosf, vsinf, cxf, viewzf;
+    int surf, ss, drew = 0;
+    static int flats[256];
+    static int vis[4096];
+
+    if (!n64_rdp_mesh_worldz || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+        return;
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    vxf = (float)viewx * (1.0f / 65536.0f);
+    vyf = (float)viewy * (1.0f / 65536.0f);
+    vcosf = (float)vcos * (1.0f / 65536.0f);
+    vsinf = (float)vsin * (1.0f / 65536.0f);
+    cxf = (float)centerx;
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;
+        tp.t.mask = 5;
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+    }
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    rdpq_mode_persp(true);
+
+    for (surf = 0; surf < 2; surf++)
+    {
+        int nvis = 0, nflat = 0, vi, fi;
+        for (ss = 0; ss < numsubsectors; ss++)
+        {
+            bake_leaf_t* lf = &bake_leaves[ss];
+            fixed_t height;
+            int pic, fl, j, seen;
+            if (!bake_leafvis[ss]) continue;       // Phase-A cull seed; later replaced by PVS/frustum cull.
+            if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
+            pic = surf ? lf->ceilingpic : lf->floorpic;
+            if (pic == skyflatnum) continue;
+            height = surf ? sectors[lf->sector].ceilingheight : sectors[lf->sector].floorheight;
+            if (surf ? (height <= viewz) : (height >= viewz)) continue;
+            if (nvis < (int)(sizeof(vis) / sizeof(vis[0]))) vis[nvis++] = ss;
+            fl = flattranslation[pic];
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
+        }
+
+        for (fi = 0; fi < nflat; fi++)
+        {
+            int flatidx = flats[fi];
+            byte* block = DL_FlatBlock(flatidx);
+            if (!block) continue;
+            DL_FlatMarkInFlight(flatidx);
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
+            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);
+
+            for (vi = 0; vi < nvis; vi++)
+            {
+                bake_leaf_t* lf = &bake_leaves[vis[vi]];
+                sector_t* sec = &sectors[lf->sector];
+                fixed_t height;
+                float spx[DL_WZ_MAXV + 8], spy[DL_WZ_MAXV + 8];
+                fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
+                float hf, nearz_eff, zlo, EDGEB, EDGET;
+                int ms, band, lvl;
+                uint32_t prim;
+                if (flattranslation[surf ? lf->ceilingpic : lf->floorpic] != flatidx) continue;
+
+                height = surf ? sec->ceilingheight : sec->floorheight;
+                hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
+                if (ms < 3) continue;
+
+                lvl = (255 - sec->lightlevel) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                prim = dl_prim_lut[lvl];
+                rdpq_set_prim_color(color_from_packed32(prim));
+
+                nearz_eff = 6.0f;
+                EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;
+                EDGET = (float)centery + 256.0f;
+                if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
+                else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
+
+                zlo = nearz_eff;
+                for (band = 0; band < DL_WZ_NBANDS; band++)
+                {
+                    int n, i, tri;
+                    float zhi = (band == DL_WZ_NBANDS - 1) ? DL_WZ_FARZ : zlo * DL_WZ_BAND_RATIO;
+                    float umin = 1.0e30f, vmin = 1.0e30f;
+                    float vx[DL_WZ_MAXV][6];
+                    n = DL_WZClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
+                                             zlo, zhi, clx, cly, DL_WZ_MAXV);
+                    if (n >= 3)
+                    {
+                        int ubias, vbias;
+                        for (i = 0; i < n; i++)
+                        {
+                            fixed_t wx = clx[i], wy = cly[i];
+                            fixed_t tx = wx - viewx, ty = wy - viewy;
+                            fixed_t depth = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+                            fixed_t lat = FixedMul(ty, vcos) - FixedMul(tx, vsin);
+                            float invw = 65536.0f / (float)depth;
+                            float sc = (float)centerx * invw;
+                            float u = (float)(wx >> FRACBITS);
+                            float v = (float)(wy >> FRACBITS);
+                            vx[i][0] = (float)centerx - (float)lat * (1.0f / 65536.0f) * sc;
+                            vx[i][1] = (float)centery - hf * sc;
+                            vx[i][2] = DL_WallZ(invw);
+                            vx[i][3] = u;
+                            vx[i][4] = v;
+                            vx[i][5] = invw;
+                            if (u < umin) umin = u;
+                            if (v < vmin) vmin = v;
+                        }
+                        ubias = IFLOOR(umin / 64.0f) * 64;
+                        vbias = IFLOOR(vmin / 64.0f) * 64;
+                        for (i = 0; i < n; i++) {
+                            vx[i][3] -= (float)ubias;
+                            vx[i][4] = (vx[i][4] - (float)vbias) * 0.5f;
+                        }
+                        for (tri = 1; tri < n - 1; tri++) {
+                            rdpq_triangle(&TRIFMT_ZBUF_TEX, vx[0], vx[tri], vx[tri + 1]);
+                            drew++;
+                        }
+                    }
+                    zlo = zhi;
+                }
+            }
+        }
+    }
+
+    dl_leaf_tris = drew;
+    {
+        static unsigned wzf = 0;
+        if ((wzf++ & 511) == 0)
+            debugf("MESH-WORLDZ: plane tris=%d (Option3 Phase A candidate)\n", dl_leaf_tris);
+    }
+}
+
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
 // Phase 4 VERIFY (logging only, no render effect): dispatch every drawable leaf's verts
 // through the RSP DLWallCmd_LeafBatch and compare {cx, invw, emit} against the CPU
@@ -5274,6 +5505,12 @@ static void DL_DrawMeshLeaves(void)
     static int            leaf_proj_cap = 0;
     static unsigned char* leaf_cull = NULL;     // [numsubsectors]: 1 = skip this frame
     static int            leaf_cull_cap = 0;
+
+    if (n64_rdp_mesh_worldz)
+    {
+        DL_DrawWorldZPlanes();
+        return;
+    }
 
     if (!n64_rdp_mesh_floors || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
         return;
