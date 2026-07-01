@@ -1,5 +1,12 @@
 # GPU Port Plan — static world mesh + cull + RSP-fed raster
 
+> **DIRECTION (2026-06-30): pursuing Option 3 — a full-scene Z-buffered renderer.** The
+> mesh floor/ceiling retry was refuted (planes cannot mimic visplane opening masks as isolated
+> leaf fans); the decision is to make the shared Z-buffer the authority for ALL opaque world
+> visibility and retire the CPU visibility machinery in phases. Read **§DIRECTION CHANGE
+> (2026-06-30): Option 3** at the end of this file FIRST — it supersedes the Phase-3 /
+> floors-as-poly-plane-drop-in framing below. Motivating evidence: `Docs/CEILING_VOID_INVESTIGATION.md`.
+
 Goal: collapse the p95 CPU tail toward locked-60 by replacing DOOM's per-frame
 CPU geometry generation (BSP-walk projection + per-column wall fill + per-frame
 visplane tessellation) with a **static world-space polygon mesh** baked once at
@@ -26,6 +33,11 @@ adversarial review that refuted the first synthesis' central premise** — see �
 > opaque wall-vs-wall pixels. See §Z-buffer.
 
 ## Architecture
+
+> **Historical note (2026-06-30):** this section records the original incremental mesh-port
+> architecture. The current direction is Option 3 (§DIRECTION CHANGE below): a full-scene
+> Z-buffered renderer. In particular, the old "BSP order / no Z-image" and "leaf floors as a
+> drop-in for visplanes" assumptions are superseded; keep reading this section as background only.
 
 1. **Bake (once, at level load).** `P_SetupLevel` (p_setup.c:651) gains a
    `P_BakeWorldMesh` (new `r_bake.c`) that converts the static lumps into a
@@ -132,15 +144,17 @@ won't initially, vs today's per-column projection.)
   rowoffset/peg_*` populated, resolved live each frame in the transform -- rdp_view.c:3500+);
   grazing-angle S-precision smear mitigated by period-bias + S-span split (`7226518`), with
   s10.5 saturation (>1024 texels/tri) the residual RDP physical limit.
-- **Phase 3 — Baked leaf-fan floors/ceilings** ✅ BUILT + VALIDATED, but SHELVED
-  (default-OFF, perf loss). The convex-leaf bake (`P_BakeLeafFans`, r_bake.c -- the
+- **Phase 3 — Baked leaf-fan floors/ceilings** BUILT, but SHELVED / SUPERSEDED
+  (default-OFF). The convex-leaf bake (`P_BakeLeafFans`, r_bake.c -- the
   Sutherland-Hodgman partition-half-plane clip below, 237/237 E1M1 subsectors filled +
   convex, `a5ea814`) and the per-frame leaf transform + RDP emit (`DL_DrawMeshLeaves`,
-  rdp_view.c, CPU + an RSP-leaf variant) are COMPLETE and validated (`43edf87`). But it is
+  rdp_view.c, CPU + an RSP-leaf variant) were built and simple-frame validated. But it is
   gated behind `BENCH_FORCE_MESH_FLOORS` and **OFF by default** (`n64_rdp_mesh_floors=0`):
-  it MEASURED A PERF LOSS (~+5% avg / +21% p95) -- the baked leaf mesh is SLOWER than the
-  already-coalesced RDP plane-poly path. So shipping floors/ceilings render via
-  `DL_FlushPlanePolys` (RDP trapezoid plane polys), NOT the leaf mesh and NOT software spans.
+  it first MEASURED A PERF LOSS (~+5% avg / +21% p95), and the 2026-06-30 retry later
+  refuted it as a drop-in visual replacement for poly planes (leaf/cell fans do not consume
+  visplane opening masks; see `Docs/CEILING_VOID_INVESTIGATION.md`). So shipping
+  floors/ceilings render via `DL_FlushPlanePolys` (RDP trapezoid plane polys), NOT the leaf
+  mesh and NOT software spans.
   (Original design note, still accurate, kept below.) ⚠️ **THE HARD PART = closing
   each subsector leaf to its convex polygon.** Vanilla nodes have NO minisegs, so
   `segs[firstline..]` only cover the leaf's *wall* edges — the boundary that runs along
@@ -214,6 +228,12 @@ Default mesh build baseline avg ~17.9k / p95 ~30.8k us. Per-phase tail (p95): `d
   TOTAL frame time, not the single phase you touched.
 
 ## BSP-walk-replacement roadmap (2026-06-24) — where the GPU port stands
+
+> **Superseded by Option 3 (2026-06-30):** the old sequence "floors on mesh, then sprites,
+> then strip R_AddLine" assumed mesh floors could replace poly planes independently. The live
+> roadmap is now Phase A/B/C/D in §DIRECTION CHANGE below. This section remains as historical
+> performance context only.
+
 The RSP wall-transform offload is DEFAULT-ON and WON (walls off the CPU). That made `bsp_walk`
 (~23% tail) the new #1 cost: the per-seg BSP occlusion walk (R_AddLine: 2× R_PointToAngle +
 solidsegs + R_StoreWallRange). The plan is to delete it and let the mesh do its OWN cull
@@ -234,7 +254,11 @@ solidsegs + R_StoreWallRange). The plan is to delete it and let the mesh do its 
    (R_CheckBBox uses them); the pure-frustum walk drops solidsegs entirely and lets Z do ALL
    occlusion — visits/draws more, but kills the per-seg cost. Measure the balance when it lands.
 
-## CURRENT PROFILE + corrected next levers (2026-06-24, default mesh build = mesh-floors)
+## HISTORICAL PROFILE + corrected next levers (2026-06-24, then-default experiment = mesh-floors)
+
+> **Not the current shipping baseline.** Current known-good/default mesh work is mesh walls +
+> poly planes (`BENCH_FORCE_MESH=1`, no `BENCH_FORCE_MESH_FLOORS`). These numbers are retained
+> to explain why the old mesh-floor route was attractive, then refuted.
 
 `bench/bench.sh mesh-floors`, E1M1 4117 frames, avg 16633 / p95 30112 (60.1 / 33.2 fps).
 Per-phase MEAN (pct of mean_total 19522us):
@@ -375,3 +399,113 @@ exceeds the 3ms walk, so the consume wait still stalls for the remainder). The c
 rdpq_triangle commands -> CPU never reads batch_out back, keeps compaction, drops both the
 776us stall and the 352us emit). That's the keystone; it's a multi-session hand-rolled ucode
 effort (tiny3d is NO-GO: resets combiner/TLUT, stomps DOOM CI4).
+
+## DIRECTION CHANGE (2026-06-30): Option 3 — full-scene Z-buffered renderer
+
+Ryan's call after the mesh-plane retry (below): stop trying to make **mesh floors/ceilings
+mimic visplanes**, and instead make the shared **Z-buffer the authority for ALL opaque world
+visibility**. This is the "whole level as a mesh" architecture. It supersedes the
+"floors-on-the-mesh as a drop-in for poly planes" framing that Phase 3 / RSP_PORT_PLAN §8 chased.
+
+### Why the mesh-plane retry did not ship (the finding that forced the pivot)
+See `Docs/CEILING_VOID_INVESTIGATION.md` for the full log. Short version, all confirmed on the
+retry branch `perf/rdp-mesh-planes-retry` with same-geometry captures at E1M1 frame 3712/3200:
+- The no-readback mesh leaf/cell path **emits the descriptors** (EMITDIAG: `ceil vis≈desc`,
+  `dcap_break=0`), the cells are on-screen and non-degenerate (LEAFRB), and it is **not** a
+  simple z-test/cap/cull drop.
+- Cells vs whole-leaf bands: **same class of mismatch**. Not the tessellation.
+- Emitting the SAME staged cells through libdragon `rdpq_triangle()` on the CPU (and even
+  recomputing the projection on the CPU) **still** diverges from the working poly-plane baseline.
+  So it is **not** overlay-B / the RSP emitter / the RSP transform in isolation.
+- A same-geometry diff vs the working **mesh-walls + poly-planes** build shows **broad darker /
+  underdrawn plane regions**, not one missing grey sliver.
+- ROOT CAUSE (design, not a bug): the poly-plane path draws visplanes **clipped to DOOM's real
+  per-column openings** (`visplane->top[]/bottom[]`, produced by `R_RenderSegLoop` in the wall
+  pass). The mesh-leaf path only marks visible subsectors/cells and draws whole convex leaf
+  polygons — it never consumes those opening masks — so in busy stepped-ceiling scenes its
+  coverage/lighting/order cannot match. Even in the mesh build, `R_RenderSegLoop` still fills
+  `ceilingplane/floorplane->top[]/bottom[]`; the poly path is a GPU plane path that is *already*
+  clipped to visibility, while mesh leaves are not.
+
+**Conclusion:** meshing planes in isolation is the wrong shape for THIS renderer. The renderer is
+still a hybrid — mesh walls on Z, poly planes on visplane masks, sprites+masked on the drawseg
+clip arrays, 2D overlay on the CI8 software buffer. Floors can only become plain mesh geometry
+once the whole opaque world is depth-tested and no class still depends on the CPU visibility
+products (visplane opening masks + drawseg sprite-clip arrays).
+
+### The end-state architecture
+```
+opaque world (walls + floors + ceilings [+ masked-opaque]) --> ONE shared 16-bit Z-image
+    visibility = per-pixel Z, NOT visplane top[]/bottom[], NOT solidsegs, NOT drawsegs
+sprites / transparent midtex --> textured billboards / quads, Z-TESTED against that world,
+    alpha/keyed transparency, sorted only where blending order matters
+sky --> background pass, no Z write
+2D overlay (HUD / status bar / menu / wipe) --> its own pass (unchanged for now)
+BSP walk --> demoted to a COARSE culler (frustum + sector/leaf PVS), or dropped for a
+    frustum/portal traversal; it no longer produces per-column visibility
+```
+The win is deleting the CPU visibility machinery: `R_AddLine` occlusion, `R_StoreWallRange`,
+`R_RenderSegLoop` column fill, visplane `top[]/bottom[]` construction, and the drawseg sprite
+clip arrays. The cost is more RDP fill/overdraw + more RSP triangle setup + command bandwidth —
+acceptable ONLY with coarse culling (the RDP is idle today, `rdpbusy` ~3–5µs, but N64 triangle
+setup + command volume are real limits; measure every phase).
+
+### Phased roadmap (each phase behind a flag, A/B vs the shipping mesh-walls+poly-planes build)
+- **Phase A — Opaque world Z renderer (walls + floors + ceilings).** Draw baked floor/ceiling
+  geometry into the SAME Z-image as the mesh walls, with Z as the only occlusion authority — NO
+  dependence on `visplane->top[]/bottom[]`. This is the real replacement for poly planes. Reuses
+  the Phase-3 convex-leaf bake (`P_BakeLeafFans`) as opaque geometry, but the acceptance test is
+  now "no holes / correct occlusion vs walls by Z", not "matches the visplane mask". Needs a
+  conservative floor/ceiling cull (frustum + which sectors are potentially visible) so we are not
+  drawing the whole map. GATE: new build flag; keep poly planes as the shipping default until A
+  is hole-free AND not a perf loss.
+  - Acceptance: frames 3200/3712 (and the demo-wide `BENCH_VOID_SCAN`) show correct floors/
+    ceilings with poly planes SUPPRESSED and Z the sole authority; avg/p95 ≤ shipping build.
+- **Phase B — GPU masked/transparent midtextures.** Move two-sided midtex quads
+  (`R_RenderMaskedSegRange`) to RDP geometry with alpha-compare / keyed transparency, Z-tested
+  against the opaque world, Z-write on opaque texels. Removes one of the two remaining
+  drawseg dependencies. GATE: flag; verify grates/bars/windows (and their sorting) vs software.
+- **Phase C — GPU sprites.** Billboard sprites on the RDP, Z-tested against the world Z-image,
+  alpha/keyed transparency, an explicit z-write + sort policy for sprite-vs-sprite and
+  sprite-vs-transparent. Removes the LAST drawseg dependency (`sprtopclip`/`sprbottomclip`/
+  `silhouette`). Weapon/HUD sprites stay in the 2D overlay pass. GATE: flag; verify partial
+  occlusion (monster behind a step/rail), thing sort, and translucency.
+- **Phase D — Strip the BSP visibility walk.** ONLY after A+B+C no longer consume any CPU
+  visibility product: delete/collapse `R_AddLine` occlusion + `R_StoreWallRange` +
+  `R_RenderSegLoop` fill + visplane mask construction + drawseg clip arrays. Replace the walk
+  with a frustum + sector/leaf PVS (or portal) traversal that only picks the drawn set. Measure
+  the `bsp_walk` collapse against the added RDP/RSP cost — this is the phase the whole port is
+  for, and the one that can regress perf if culling is too loose.
+
+### Gotchas Option 3 MUST still honour (carried from §DOOM gotchas, re-scoped)
+- **Automap `ML_MAPPED`** is set in `R_StoreWallRange` today. If that dies in Phase D, the cull/
+  traversal must set `ML_MAPPED` per visited wall or walked-past walls never map.
+- **Moving sectors** stay a LIVE per-frame height resolve (Phase 4 pattern), never a cached Z.
+- **Sky** stays its own pass; opaque world geometry skips `picnum==skyflatnum`.
+- **Colormap / sector light / CI4 damage-flash / fixedcolormap** must keep working per surface on
+  every newly-meshed class (walls + planes already do; masked + sprites must match when moved).
+- **Ordering where blending matters** (translucent midtex, sprite translucency) is NOT solved by
+  the opaque Z-image alone — Phases B/C still need a back-to-front sort for the blended fraction.
+
+### Open risks / uncertainties (flagged, not yet measured)
+- **Overdraw budget.** Drawing conservatively-culled floors/ceilings + walls every frame into Z
+  may raise RDP fill beyond the idle headroom on dense frames. Unknown until Phase A benches;
+  the coarse cull (frustum + potentially-visible sectors) is the lever.
+- **Sprite occlusion fidelity.** Z-testing billboards against the world replaces DOOM's exact
+  column clip; thin gaps / grazing steps may differ by a pixel. Needs a live-motion grab, not
+  just frozen marks.
+- **Command/triangle-setup volume.** More geometry = more `rspq` commands + RSP triangle setup
+  (~150–173 cyc/tri floor, shared ucode). The RSP-emits-triangles keystone (RSP_PORT_PLAN §9) is
+  the same lever that keeps this affordable; Phase A/B/C should ride it, not CPU emit.
+- **2D overlay stays software for now.** The CI8 HUD/status/wipe blit (`present`) is explicitly
+  out of Option 3's opaque-world scope (delicate ghost/TLUT/keyed-box history); a later, separate
+  effort.
+
+### Status / branch hygiene (2026-06-30)
+- **Shipping / known-good:** `perf/rdp-renderer` @ `383cd05` = mesh walls + poly planes. UNCHANGED.
+  This stays the default until Phase A is proven hole-free and not a perf loss.
+- **Mesh-plane retry (parked):** `perf/rdp-mesh-planes-retry` (from the parked
+  `perf/rdp-mesh-planes-wip`). Holds the no-readback leaf/cell emit + the diagnostics that
+  produced the finding above. Kept for reference; NOT the Option 3 path.
+- **Next:** start the Option 3 work (Phase A) on a fresh branch off the known-good checkpoint;
+  keep every phase behind a build flag and A/B against the shipping build.

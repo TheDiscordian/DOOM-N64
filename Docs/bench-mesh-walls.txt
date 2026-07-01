@@ -16,4 +16,6 @@ Remaining wall fidelity gaps (NOT occlusion/perf):
     + ML_DONTPEG* -> walls with offsets/bottom-peg mis-align vs software). UNCONFIRMED
     visible; needs a clean A/B.
   - grazing-angle S-precision smear (pre-existing, also hit the per-column path).
-Next perf lever: Phase 3 baked leaf-fan floors/ceilings (the plane tail).
+Next perf lever (updated 2026-06-30): Option 3 full-scene Z-buffered renderer. The isolated
+Phase-3 baked leaf-fan floor/ceiling path was superseded because it cannot reproduce visplane
+opening-mask coverage as a drop-in replacement; see Docs/GPU_PORT_PLAN.md.

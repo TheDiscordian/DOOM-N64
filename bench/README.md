@@ -14,7 +14,9 @@ runs — A/B by the numbers, not by feel.
 ```bash
 bench/bench.sh mesh                       # build + bench one preset
 bench/bench.sh software mesh              # A/B, prints a delta table
-bench/bench.sh mesh-floors mesh-leaf-rsp  # the Phase 4 floors A/B
+bench/bench.sh mesh                       # current known-good mesh: walls + poly planes
+# Historical diagnostics only (superseded by Option 3):
+bench/bench.sh mesh-floors mesh-leaf-rsp  # old leaf-floor A/B, not a shipping target
 bench/bench.sh --list                     # all presets + their flags
 ```
 
@@ -31,11 +33,11 @@ can't trip the footguns below — prefer it.**
 | `rdp` | full RDP renderer, no mesh |
 | `planes-only` | SW walls + RDP planes (isolation) |
 | `walls-only` | RDP walls + SW planes (isolation) |
-| `mesh` | **default mesh build**: RSP-transformed walls + doors on the Z-mesh |
+| `mesh` | **current known-good mesh build**: RSP-transformed walls + doors on the Z-mesh; floors/ceilings remain RDP poly planes |
 | `mesh-cpu` | mesh walls with the CPU transform (opt out of the RSP offload) — the RSP-vs-CPU A/B |
 | `mesh-cull` | mesh's own frustum visibility instead of BSP solidsegs occlusion |
-| `mesh-floors` | mesh + baked floor/ceiling leaf fans (CPU leaf transform) |
-| `mesh-leaf-rsp` | mesh-floors + the leaf vertex transform on the RSP (Phase 4) |
+| `mesh-floors` | **historical/diagnostic only**: mesh + baked floor/ceiling leaf fans (CPU leaf transform); superseded by Option 3 |
+| `mesh-leaf-rsp` | **historical/diagnostic only**: mesh-floors + the leaf vertex transform on the RSP; superseded by Option 3 |
 
 ---
 
@@ -51,8 +53,8 @@ BENCH_FORCE_RDP=1               # the RDP renderer. REQUIRED parent of all mesh:
   ├ BENCH_FORCE_PLANES_ONLY=1
   ├ BENCH_FORCE_WALLS_ONLY=1
   └ BENCH_FORCE_MESH=1          # the GPU-port mesh. Parent of:
-      ├ BENCH_FORCE_MESH_FLOORS=1
-      │   └ BENCH_FORCE_MESH_LEAF_RSP=1   # also needs RSPASFLAGS (wired in Makefile)
+      ├ BENCH_FORCE_MESH_FLOORS=1         # historical leaf-floor diagnostics only;
+      │   └ BENCH_FORCE_MESH_LEAF_RSP=1   # superseded by Option 3 full-scene Z renderer
       ├ BENCH_FORCE_MESH_CULL=1
       └ BENCH_FORCE_MESH_RSP   (auto = 1; set =0 to opt OUT for a CPU-mesh A/B)
 ```
