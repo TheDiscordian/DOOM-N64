@@ -4836,8 +4836,14 @@ static int dl_leaf_tris = 0;
 // conservative baked leaf geometry through the same Z-buffer as mesh walls and lets Z
 // decide visibility. First slice is CPU-emitted (rdpq_triangle) for correctness; RSP
 // no-readback emit can be reintroduced once the render model is proven.
-#define DL_WZ_NBANDS      6
-#define DL_WZ_BAND_RATIO  8.0f
+// Depth-band split bounds each triangle's W range (perspective S/T) AND samples the
+// per-vertex distance-light ramp. A wide ratio (8) minimises tris but undersamples the
+// STEEP near-floor light ramp (gouraud across a big near tri can't track it), leaving a
+// residual near-row dimming vs the per-row poly/software path. 3.0 keeps near bands fine
+// enough to follow the ramp while still collapsing far leaves to one band via the
+// per-leaf cd0/cd1 depth-range bound below.
+#define DL_WZ_NBANDS      8
+#define DL_WZ_BAND_RATIO  3.0f
 #define DL_WZ_FARZ        32767.0f
 #define DL_WZ_MAXV        DL_LEAF_MAXV
 
