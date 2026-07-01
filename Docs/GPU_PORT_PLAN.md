@@ -469,9 +469,26 @@ setup + command volume are real limits; measure every phase).
     to `20361/43232` (`dlbuild mean/p95 8526/24160`, still a clear loss).
     `BENCH_VOID_SCAN` reports only known startup frame 0 + death/respawn wipe frame 3213 — no
     3200/3712 black void. Phase table confirms the trade: `planes` CPU work collapses
-    `1744->59us`, but CPU `rdpq_triangle` world-Z emit moves cost into `dlbuild`. This is a
-    correctness stepping stone, not a perf win; next Phase-A work is coarse culling +
-    RSP/no-readback emit for the world-Z plane geometry.
+    `1744->59us`, but CPU `rdpq_triangle` world-Z emit moves cost into `dlbuild`.
+  - **Correctness verified + fixed (2026-06-30, commits `d7395ff`, `ecd5ba5`).** `BENCH_VOID_SCAN`
+    only proves "not >=40% black"; it CANNOT catch the underdraw/darkening that killed the old
+    mesh-plane attempt. A same-geometry region-luminance A/B (world-Z vs the shipping poly
+    baseline vs the frozen software ref, active-rect normalised to 320x240) exposed a real defect
+    the void-scan missed: at frame 3200 the near FLOOR was a flat ~46 luminance vs poly/software
+    ~52->98 — a broad `-30..-38` underdraw band. ROOT CAUSE: the first slice shaded each leaf
+    with ONE flat sector-light PRIM, while the poly path shades by PLANAR distance
+    (`planeheight*yslope[row] >> LIGHTZSHIFT -> planezlight`), gouraud-interpolated. FIX: compute
+    each world-Z vertex's colormap level from its own screen row via `yslope`+`zlight` (matching
+    `R_PlaneCornerColormap` / the wall RSP-emit distance path), feed as gouraud SHADE, emit
+    `TRIFMT_ZBUF_SHADE_TEX`; `fixedcolormap` forces the worn level flat as `R_MapPlane` does. Then
+    narrowed the near depth-band ratio 8->3 so gouraud samples the steep near ramp. Result: frame
+    3200 worst floor-band underdraw `-38 -> -4.2` vs poly; near rows now sit on software (y=160
+    63.7 vs sw 64.1); frame 3712 within `+-4.5`. Cost: `mesh-worldz` `20361 -> 21978` avg (more
+    near tris). Void-scan still clean.
+  - This is a CORRECT-first stepping stone, not a perf win (`+24% avg / +46% p95` vs shipping).
+    The band count is a tunable; the real perf lever is RSP/no-readback emit for the world-Z
+    plane geometry (the same keystone walls use), plus coarse PVS/frustum culling — NOT starving
+    bands (which trades correctness back). Do those before judging Phase A on perf.
 - **Phase B — GPU masked/transparent midtextures.** Move two-sided midtex quads
   (`R_RenderMaskedSegRange`) to RDP geometry with alpha-compare / keyed transparency, Z-tested
   against the opaque world, Z-write on opaque texels. Removes one of the two remaining
