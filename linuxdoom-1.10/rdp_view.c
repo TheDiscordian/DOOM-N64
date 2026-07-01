@@ -4969,6 +4969,15 @@ static void DL_DrawWorldZPlanes(void)
     int surf, ss, drew = 0;
     static int flats[256];
     static int vis[4096];
+    // Per-frame side-clip cache shared by floor+ceiling. Side planes are height-independent;
+    // computing them once per visible leaf avoids duplicating the clip for both surfaces and
+    // for every flat bucket. Depth range is cached with it so band bounds are cheap.
+    static float (*wz_spx)[DL_WZ_MAXV + 8] = NULL;
+    static float (*wz_spy)[DL_WZ_MAXV + 8] = NULL;
+    static int*   wz_ms  = NULL;
+    static float* wz_cd0 = NULL;
+    static float* wz_cd1 = NULL;
+    static int    wz_cap = 0;
 
     if (!n64_rdp_mesh_worldz || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
         return;
@@ -4981,6 +4990,45 @@ static void DL_DrawWorldZPlanes(void)
     vsinf = (float)vsin * (1.0f / 65536.0f);
     cxf = (float)centerx;
     viewzf = (float)viewz * (1.0f / 65536.0f);
+
+    if (numsubsectors > wz_cap)
+    {
+        if (wz_spx) Z_Free(wz_spx);
+        if (wz_spy) Z_Free(wz_spy);
+        if (wz_ms)  Z_Free(wz_ms);
+        if (wz_cd0) Z_Free(wz_cd0);
+        if (wz_cd1) Z_Free(wz_cd1);
+        wz_cap = numsubsectors;
+        wz_spx = (float (*)[DL_WZ_MAXV + 8])Z_Malloc(sizeof(float) * (DL_WZ_MAXV + 8) * wz_cap, PU_STATIC, NULL);
+        wz_spy = (float (*)[DL_WZ_MAXV + 8])Z_Malloc(sizeof(float) * (DL_WZ_MAXV + 8) * wz_cap, PU_STATIC, NULL);
+        wz_ms  = (int*)  Z_Malloc(sizeof(int)   * wz_cap, PU_STATIC, NULL);
+        wz_cd0 = (float*)Z_Malloc(sizeof(float) * wz_cap, PU_STATIC, NULL);
+        wz_cd1 = (float*)Z_Malloc(sizeof(float) * wz_cap, PU_STATIC, NULL);
+    }
+    if (!wz_spx || !wz_spy || !wz_ms || !wz_cd0 || !wz_cd1)
+        return;
+
+    // Height-independent side clip and depth range, computed ONCE per visible leaf.
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        bake_leaf_t* lf = &bake_leaves[ss];
+        int ms, k;
+        wz_ms[ss] = 0;
+        wz_cd0[ss] = 1.0e30f;
+        wz_cd1[ss] = -1.0e30f;
+        if (!bake_leafvis[ss]) continue;
+        if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
+        if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
+        ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf,
+                                wz_spx[ss], wz_spy[ss]);
+        if (ms < 3) continue;
+        wz_ms[ss] = ms;
+        for (k = 0; k < ms; k++) {
+            float dep = (wz_spx[ss][k] - vxf) * vcosf + (wz_spy[ss][k] - vyf) * vsinf;
+            if (dep < wz_cd0[ss]) wz_cd0[ss] = dep;
+            if (dep > wz_cd1[ss]) wz_cd1[ss] = dep;
+        }
+    }
 
     {
         rdpq_tileparms_t tp;
@@ -5004,7 +5052,7 @@ static void DL_DrawWorldZPlanes(void)
             fixed_t height;
             int pic, fl, j, seen;
             if (!bake_leafvis[ss]) continue;       // Phase-A cull seed; later replaced by PVS/frustum cull.
-            if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
+            if (wz_ms[ss] < 3) continue;
             pic = surf ? lf->ceilingpic : lf->floorpic;
             if (pic == skyflatnum) continue;
             height = surf ? sectors[lf->sector].ceilingheight : sectors[lf->sector].floorheight;
@@ -5033,7 +5081,6 @@ static void DL_DrawWorldZPlanes(void)
                 bake_leaf_t* lf = &bake_leaves[vis[vi]];
                 sector_t* sec = &sectors[lf->sector];
                 fixed_t height;
-                float spx[DL_WZ_MAXV + 8], spy[DL_WZ_MAXV + 8];
                 fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
                 float hf, nearz_eff, zlo, EDGEB, EDGET, cd0, cd1;
                 float planeheight;
@@ -5044,21 +5091,9 @@ static void DL_DrawWorldZPlanes(void)
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;
                 // planeheight = |sector height - viewz| (fixed_t), the R_MapPlane distance base.
                 planeheight = (hf < 0.0f) ? -hf : hf;
-                ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf, spx, spy);
-                if (ms < 3) continue;
-                // Bound depth-band tessellation to THIS leaf's side-clipped depth range.
-                // Without this, far leaves run all NBANDS clip passes even though only one
-                // band intersects them; pure CPU waste inside dlbuild.
-                {
-                    int k;
-                    cd0 = 1.0e30f;
-                    cd1 = -1.0e30f;
-                    for (k = 0; k < ms; k++) {
-                        float dep = (spx[k] - vxf) * vcosf + (spy[k] - vyf) * vsinf;
-                        if (dep < cd0) cd0 = dep;
-                        if (dep > cd1) cd1 = dep;
-                    }
-                }
+                ms = wz_ms[vis[vi]];
+                cd0 = wz_cd0[vis[vi]];
+                cd1 = wz_cd1[vis[vi]];
 
                 // DISTANCE LIGHTING (per-vertex GOURAUD). The poly-plane path shades floors
                 // by PLANAR distance (planeheight*yslope[row] >> LIGHTZSHIFT -> planezlight),
@@ -5083,7 +5118,7 @@ static void DL_DrawWorldZPlanes(void)
                     float umin = 1.0e30f, vmin = 1.0e30f;
                     // TRIFMT_ZBUF_SHADE_TEX vertex: {X,Y,Z, R,G,B,A, S,T, INV_W} (10 floats).
                     float vx[DL_WZ_MAXV][10];
-                    n = DL_WZClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
+                    n = DL_WZClipBandToFixed(wz_spx[vis[vi]], wz_spy[vis[vi]], ms, vxf, vyf, vcosf, vsinf,
                                              zlo, zhi, clx, cly, DL_WZ_MAXV);
                     if (n >= 3)
                     {
