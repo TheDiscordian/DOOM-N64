@@ -481,10 +481,11 @@ setup + command volume are real limits; measure every phase).
     each world-Z vertex's colormap level from its own screen row via `yslope`+`zlight` (matching
     `R_PlaneCornerColormap` / the wall RSP-emit distance path), feed as gouraud SHADE, emit
     `TRIFMT_ZBUF_SHADE_TEX`; `fixedcolormap` forces the worn level flat as `R_MapPlane` does. Then
-    narrowed the near depth-band ratio 8->3 so gouraud samples the steep near ramp. Result: frame
-    3200 worst floor-band underdraw `-38 -> -4.2` vs poly; near rows now sit on software (y=160
-    63.7 vs sw 64.1); frame 3712 within `+-4.5`. Cost: `mesh-worldz` `20361 -> 21978` avg (more
-    near tris). Void-scan still clean.
+    narrowed the near depth-band ratio 8->4 so gouraud samples the steep near ramp without the
+    extra ratio-3 cost. Result: frame 3200 worst floor-band underdraw `-38 -> -4.1` vs poly; near
+    rows now sit on software (y=160 63.9 vs sw 64.1); frame 3712 within `+-3`. Cost:
+    `mesh-worldz` `20361 -> 21540` avg (`p95 46304`); void-scan build `21137/44768`. Void-scan
+    still clean.
   - This is a CORRECT-first stepping stone, not a perf win (`+24% avg / +46% p95` vs shipping).
     The band count is a tunable; the real perf lever is RSP/no-readback emit for the world-Z
     plane geometry (the same keystone walls use), plus coarse PVS/frustum culling — NOT starving

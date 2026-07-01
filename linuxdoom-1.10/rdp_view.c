@@ -4843,7 +4843,7 @@ static int dl_leaf_tris = 0;
 // enough to follow the ramp while still collapsing far leaves to one band via the
 // per-leaf cd0/cd1 depth-range bound below.
 #define DL_WZ_NBANDS      8
-#define DL_WZ_BAND_RATIO  3.0f
+#define DL_WZ_BAND_RATIO  4.0f
 #define DL_WZ_FARZ        32767.0f
 #define DL_WZ_MAXV        DL_LEAF_MAXV
 
