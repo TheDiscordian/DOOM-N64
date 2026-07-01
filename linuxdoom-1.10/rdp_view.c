@@ -4837,7 +4837,7 @@ static int dl_leaf_tris = 0;
 // decide visibility. First slice is CPU-emitted (rdpq_triangle) for correctness; RSP
 // no-readback emit can be reintroduced once the render model is proven.
 #define DL_WZ_NBANDS      6
-#define DL_WZ_BAND_RATIO  4.0f
+#define DL_WZ_BAND_RATIO  8.0f
 #define DL_WZ_FARZ        32767.0f
 #define DL_WZ_MAXV        DL_LEAF_MAXV
 

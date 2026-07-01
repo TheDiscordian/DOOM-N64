@@ -465,7 +465,8 @@ setup + command volume are real limits; measure every phase).
     baked leaf planes draw as opaque Z-tested world geometry and suppress non-sky poly planes.
     Full E1M1 bench completes: shipping `mesh` = `17667/32416`; first `mesh-worldz` =
     `21222/46112` (`+20.1% avg / +42.3% p95`). A cheap per-leaf depth-range bound on band
-    clipping improved it to `20784/44128` (`dlbuild mean/p95 9169/25120`, still a clear loss).
+    clipping improved it to `20784/44128`; raising the world-Z band ratio to 8 improved again
+    to `20361/43232` (`dlbuild mean/p95 8526/24160`, still a clear loss).
     `BENCH_VOID_SCAN` reports only known startup frame 0 + death/respawn wipe frame 3213 — no
     3200/3712 black void. Phase table confirms the trade: `planes` CPU work collapses
     `1744->59us`, but CPU `rdpq_triangle` world-Z emit moves cost into `dlbuild`. This is a
