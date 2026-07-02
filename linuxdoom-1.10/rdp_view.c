@@ -4858,7 +4858,7 @@ static int dl_leaf_tris = 0;
 #define DL_WZ_FARZ        32767.0f
 #define DL_WZ_MAXV        DL_LEAF_MAXV
 
-static int DL_WZClipLeafSides(int firstvert, int n,
+static int DL_WZClipLeafSides(fixed_t (*pool)[2], int firstvert, int n,
                               float vxf, float vyf, float vcosf, float vsinf, float cxf,
                               float* px, float* py)
 {
@@ -4869,8 +4869,8 @@ static int DL_WZClipLeafSides(int firstvert, int n,
     int m = n, i, plane;
     if (n < 3 || n > DL_WZ_MAXV) return 0;
     for (i = 0; i < n; i++) {
-        px[i] = (float)bake_leaf_verts[firstvert + i][0] * (1.0f / 65536.0f);
-        py[i] = (float)bake_leaf_verts[firstvert + i][1] * (1.0f / 65536.0f);
+        px[i] = (float)pool[firstvert + i][0] * (1.0f / 65536.0f);
+        py[i] = (float)pool[firstvert + i][1] * (1.0f / 65536.0f);
     }
     for (plane = 0; plane < 2 && m >= 3; plane++) {
         float f[DL_WZ_MAXV + 8];
@@ -5037,8 +5037,8 @@ static void DL_DrawWorldZPlanes(void)
         if (!bake_leafvis[ss]) continue;
         if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
         if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
-        ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf,
-                                wz_spx[ss], wz_spy[ss]);
+        ms = DL_WZClipLeafSides(bake_leaf_verts, lf->firstvert, lf->numverts,
+                                vxf, vyf, vcosf, vsinf, cxf, wz_spx[ss], wz_spy[ss]);
         if (ms < 3) continue;
         wz_ms[ss] = ms;
         for (k = 0; k < ms; k++) {
@@ -5698,16 +5698,15 @@ static int DL_WZLightLevelDist(int lightlevel, fixed_t dist, fixed_t distclamp)
 // depth bands bounded by the leaf depth range -- but stages records instead of emitting.
 static void DL_WZRSPDispatch(void)
 {
-    extern int bake_numleafverts;
     extern fixed_t yslope[SCREENHEIGHT];
     static rsp_view_blk_t* vb = NULL;
     fixed_t vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
     fixed_t vsin = finesine[viewangle >> ANGLETOFINESHIFT];
-    int ss, nv = 0;
+    int ci, nv = 0;
 
     wz_nunits = 0;
     leaf_rsp_nv = 0;
-    if (!n64_rdp_mesh_worldz || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+    if (!n64_rdp_mesh_worldz || !DL_MeshRouteOn() || !bake_cells || !bake_leafvis || !dl_wall_z)
         return;
     if (rsp_dlwall_ovl_id == 0)
         rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
@@ -5716,11 +5715,12 @@ static void DL_WZRSPDispatch(void)
         wz_units = (wz_rsp_unit_t*)Z_Malloc(sizeof(wz_rsp_unit_t) * DL_WZ_UNITS_MAX, PU_STATIC, NULL);
     if (!wz_units) return;
     // Zone-resident DMA staging, same sizing discipline as the leaf path (see
-    // leaf_in_raw's declaration comment for why the zone and why +15 & 16-align).
-    if (2 * bake_numleafverts + DL_LEAF_CLIP_PAD > leaf_buf_cap) {
+    // leaf_in_raw's declaration comment for why the zone and why +15 & 16-align) --
+    // but sized to the CELL vertex pool: the grid cut multiplies the vert count.
+    if (2 * bake_numcellverts + DL_LEAF_CLIP_PAD > leaf_buf_cap) {
         if (leaf_in_raw)  Z_Free(leaf_in_raw);
         if (leaf_out_raw) Z_Free(leaf_out_raw);
-        leaf_buf_cap = 2 * bake_numleafverts + DL_LEAF_CLIP_PAD;
+        leaf_buf_cap = 2 * bake_numcellverts + DL_LEAF_CLIP_PAD;
         leaf_in_raw  = Z_Malloc(sizeof(rsp_bleaf_in_t)  * leaf_buf_cap + 15, PU_STATIC, &leaf_in_raw);
         leaf_out_raw = Z_Malloc(sizeof(rsp_bleaf_out_t) * leaf_buf_cap + 15, PU_STATIC, &leaf_out_raw);
         leaf_in_buf  = leaf_in_raw  ? (rsp_bleaf_in_t*) (((uintptr_t)leaf_in_raw  + 15) & ~(uintptr_t)15) : NULL;
@@ -5743,16 +5743,21 @@ static void DL_WZRSPDispatch(void)
         fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
         int cap = leaf_buf_cap - (DL_WZ_MAXV + 8);
 
-        for (ss = 0; ss < numsubsectors && nv < cap; ss++)
+        // CELL-major, not leaf-major: cells are the bake's static 512-unit grid cut of
+        // each leaf (P_BakeLeafCells). Every cell spans <= BAKE_CELL_SIZE texels from
+        // its own baked S/T bias, so no emitted triangle can reach the rsp_rdpq_tri
+        // s10.5 edge-derivative limit -- the per-frame whole-leaf cut flickered exactly
+        // because its spans crossed that limit with camera motion.
+        for (ci = 0; ci < bake_numcells && nv < cap; ci++)
         {
-            bake_leaf_t* lf = &bake_leaves[ss];
+            bake_cell_t* c = &bake_cells[ci];
             float cd0, cd1;
             int ms, k, surf;
-            if (!bake_leafvis[ss]) continue;   // Phase-A cull seed; later a PVS/frustum cull
-            if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
-            if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
-            ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf,
-                                    spx, spy);
+            if (!bake_leafvis[c->subsector]) continue;   // Phase-A cull seed (BSP walk marks)
+            if (c->numverts < 3 || c->numverts > DL_WZ_MAXV) continue;
+            if (c->floorpic == skyflatnum && c->ceilingpic == skyflatnum) continue;
+            ms = DL_WZClipLeafSides(bake_cell_verts, c->firstvert, c->numverts,
+                                    vxf, vyf, vcosf, vsinf, cxf, spx, spy);
             if (ms < 3) continue;
             cd0 = 1.0e30f; cd1 = -1.0e30f;
             for (k = 0; k < ms; k++) {
@@ -5765,17 +5770,17 @@ static void DL_WZRSPDispatch(void)
             {
                 fixed_t height, phfix, distclamp;
                 float hf, nearz_eff, zlo;
-                int pic = surf ? lf->ceilingpic : lf->floorpic;
+                int pic = surf ? c->ceilingpic : c->floorpic;
                 int band, lightlevel, flatidx;
                 if (pic == skyflatnum) continue;                       // sky stays CPU
-                height = surf ? sectors[lf->sector].ceilingheight
-                              : sectors[lf->sector].floorheight;
+                height = surf ? sectors[c->sector].ceilingheight
+                              : sectors[c->sector].floorheight;
                 if (surf ? (height <= viewz) : (height >= viewz)) continue;  // height backface
                 hf = (float)height * (1.0f / 65536.0f) - viewzf;
                 phfix = height - viewz;
                 if (phfix < 0) phfix = -phfix;                         // planeheight (fixed)
                 distclamp = FixedMul(phfix, yslope[surf ? 0 : viewheight - 1]);
-                lightlevel = sectors[lf->sector].lightlevel;
+                lightlevel = sectors[c->sector].lightlevel;
                 flatidx = flattranslation[pic];
 
                 nearz_eff = 6.0f;
@@ -5793,16 +5798,12 @@ static void DL_WZRSPDispatch(void)
                                              zlo, zhi, clx, cly, DL_WZ_MAXV);
                     if (m >= 3)
                     {
-                        // band-local 64-texel S/T bias: bounds every chunk's s10.5 span
-                        // (the CPU slice rebiased per band poly the same way).
-                        int umin = 0x7FFFFFFF, vmin = 0x7FFFFFFF, ubias, vbias, base;
-                        for (i = 0; i < m; i++) {
-                            int u = clx[i] >> FRACBITS, v = cly[i] >> FRACBITS;
-                            if (u < umin) umin = u;
-                            if (v < vmin) vmin = v;
-                        }
-                        ubias = umin & ~63;
-                        vbias = vmin & ~63;
+                        // STATIC per-cell S/T bias from the bake: a cell spans at most
+                        // BAKE_CELL_SIZE + 63 texels from its own baked bias, provably
+                        // under the engine's s10.5 limit, and view-INDEPENDENT -- the
+                        // per-frame dynamic bias was the flicker (spans crossed the
+                        // limit with camera motion and triangles silently dropped).
+                        int ubias = c->ubias, vbias = c->vbias, base;
 
                         // Stage as 1+ sub-fans of <= DL_LEAF_EMIT_MAXV verts sharing v0
                         // (a convex fan splits into convex sub-fans on the apex).
@@ -5830,7 +5831,7 @@ static void DL_WZRSPDispatch(void)
                                 nv++;
                             }
                             u = &wz_units[wz_nunits++];
-                            u->ss    = (uint16_t)ss;
+                            u->ss    = (uint16_t)c->subsector;
                             u->surf  = (uint8_t)surf;
                             u->n     = (uint8_t)take;
                             u->start = ustart;
