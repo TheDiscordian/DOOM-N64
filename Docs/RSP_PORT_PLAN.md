@@ -137,8 +137,13 @@ compaction to the floor-leaf transform (Phase 4), then evaluate default-on.
 > `Docs/CEILING_VOID_INVESTIGATION.md`). The project pivoted to **Option 3: a full-scene
 > Z-buffered renderer** where planes are opaque Z geometry, not visplane-masked. Read
 > `Docs/GPU_PORT_PLAN.md` §DIRECTION CHANGE (2026-06-30): Option 3. §8 below is kept as
-> reference for the RSP leaf transform mechanics (still reusable in Option 3 Phase A), but
-> its "make floors-on a win vs poly planes" goal is no longer the plan.
+> historical reference ONLY. **Corrected 2026-07-02: it WAS reused in Option 3 Phase A —
+> the world-Z RSP plane-emit attempts (whole-leaf bands, then the retry cells) — and
+> produced planes that flicker in/out; both attempts REVERTED (`031ad31`). This machinery
+> is condemned for planes: it has never produced a user-accepted plane image on any
+> branch. Do not point it at planes again without a differential root-cause (same
+> staging, CPU vs RSP final emit), and not before the welded bake exists
+> (`GPU_PORT_PLAN.md` §THE GOAL).**
 
 Goal: move the floor/ceiling leaf-vertex projection off the CPU (it's what makes floors-on a
 p95 loss). The leaf transform is the SAME per-vertex projection as a wall corner — project

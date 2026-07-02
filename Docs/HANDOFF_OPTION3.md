@@ -1,12 +1,11 @@
 # HANDOFF — Option 3 full-scene Z renderer (reconstructed 2026-07-02)
 
-> **CORRECTED SAME DAY — read `GPU_PORT_PLAN.md` § "THE GOAL, STATED BY THE USER
-> (2026-07-02)" before acting on anything below.** The "correctness verified" world-Z
-> claims repeated in this file failed user visual review (jagged edges); the "RSP
-> no-readback emit" next-step this file recommends was attempted twice and reverted
-> (`031ad31` — planes flickered). The corrected goal: geometry finished at level load,
-> welded shared vertices, runtime = cull + transform + draw only, acceptance = the
-> user's eye at the edges. This file remains as reconstruction context only.
+> **CORRECTED SAME DAY, claims fixed in place — read `GPU_PORT_PLAN.md` § "THE GOAL,
+> STATED BY THE USER (2026-07-02)" first.** The world-Z slice failed user visual
+> review (jagged edges); the RSP plane-emit recipe this file originally recommended
+> was implemented, flickered, and is reverted (`031ad31`) — the recipe is deleted
+> below. The goal: geometry finished at level load, welded shared vertices, runtime =
+> cull + transform + draw only, acceptance = the user's eye at the edges.
 
 The original handoff document was lost in a laptop crash on 2026-07-01. This is its
 reconstruction from the repo itself (git history, `GPU_PORT_PLAN.md`, `RSP_PORT_PLAN.md`,
@@ -22,11 +21,12 @@ visibility authority for the opaque world and, phase by phase, delete DOOM's CPU
 visibility machinery (`R_AddLine` occlusion, `R_StoreWallRange`, `R_RenderSegLoop`
 column fill, visplane `top[]/bottom[]` masks, drawseg sprite-clip arrays). Full plan:
 `GPU_PORT_PLAN.md` §"DIRECTION CHANGE (2026-06-30)". Phase A (opaque world Z:
-walls + floors + ceilings) has a first slice landed, correctness-verified, and
-CPU-optimised — but it is still a perf loss vs shipping, exactly as the plan predicted
-for a CPU-emit stepping stone. The named next levers are (1) RSP/no-readback emit for
-the world-Z plane geometry (the same keystone the walls use) and (2) coarse
-PVS/frustum culling. "Do those before judging Phase A on perf."
+walls + floors + ceilings) has a first slice landed and CPU-optimised — but it is a
+perf loss vs shipping AND it failed the user's visual review on 2026-07-02 (jagged
+edges: T-junction cracks from the unwelded bake + per-frame band-cut seams). The
+"RSP/no-readback emit" lever this file originally recommended was attempted twice the
+same day and reverted (`031ad31` — planes flickered in/out). The actual next work is
+the welded static bake (`GPU_PORT_PLAN.md` §THE GOAL).
 
 ## Branch map
 
@@ -42,14 +42,15 @@ PVS/frustum culling. "Do those before judging Phase A on perf."
 |---|---|---|
 | `1e8b9cc` | First slice: `BENCH_FORCE_MESH_WORLDZ` — CPU-emitted baked leaf planes as opaque Z-tested geometry, non-sky poly planes suppressed (`r_plane.c:1611`) | 21222/46112 |
 | `f6679d4` + `92f470e` | Per-leaf depth-range bound on band clipping; band ratio tuning | 20361/43232 |
-| `d7395ff` + `ecd5ba5` | **Correctness fix**: per-vertex distance lighting (`yslope`+`zlight` per vertex's own screen row, gouraud SHADE, `TRIFMT_ZBUF_SHADE_TEX`); near band ratio 8→4. Frame-3200 floor underdraw −38 → −4.1 vs poly; frame 3712 within ±3 | 21540/46304 |
+| `d7395ff` + `ecd5ba5` | **Distance-lighting fix (luminance means only — NOT correctness; the slice later failed the user's eye)**: per-vertex distance lighting (`yslope`+`zlight` per vertex's own screen row, gouraud SHADE, `TRIFMT_ZBUF_SHADE_TEX`); near band ratio 8→4. Frame-3200 floor underdraw −38 → −4.1 vs poly; frame 3712 within ±3 | 21540/46304 |
 | `5bcd625` | Per-leaf side-clip + depth-range cache (side clip is height-independent — computed once, shared by floor/ceiling and every flat bucket) | **19141/38368** |
 
 Shipping `mesh` reference: **17667/32416**. So Phase A currently costs ~+8% avg / +18% p95.
-Correctness state: `BENCH_VOID_SCAN` clean demo-wide (only known-benign frames 0 and
-3213 = melt wipe); region-luminance A/B vs poly + frozen software ref passes (see
-Verification below). Phase A acceptance gate (`GPU_PORT_PLAN.md`): hole-free AND
-avg/p95 ≤ shipping — the perf half is NOT met yet, by design.
+Correctness state (corrected 2026-07-02): `BENCH_VOID_SCAN` clean and luminance means
+within a few counts — but the slice **FAILED the user's visual review** (jagged edges:
+T-junction cracks from the unwelded bake + per-frame band-cut seams). Phase A
+acceptance gate: the user's eye at the edges AND avg/p95 ≤ shipping — NEITHER half is
+met.
 
 The implementation lives in `rdp_view.c` (world-Z block ~4831–5176; dispatch from
 `DL_DrawMeshLeaves` at ~5624, which routes `n64_rdp_mesh_worldz` away from the old
@@ -59,44 +60,21 @@ seed; later replaced by PVS/frustum cull").
 
 ## Next work, in order
 
-### 1. RSP no-readback emit for world-Z planes (the big one — start here)
+### 1. The welded static bake (the real work — `GPU_PORT_PLAN.md` §THE GOAL)
 
-Today the whole world-Z path is CPU work inside `dlbuild`: band clip + transform +
-lighting + libdragon `rdpq_triangle()` setup per tri. The keystone that fixed the same
-problem for walls (overlay B, `rsp/rsp_dlemit.S`) already exists and is
-visually verified; the §8.5 LeafFan emit (`DLEmitCmd_LeafBatch`) already emits
-shaded/textured/Z leaf fans with no CPU readback. Concrete gap list (verified against
-the code 2026-07-02):
+Geometry finished at level load: floor/ceiling meshes with shared, welded vertices
+(zero T-junctions), cut once on a fixed world grid, static per-piece texture biases.
+Runtime = cull + transform + per-vertex distance light + draw; no per-frame side
+clipping, near folding, band cutting, or texture rebiasing. CPU triangle emit until
+the user's eye passes the image; RSP comes later, if ever, with a differential
+root-cause first.
 
-- **Per-vertex gouraud shade plumbing — the only real ucode gap.** LeafFan shade is
-  one flat colour per fan (`rsp_leaf_desc_t.prim`); world-Z needs per-vertex distance
-  light. The CPU already knows each vertex's view depth during band clipping
-  (`DL_WZClipBandToFixed`), and `R_MapPlane`'s `planeheight·yslope[row]` identity IS
-  that view depth — so the CPU can compute the colormap level per vertex without a
-  transform round-trip, pack RGBA from `dl_prim_lut`, and carry it in the free pad
-  words of `rsp_bleaf_in_t`/`rsp_bleaf_out_t` (0x0C / 0x1C). `StageLeafVtx` then loads
-  per-vertex RGBA instead of `LF_light` (~10 instructions). zlight lookups stay
-  CPU-side (RSP table lookups are hostile; walls already do this split).
-- **Z-convention unification — mandatory, not optional.** CPU paths use
-  `DL_WallZ` = depth/32768; overlay B uses screen-affine `0x7FFF − 2·invw`. Different
-  monotone curves — mixing them in one Z-image breaks depth compares. RSP-emitting the
-  planes therefore requires the walls on `BENCH_FORCE_MESH_RSP_EMIT` in the same build.
-- **Port `EMIT_ZBIAS` from the retry branch** (13-line diff in `rsp_dlemit.S`,
-  commit `fa3cd11`/`7251426`): per-path screen-Z bias (0 for walls, 32-toward-camera
-  for leaves) so tilted planes' far edges win the 1/depth-precision z-fight. Bias Z
-  only, never invw (W·INVW=1 must hold or textures warp — PAST_BUGS).
-- **Per-descriptor S/T bias.** The descriptor already packs `ubias/vbias` per
-  (leaf, band) — compute band-local 64-aligned biases CPU-side during the clip so no
-  triangle's S/T span approaches the s10.5 ~1024-texel limit. The retry branch's cell
-  bake (`BAKE_CELL_SIZE 512` static grid, in `7251426`) is the proven stronger answer
-  if runtime bands prove too coarse or too costly — port it rather than re-derive it.
-- **Dispatch skeleton exists.** `DL_RSPLeafDispatch` (staging + LeafBatch transform)
-  and `DL_LeafRSPEmitFlush` (per-flat TMEM bind + descriptor batching + the
-  never-rewind cursor + one `Send_End` drain per batch) are debugged on THIS branch.
-  The work is routing `DL_DrawWorldZPlanes`'s gather (vis filter, live heights,
-  per-surface sky skip, banding, per-vertex light) onto that machinery behind a new
-  flag (suggest `BENCH_FORCE_MESH_WORLDZ_RSP_EMIT`, nested under WORLDZ, pulling in
-  RSP_EMIT + LEAF_RSP + LEAF_EMIT; remember RSPASFLAGS as well as CFLAGS).
+> This section originally recommended "RSP no-readback emit for world-Z planes —
+> start here", with a full implementation recipe. That recipe was implemented on
+> 2026-07-02 (per-vertex shade plumbing, Z unification, `EMIT_ZBIAS` port, then the
+> retry cell bake) and produced planes that flicker in/out of existence. Both
+> attempts are REVERTED (`031ad31`). The recipe is deleted from this file so it
+> cannot be followed again; the emit machinery it targeted is condemned for planes.
 
 ### 2. Coarse cull (Phase D foundation)
 
@@ -115,12 +93,15 @@ CI4 damage-flash / fixedcolormap per surface, back-to-front sort where blending 
 
 ## Verification requirements (Phase A acceptance)
 
-- `BENCH_VOID_SCAN` is a WEAK oracle — only catches ≥40% black. It CANNOT see the
-  underdraw/darkening class that killed the mesh-plane retry. Every acceptance check
-  pairs it with the **region-luminance A/B**: same-geometry `BENCH_MARKS` captures of
-  candidate + poly baseline + frozen software ref
-  (`~/.local/share/doom-n64-bench/ref-sw-frozen/` — never re-capture), active game
-  rect normalised to 320×240, per-region mean luminance deltas. Key frames: 3200, 3712.
+- **The gate is the user's eye at the edges** (seams inside floors, band lines,
+  wall junctions, stability in motion). No metric passes a build — the world-Z slice
+  passed every metric below and still failed review (jagged edges, 2026-07-02).
+- `BENCH_VOID_SCAN` is a WEAK oracle — only catches ≥40% black. The
+  **region-luminance A/B** (same-geometry `BENCH_MARKS` captures of candidate + poly
+  baseline + frozen software ref at `~/.local/share/doom-n64-bench/ref-sw-frozen/`
+  — never re-capture — active game rect normalised to 320×240, per-region mean
+  deltas; key frames 3200, 3712) catches area-brightness defects only. Both are
+  SUPPORTING evidence for the eye, blind to edge defects, never sufficient alone.
 - Timing: `bench/bench.sh mesh mesh-worldz …` (deterministic — measure each config
   once; A/B within one ares session only). Never time a MARKS/VOID_SCAN build.
 - Motion bugs (staleness/ghosting) are invisible in frozen captures — live grab needed.

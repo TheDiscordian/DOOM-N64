@@ -453,14 +453,17 @@ setup + command volume are real limits; measure every phase).
 ### Phased roadmap (each phase behind a flag, A/B vs the shipping mesh-walls+poly-planes build)
 - **Phase A — Opaque world Z renderer (walls + floors + ceilings).** Draw baked floor/ceiling
   geometry into the SAME Z-image as the mesh walls, with Z as the only occlusion authority — NO
-  dependence on `visplane->top[]/bottom[]`. This is the real replacement for poly planes. Reuses
-  the Phase-3 convex-leaf bake (`P_BakeLeafFans`) as opaque geometry, but the acceptance test is
-  now "no holes / correct occlusion vs walls by Z", not "matches the visplane mask". Needs a
+  dependence on `visplane->top[]/bottom[]`. This is the real replacement for poly planes.
+  The geometry source MUST be the WELDED bake (shared vertices, zero T-junctions, fixed-grid
+  cut at level load — see THE GOAL at the end of this file). The 2026-06-30 slice below used
+  the unwelded Phase-3 `P_BakeLeafFans` polygons plus per-frame band cutting instead, and the
+  user's visual review failed it for exactly that (jagged edges, 2026-07-02). Needs a
   conservative floor/ceiling cull (frustum + which sectors are potentially visible) so we are not
   drawing the whole map. GATE: new build flag; keep poly planes as the shipping default until A
-  is hole-free AND not a perf loss.
-  - Acceptance: frames 3200/3712 (and the demo-wide `BENCH_VOID_SCAN`) show correct floors/
-    ceilings with poly planes SUPPRESSED and Z the sole authority; avg/p95 ≤ shipping build.
+  passes the user's eye AND is not a perf loss.
+  - Acceptance: the USER'S EYE at the edges (seams, junctions, stability in motion) vs the
+    software/poly image — averaged metrics and `BENCH_VOID_SCAN` are supporting evidence only,
+    never sufficient; plus avg/p95 ≤ shipping build.
   - **First slice landed (`BENCH_FORCE_MESH_WORLDZ`, 2026-06-30, commit `1e8b9cc`):** CPU-emitted
     baked leaf planes draw as opaque Z-tested world geometry and suppress non-sky poly planes.
     Full E1M1 bench completes: shipping `mesh` = `17667/32416`; first `mesh-worldz` =
@@ -470,29 +473,31 @@ setup + command volume are real limits; measure every phase).
     `BENCH_VOID_SCAN` reports only known startup frame 0 + death/respawn wipe frame 3213 — no
     3200/3712 black void. Phase table confirms the trade: `planes` CPU work collapses
     `1744->59us`, but CPU `rdpq_triangle` world-Z emit moves cost into `dlbuild`.
-  - **Correctness verified + fixed (2026-06-30, commits `d7395ff`, `ecd5ba5`).** `BENCH_VOID_SCAN`
-    only proves "not >=40% black"; it CANNOT catch the underdraw/darkening that killed the old
-    mesh-plane attempt. A same-geometry region-luminance A/B (world-Z vs the shipping poly
-    baseline vs the frozen software ref, active-rect normalised to 320x240) exposed a real defect
-    the void-scan missed: at frame 3200 the near FLOOR was a flat ~46 luminance vs poly/software
-    ~52->98 — a broad `-30..-38` underdraw band. ROOT CAUSE: the first slice shaded each leaf
-    with ONE flat sector-light PRIM, while the poly path shades by PLANAR distance
-    (`planeheight*yslope[row] >> LIGHTZSHIFT -> planezlight`), gouraud-interpolated. FIX: compute
-    each world-Z vertex's colormap level from its own screen row via `yslope`+`zlight` (matching
-    `R_PlaneCornerColormap` / the wall RSP-emit distance path), feed as gouraud SHADE, emit
-    `TRIFMT_ZBUF_SHADE_TEX`; `fixedcolormap` forces the worn level flat as `R_MapPlane` does. Then
-    narrowed the near depth-band ratio 8->4 so gouraud samples the steep near ramp without the
-    extra ratio-3 cost. Result: frame 3200 worst floor-band underdraw `-38 -> -4.1` vs poly; near
-    rows now sit on software (y=160 63.9 vs sw 64.1); frame 3712 within `+-3`. Cost after lighting:
-    `mesh-worldz` `21540/46304`.
+  - **Distance lighting fixed; luminance means matched — NOT correctness (2026-06-30, commits
+    `d7395ff`, `ecd5ba5`; verdict corrected 2026-07-02).** What was actually established:
+    `BENCH_VOID_SCAN` clean, and a same-geometry region-luminance A/B (world-Z vs the shipping
+    poly baseline vs the frozen software ref, active-rect normalised to 320x240) within a few
+    counts. The lighting work was real: the first slice shaded each leaf with ONE flat
+    sector-light PRIM while the poly path shades by planar distance
+    (`planeheight*yslope[row] >> LIGHTZSHIFT -> planezlight`), reading as a broad `-30..-38`
+    underdraw band at frame 3200; per-vertex colormap levels via `yslope`+`zlight` as gouraud
+    SHADE (`TRIFMT_ZBUF_SHADE_TEX`, `fixedcolormap` forcing the worn level flat) brought that to
+    `-4.1` and frame 3712 within `+-3`. Cost after lighting: `mesh-worldz` `21540/46304`.
+    **But luminance means measure area brightness, not edges — the slice FAILED the user's
+    visual review (2026-07-02): jagged edges from the unwelded bake's T-junctions and the
+    per-frame band cutting. Region-average metrics must never again be reported as
+    "correctness verified".**
   - **CPU waste cut (`5bcd625`).** Side-plane clipping is height-independent but the first slice
     recomputed it for floor and ceiling / every flat bucket. Caching each visible leaf's side-
     clipped polygon + depth range once per frame drops `mesh-worldz` to `19141/38368`; void-scan
     build `19477/39008`. Void-scan remains clean (only known frame 0 + wipe 3213).
-  - This is a CORRECT-first stepping stone, not a perf win (`+24% avg / +46% p95` vs shipping).
-    The band count is a tunable; the real perf lever is RSP/no-readback emit for the world-Z
-    plane geometry (the same keystone walls use), plus coarse PVS/frustum culling — NOT starving
-    bands (which trades correctness back). Do those before judging Phase A on perf.
+  - **Slice verdict (2026-07-02): neither correct nor fast — do not iterate on it.** It failed
+    the user's eye (jagged edges) and costs `+8% avg / +18% p95` vs shipping. The "real perf
+    lever is RSP/no-readback emit" claim that used to close this section was tried the same
+    day — whole-leaf bands, then the retry cells — and produced planes that flicker in/out;
+    both attempts REVERTED (`031ad31`). The path forward is the welded static bake (THE GOAL,
+    end of this file); this slice's per-frame clipping/banding machinery is superseded, not
+    tunable.
 - **Phase B — GPU masked/transparent midtextures.** Move two-sided midtex quads
   (`R_RenderMaskedSegRange`) to RDP geometry with alpha-compare / keyed transparency, Z-tested
   against the opaque world, Z-write on opaque texels. Removes one of the two remaining
@@ -528,7 +533,11 @@ setup + command volume are real limits; measure every phase).
   just frozen marks.
 - **Command/triangle-setup volume.** More geometry = more `rspq` commands + RSP triangle setup
   (~150–173 cyc/tri floor, shared ucode). The RSP-emits-triangles keystone (RSP_PORT_PLAN §9) is
-  the same lever that keeps this affordable; Phase A/B/C should ride it, not CPU emit.
+  the lever that keeps WALL volume affordable. PLANES must NOT ride it (corrected
+  2026-07-02): both plane-emit attempts flickered and were reverted (`031ad31`); the
+  overlay-B emitter has never produced a user-accepted plane image. Planes are CPU-emitted
+  from the welded bake until the user's eye passes, and any future RSP plane emit needs a
+  differential root-cause (same staging, CPU vs RSP final emit) first.
 - **2D overlay stays software for now.** The CI8 HUD/status/wipe blit (`present`) is explicitly
   out of Option 3's opaque-world scope (delicate ghost/TLUT/keyed-box history); a later, separate
   effort.
@@ -553,15 +562,17 @@ rebiasing. Per-frame geometry cutting IS the defect: it produces edges that diff
 between neighbours and between frames, which the user sees as jagged seams and
 flicker. If a design requires cutting polygons at render time, it is the wrong design.
 
-### Corrections to the record (2026-07-02) — claims above this line to re-read
+### Corrections applied to this file (2026-07-02)
+The claims in the body above have been edited in place to match these findings; this
+section records what changed and why, so the history is auditable:
 - **The Phase A world-Z CPU slice FAILED user visual review**: jagged edges across
   planes (T-junction cracks from the unwelded `P_BakeLeafFans` polygons + seams from
-  the runtime depth-band cutting). The "correctness verified" entries dated 2026-06-30
-  above mean ONLY "region-average luminance within a few counts + no >=40%-black
-  frames". Region averages are structurally blind to edge defects — this file's own
-  debugging guidance (CLAUDE.md: regional means hide localized structural defects)
-  applies to the acceptance test itself. **Acceptance for planes is the user's eye at
-  the edges vs software/poly, full stop.**
+  the runtime depth-band cutting). Its former "correctness verified" entries meant
+  ONLY "region-average luminance within a few counts + no >=40%-black frames".
+  Region averages are structurally blind to edge defects — the repo's own debugging
+  guidance (CLAUDE.md: regional means hide localized structural defects) applies to
+  the acceptance test itself. **Acceptance for planes is the user's eye at the edges
+  vs software/poly, full stop.**
 - **The RSP no-readback plane emit (2026-07-02, whole-leaf bands, then retry cells)
   produced planes that flicker in/out — both attempts REVERTED (`031ad31`).** The
   overlay-B plane emitter has never produced a user-accepted plane image on any
