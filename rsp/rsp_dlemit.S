@@ -117,13 +117,6 @@ ES_outptr: .word 0      # DMEM ptr into EOUT_BUF for the current wall
 ES_band_lo: .word 0     # this band's first source row (16.16 texels) -- T clip lo
 ES_band_hi: .word 0     # one past this band's last source row (16.16 texels) -- T clip hi
 EW_ra:     .word 0      # saved ra across StageVtx / the engine calls
-# Per-path screen-Z bias (subtracted from Z = nearer): 0 for walls, LEAF_ZBIAS for leaf surfaces.
-# Leaves are tilted planes whose FAR edge collapses to near-equal screen-Z with the distant
-# geometry behind (1/depth precision), so they z-fight/drop (ceilings reveal what's behind). A
-# small toward-camera Z bias lets the leaf win that fight. Z-ONLY (not invw) -> keeps W*INVW=1 so
-# the engine's perspective S/T normalisation is untouched (no texture warp).
-EMIT_ZBIAS: .word 0
-#define LEAF_ZBIAS 32
 # Per-wall T-band clip scratch (FixedMulVU clobbers t7..t9, so keep clipped Y/T in DMEM).
 EW_Ttop:   .word 0      # clipped T at the band-top edge (period-relative texels)
 EW_Tbot:   .word 0      # clipped T at the band-bottom edge
@@ -147,7 +140,6 @@ VSCRATCH:  .ds.b 32
 #define LRO_u     0x10
 #define LRO_v     0x14
 #define LRO_emit  0x18
-#define LRO_pad   0x1C   /* per-vertex packed RGBA shade (world-Z distance light passthrough) */
 #define LEAF_REC_BYTES 32
 # per-leaf vert cap (observed maxverts=8); CPU skips bigger. NOTE: no trailing '#'
 # comment on this #define -- the .S is cpp-processed, so a trailing comment leaks into
@@ -205,7 +197,6 @@ DLEmitCmd_Batch:
     sw   a1, %lo(ES_remain)
     sw   a2, %lo(ES_band_lo)     # this band's T clip range [band_lo, band_hi)
     sw   a3, %lo(ES_band_hi)
-    sw   zero, %lo(EMIT_ZBIAS)   # walls: no screen-Z bias
 
 EBatchChunkLoop:
     lw   t4, %lo(ES_remain)
@@ -279,8 +270,6 @@ DLEmitCmd_LeafView:
     sll  t0, a0, 8              # strip the rspq command-id byte (top 8 bits)
     srl  t0, t0, 8
     sw   t0, %lo(LV_centerx)
-    li   t0, LEAF_ZBIAS         # leaf surfaces: bias screen-Z toward camera (win far z-fights)
-    sw   t0, %lo(EMIT_ZBIAS)
     j    RSPQ_Loop
     sw   a1, %lo(LV_centery)     # (delay)
 
@@ -556,11 +545,7 @@ StageLeafVtx:
     lw   t5, %lo(LF_vbias)
     subu s0, s0, t5
     sll  s0, s0, 15           # T = (v - vbias) << 15  (x0.5 for the 64->32 decimated tile)
-#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
-    lw   s1, LRO_pad(t9)      # per-vertex packed shade (world-Z distance-light gouraud)
-#else
     lw   s1, %lo(LF_light)
-#endif
     lw   t8, %lo(LF_vbufdst)
     jal  StageVtx
     nop
@@ -733,13 +718,11 @@ StageVtx:
     sll  t5, t3, 1                   # 2*invw
     li   t6, 0x7FFF
     subu t5, t6, t5                  # 0x7FFF - 2*invw  (near -> ~0, far -> ~0x7FFF)
-    lw   t7, %lo(EMIT_ZBIAS)         # per-path toward-camera bias (0 walls, LEAF_ZBIAS leaves)
-    subu t5, t5, t7
     bgez t5, 1f
     nop
     move t5, zero                    # clamp very-near to 0
 1:
-    sh   t5, VTX_ATTR_Z(t8)          # Z (perspective screen-Z, per-path biased)
+    sh   t5, VTX_ATTR_Z(t8)          # Z (perspective screen-Z)
     # CLIPFLAGS (byte 0x06) = 0: no near/far/guard clip needed (walls are pre-clipped).
     # REJFLAGS (byte 0x07) = 0xFF: the engine CULLS unless (rej1|rej2|rej3)&0x3F == 0x3F
     # (rsp_rdpq_tri.inc:277-279 -- negated trivial-reject = "inside all 6 planes"). A

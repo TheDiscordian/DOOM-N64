@@ -158,19 +158,6 @@ endif
 #   this is a full-scene-Z stepping stone, not a drop-in mask-equivalence attempt.
 ifeq ($(BENCH_FORCE_MESH_WORLDZ),1)
 CFLAGS += -DBENCH_FORCE_MESH_WORLDZ=1
-#   BENCH_FORCE_MESH_WORLDZ_RSP_EMIT=1 -> Option 3 Phase A perf lever: no-readback RSP
-#   emit for the world-Z planes. The CPU keeps the clipping + per-vertex distance light;
-#   the RSP transforms and emits the banded plane fans (overlay B leaf pipeline with
-#   per-vertex gouraud shade). Implies the wall RSP emit so BOTH classes share overlay
-#   B's screen-affine Z convention (mixing it with DL_WallZ breaks depth compares).
-#   Reaches CFLAGS and RSPASFLAGS (StageLeafVtx reads per-vertex shade under this flag).
-ifeq ($(BENCH_FORCE_MESH_WORLDZ_RSP_EMIT),1)
-CFLAGS += -DBENCH_FORCE_MESH_WORLDZ_RSP_EMIT=1
-RSPASFLAGS += -DBENCH_FORCE_MESH_WORLDZ_RSP_EMIT=1
-BENCH_FORCE_MESH_LEAF_RSP := 1
-BENCH_FORCE_MESH_RSP_EMIT := 1
-BENCH_FORCE_MESH_LEAF_EMIT := 1
-endif
 endif
 #   BENCH_FORCE_MESH_CULL=1 -> the mesh's OWN visibility: mark walls by frustum (every
 #   wall in a frustum-visible subsector) instead of the BSP solidsegs occlusion. Wall-Z

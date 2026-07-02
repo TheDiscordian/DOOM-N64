@@ -79,7 +79,7 @@ fail() { echo "BENCH_ERROR $*" >&2; exit 1; }
 # SOFTWARE (no error, just wrong numbers). Coerce it here, and -- critically --
 # do it BEFORE the flag-off cache check below, which keys on BENCH_FORCE_RDP
 # being empty; otherwise a mesh request gets served the cached SOFTWARE result.
-case "${BENCH_FORCE_MESH:-}${BENCH_FORCE_MESH_FLOORS:-}${BENCH_FORCE_MESH_WORLDZ:-}${BENCH_FORCE_MESH_WORLDZ_RSP_EMIT:-}${BENCH_FORCE_MESH_CULL:-}${BENCH_FORCE_MESH_LEAF_RSP:-}${BENCH_FORCE_MESH_RSP:-}${BENCH_FORCE_MESH_RSP_EMIT:-}" in
+case "${BENCH_FORCE_MESH:-}${BENCH_FORCE_MESH_FLOORS:-}${BENCH_FORCE_MESH_WORLDZ:-}${BENCH_FORCE_MESH_CULL:-}${BENCH_FORCE_MESH_LEAF_RSP:-}${BENCH_FORCE_MESH_RSP:-}${BENCH_FORCE_MESH_RSP_EMIT:-}" in
     *1*) if [ "${BENCH_FORCE_RDP:-}" != "1" ]; then
              BENCH_FORCE_RDP=1
              echo "[bench] mesh flag set -> auto-enabling BENCH_FORCE_RDP=1 (Makefile nests mesh under it)" >&2
@@ -131,7 +131,6 @@ if [ -z "$RUN_ROM" ]; then
     MAKE_FLAGS="BENCH=1"
     for v in BENCH_MP BENCH_FORCE_RDP BENCH_FORCE_PLANES_ONLY BENCH_FORCE_WALLS_ONLY \
              BENCH_FORCE_MESH BENCH_FORCE_MESH_FLOORS BENCH_FORCE_MESH_WORLDZ BENCH_FORCE_MESH_CULL \
-             BENCH_FORCE_MESH_WORLDZ_RSP_EMIT \
              BENCH_FORCE_MESH_LEAF_RSP BENCH_FORCE_MESH_LEAF_EMIT BENCH_FORCE_MESH_RSP \
              BENCH_FORCE_MESH_RSP_EMIT \
              BENCH_FORCE_SHOW_FPS BENCH_FORCE_FIXEDCOLORMAP BENCH_MARKS BENCH_VOID_SCAN PVS_PROBE; do

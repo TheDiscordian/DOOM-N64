@@ -174,7 +174,6 @@ BOUT_BUF: .ds.b BATCH_N * BWALL_OUT_BYTES     # transformed outputs (DMA'd back 
 #define BLI_x      0x00
 #define BLI_y      0x04
 #define BLI_floorz 0x08    /* live surface height (fixed_t) -> screen-y */
-#define BLI_shade  0x0C    /* packed RGBA per-vertex shade (world-Z distance light) */
 #define BLEAF_IN_BYTES  16
 #define BLO_cx    0x00     /* screen-x, 16.16 */
 #define BLO_cy    0x04     /* reserved (cy is per-surface, derived at emit) */
@@ -705,14 +704,11 @@ XformLeaf:
     lw   t9, %lo(BS_outptr)
     sw   t8, %lo(XW_in)
     sw   t9, %lo(XW_out)
-    # zero the 16B output slot; the pad word passes the per-vertex packed shade through
-    # (world-Z distance light -- the CPU computes it during band clipping; overlay B's
-    # StageLeafVtx reads it from the record when built with per-vertex shade).
+    # zero the 16B output slot
     sw   zero, BLO_cx(t9)
     sw   zero, BLO_invw(t9)
     sw   zero, BLO_emit(t9)
-    lw   t2, BLI_shade(t8)
-    sw   t2, BLO_pad(t9)
+    sw   zero, BLO_pad(t9)
     # ---- view-space tx/ty ----
     lw   t0, BLI_x(t8)
     lw   t1, BLI_y(t8)

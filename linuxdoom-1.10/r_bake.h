@@ -76,33 +76,6 @@ extern int            bake_numleaves;
 extern fixed_t      (*bake_leaf_verts)[2]; // shared convex-polygon vertex pool (map x,y)
 extern int            bake_numleafverts;
 
-// One baked floor/ceiling CELL: a leaf's convex polygon clipped to one axis-aligned
-// world-grid cell (BAKE_CELL_SIZE map units a side). Tessellated OFFLINE so that every
-// emitted triangle's texture-coordinate span (world x as S, world y as T) stays under
-// the rsp_rdpq_tri s10.5 per-edge derivative limit: a leaf triangle whose u/v span
-// exceeds the engine's ~16-bit edge range overflows and the engine silently DROPS the
-// triangle, blanking the whole plane to the cleared framebuffer (the ceiling "void"
-// flicker). The runtime used to bound this with a per-frame, view-dependent depth-band
-// split (which itself churned and flickered); cells move that work into the bake. Each
-// cell carries its own ubias/vbias (its own min, floored to the 64-texel flat period)
-// and its owning subsector for the per-frame visibility lookup via bake_leafvis.
-typedef struct
-{
-    int     firstvert;  // index into bake_cell_verts
-    short   numverts;   // convex polygon vertex count (>=3)
-    short   subsector;  // owning subsector index (per-frame vis via bake_leafvis[ss])
-    short   sector;     // owning sector index (live floor/ceiling height + light)
-    short   floorpic;   // flat lump for the floor   (skyflatnum => skip, stays CPU)
-    short   ceilingpic; // flat lump for the ceiling (skyflatnum => skip, stays CPU)
-    int     ubias;      // floor(min world-texel x / 64)*64 -- STATIC S period bias
-    int     vbias;      // floor(min world-texel y / 64)*64 -- STATIC T period bias
-} bake_cell_t;
-
-extern bake_cell_t*   bake_cells;          // PU_LEVEL, grid-tessellated floor/ceiling cells
-extern int            bake_numcells;
-extern fixed_t      (*bake_cell_verts)[2]; // shared cell vertex pool (map x,y)
-extern int            bake_numcellverts;
-
 // Per-subsector visibility, set during the BSP walk (R_Subsector marks each leaf it
 // reaches) and consumed by DL_MeshDrawLeaves so only visible leaves transform/draw.
 // PU_LEVEL, sized numsubsectors. Reset each frame (R_MeshResetLeafVis).
