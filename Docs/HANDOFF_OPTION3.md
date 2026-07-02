@@ -1,5 +1,13 @@
 # HANDOFF — Option 3 full-scene Z renderer (reconstructed 2026-07-02)
 
+> **CORRECTED SAME DAY — read `GPU_PORT_PLAN.md` § "THE GOAL, STATED BY THE USER
+> (2026-07-02)" before acting on anything below.** The "correctness verified" world-Z
+> claims repeated in this file failed user visual review (jagged edges); the "RSP
+> no-readback emit" next-step this file recommends was attempted twice and reverted
+> (`031ad31` — planes flickered). The corrected goal: geometry finished at level load,
+> welded shared vertices, runtime = cull + transform + draw only, acceptance = the
+> user's eye at the edges. This file remains as reconstruction context only.
+
 The original handoff document was lost in a laptop crash on 2026-07-01. This is its
 reconstruction from the repo itself (git history, `GPU_PORT_PLAN.md`, `RSP_PORT_PLAN.md`,
 `CEILING_VOID_INVESTIGATION.md`, `PAST_BUGS.md`, and the code on

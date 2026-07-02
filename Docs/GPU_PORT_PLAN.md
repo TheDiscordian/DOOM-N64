@@ -541,3 +541,48 @@ setup + command volume are real limits; measure every phase).
   produced the finding above. Kept for reference; NOT the Option 3 path.
 - **Next:** start the Option 3 work (Phase A) on a fresh branch off the known-good checkpoint;
   keep every phase behind a build flag and A/B against the shipping build.
+
+## THE GOAL, STATED BY THE USER (2026-07-02) — READ THIS BEFORE TOUCHING PLANES
+
+**A full bake, done properly, like a real 3D game: the geometry is FINISHED at level
+load.** Floor and ceiling meshes with **shared, welded vertices** — no T-junctions
+anywhere — cut once on a fixed world grid. The runtime only **culls, transforms, and
+draws**. NO per-frame polygon surgery of any kind: no per-frame side clipping, no
+per-frame near folding, no per-frame depth-band cutting, no per-frame texture
+rebiasing. Per-frame geometry cutting IS the defect: it produces edges that differ
+between neighbours and between frames, which the user sees as jagged seams and
+flicker. If a design requires cutting polygons at render time, it is the wrong design.
+
+### Corrections to the record (2026-07-02) — claims above this line to re-read
+- **The Phase A world-Z CPU slice FAILED user visual review**: jagged edges across
+  planes (T-junction cracks from the unwelded `P_BakeLeafFans` polygons + seams from
+  the runtime depth-band cutting). The "correctness verified" entries dated 2026-06-30
+  above mean ONLY "region-average luminance within a few counts + no >=40%-black
+  frames". Region averages are structurally blind to edge defects — this file's own
+  debugging guidance (CLAUDE.md: regional means hide localized structural defects)
+  applies to the acceptance test itself. **Acceptance for planes is the user's eye at
+  the edges vs software/poly, full stop.**
+- **The RSP no-readback plane emit (2026-07-02, whole-leaf bands, then retry cells)
+  produced planes that flicker in/out — both attempts REVERTED (`031ad31`).** The
+  overlay-B plane emitter has never produced a user-accepted plane image on any
+  branch. Do not point it at planes again without a differential root-cause (same
+  staging, CPU vs RSP final emit) — and not before the welded bake exists.
+- **History note (user-corrected):** the visplane-mimicry direction that consumed the
+  pre-Option-3 sessions was the agent's, not the user's. The user's goal was the
+  proper bake throughout.
+
+### The plan from here (welded bake first, everything else after)
+1. **Bake (level load):** weld the plane geometry — every vertex that lies on a
+   neighbouring polygon's edge is inserted into that edge (exact shared coordinates),
+   so all adjacent pieces share edge endpoints bit-for-bit. Then cut once on the fixed
+   512-unit world grid with direction-canonicalized intersection arithmetic (both
+   sides of a shared edge compute the identical cut vertex). Static per-piece
+   64-aligned ubias/vbias (bounded texel span by construction). Bake-time numeric
+   self-checks printed at load: T-junction count MUST be 0, max texel span, piece and
+   vert counts.
+2. **Runtime:** per visible piece — cull, transform, per-vertex distance light, draw.
+   Near/guard clipping happens per TRIANGLE at transform time from shared endpoints
+   (both neighbours derive identical clip vertices), never by re-cutting polygons.
+   CPU emit first; no RSP anywhere near planes until the user's eye passes the CPU
+   image.
+3. **Gate:** the user looks at it. Not a luminance table. Then Phases B/C/D as above.
