@@ -2581,7 +2581,7 @@ typedef struct {
 typedef struct {
     int32_t x, y;                  // 0x00,0x04   world map coords (fixed_t)
     int32_t floorz;                // 0x08        live surface height (fixed_t) -> screen-y
-    int32_t pad0;                  // 0x0C        (16-byte align)
+    int32_t shade;                 // 0x0C        packed RGBA per-vertex shade (world-Z light)
 } rsp_bleaf_in_t;                  // 16 bytes
 typedef struct {
     int32_t cx;                    // 0x00        screen-x 16.16
@@ -2590,7 +2590,7 @@ typedef struct {
     int32_t depth;                 // 0x0C        view-space depth 16.16 -> engine Z (>>16) + W
     int32_t u, v;                  // 0x10,0x14   world-coord flat texel (x>>FRACBITS,y>>FRACBITS)
     int32_t emit;                  // 0x18        1 = in front of near plane, 0 = cull leaf
-    int32_t pad;                   // 0x1C
+    int32_t pad;                   // 0x1C        in.shade passed through by XformLeaf
 } rsp_bleaf_out_t;                 // 32 bytes
 #endif
 #endif
@@ -2958,6 +2958,10 @@ static unsigned batch_frame = 0;
 #ifdef BENCH_FORCE_MESH_LEAF_RSP
 static void DL_RSPLeafDispatch(void);    // Phase 4 fold: queues the leaf transform (defined below)
 static void DL_RSPLeafDrain(int wall_nvis); // Phase 4 fold: render-time drain+invalidate (below)
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+static void DL_WZRSPDispatch(void);      // Option 3: world-Z plane transform queue (defined below)
+static void DL_WZRSPEmitFlush(void);     // Option 3: world-Z no-readback emit (defined below)
+#endif
 #endif
 
 static void DL_RSPBatchProbe(void)
@@ -3435,6 +3439,13 @@ void DL_MeshDrawWalls(void)
         // batch below drains it in the same rspq_wait and the leaf transform overlaps
         // the wall pack. DL_DrawMeshLeaves reads the result at present time.
         DL_RSPLeafDispatch();
+#endif
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+        // Option 3: queue the world-Z plane transform the same way -- before the wall
+        // batch so the queue drains it with no extra barrier. The banded/clipped verts
+        // (with per-vertex distance-light shade) go out now; the descriptors are built
+        // and dispatched at present time (DL_WZRSPEmitFlush).
+        DL_WZRSPDispatch();
 #endif
 #ifdef BSPWALK_PROBE
         // Split the wall RSP round-trip (pack + dispatch + rspq_wait) out of the mesh
@@ -4964,6 +4975,13 @@ static void DL_WZShade4(int level, float out[4])
 
 static void DL_DrawWorldZPlanes(void)
 {
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+    // No-readback build: overlay B fans the banded world-Z planes from the records the
+    // leaf transform wrote at render time; the CPU never projects nor emits. The CPU
+    // path below is kept compiled (dead) so the A/B builds share one source.
+    DL_WZRSPEmitFlush();
+    return;
+#endif
     fixed_t vcos, vsin;
     float vxf, vyf, vcosf, vsinf, cxf, viewzf;
     int surf, ss, drew = 0;
@@ -5434,7 +5452,7 @@ static void DL_RSPLeafDispatch(void)
                                 leaf_in_buf[nv].x = clx[i];
                                 leaf_in_buf[nv].y = cly[i];
                                 leaf_in_buf[nv].floorz = height;       // this surface's live height
-                                leaf_in_buf[nv].pad0 = 0;
+                                leaf_in_buf[nv].shade = 0;             // legacy path: LF_light shades the fan
                                 nv++;
                             }
                         }
@@ -5609,6 +5627,344 @@ static void DL_LeafRSPEmitFlush(void)
     }
 }
 #endif
+
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+// ============================================================================
+// Option 3 Phase A perf lever: NO-READBACK RSP emit for the world-Z planes.
+// The CPU slice moved the whole plane cost into dlbuild (band clip + transform +
+// rdpq_triangle setup per tri). This path keeps the CPU's cheap, table-heavy work
+// (side/band clipping, per-vertex distance LIGHT from zlight) and moves the divide,
+// projection and triangle emit onto the RSP via the debugged leaf pipeline:
+//   render time  : DL_WZRSPDispatch stages banded clipped verts (with per-vertex
+//                  packed shade) -> DLWallCmd_LeafBatch transform, queued, no wait.
+//   present time : DL_WZRSPEmitFlush walks the recorded units flat-major and fires
+//                  DLEmitCmd_LeafBatch descriptors (never-rewinding cursor).
+// Z convention: overlay B's screen-affine 0x7FFF-2*invw for BOTH walls and planes
+// (this build implies BENCH_FORCE_MESH_RSP_EMIT), leaf surfaces get EMIT_ZBIAS.
+// ============================================================================
+
+// Per-(leaf,surface,band) emit unit recorded at dispatch, consumed by the flush's
+// flat-major descriptor walk. n <= DL_LEAF_EMIT_MAXV: a band polygon with more verts
+// is staged as several sub-fans sharing vertex 0, one unit (descriptor) each.
+typedef struct {
+    uint16_t ss;         // subsector index
+    uint8_t  surf;       // 0 floor, 1 ceiling
+    uint8_t  n;          // verts in this fan chunk (3..DL_LEAF_EMIT_MAXV)
+    int32_t  start;      // first record slot in leaf_out_buf
+    int16_t  ub64, vb64; // band-local 64-texel S/T bias, packed (bias/64 + 512)
+    int16_t  flat;       // flattranslation[pic] -- the flush's TMEM bucket key
+    int16_t  pad;
+} wz_rsp_unit_t;
+#define DL_WZ_UNITS_MAX 2048     // == descriptor buffer cap, so the cursor can't starve
+static wz_rsp_unit_t* wz_units = NULL;   // zone, allocated once (24KB is BSS-hostile)
+static int wz_nunits = 0;                // armed by dispatch, consumed by the flush
+
+// Distance-light colormap level from the vertex's own VIEW DEPTH. R_MapPlane's
+// distance = planeheight*yslope[row] IS the view depth of the plane point on that
+// row (planeheight*centerx/|cy-centery| == depth), so the CPU can light a vertex
+// without projecting it -- the projection now lives on the RSP. distclamp reproduces
+// DL_WZLightLevel's screen-row clamp: a vertex projecting past the bottom/top screen
+// edge lights as if on the edge row. planeheight*yslope[edge] is the MINIMUM depth an
+// on-screen vertex of this surface can have, so the max() is exact for interior verts.
+static int DL_WZLightLevelDist(int lightlevel, fixed_t dist, fixed_t distclamp)
+{
+    extern int extralight;
+    extern lighttable_t* fixedcolormap;
+    int lnum;
+    unsigned zi;
+    long lv;
+
+    if (fixedcolormap) {
+        lv = (fixedcolormap - colormaps) / 256;
+        if (lv < 0) lv = 0;
+        if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+        return (int)lv;
+    }
+    if (dist < distclamp) dist = distclamp;
+    lnum = (lightlevel >> LIGHTSEGSHIFT) + extralight;
+    if (lnum < 0) lnum = 0;
+    if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+    zi = (unsigned)dist >> LIGHTZSHIFT;
+    if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+    lv = (zlight[lnum][zi] - colormaps) / 256;
+    if (lv < 0) lv = 0;
+    if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+    return (int)lv;
+}
+
+// Render time (DL_MeshDrawWalls, right before the wall batch so the queue drains the
+// transform with no extra barrier). Mirrors DL_DrawWorldZPlanes' gather exactly --
+// side clip once per leaf, per-surface sky/backface filters, effective near, world-Z
+// depth bands bounded by the leaf depth range -- but stages records instead of emitting.
+static void DL_WZRSPDispatch(void)
+{
+    extern int bake_numleafverts;
+    extern fixed_t yslope[SCREENHEIGHT];
+    static rsp_view_blk_t* vb = NULL;
+    fixed_t vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    fixed_t vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    int ss, nv = 0;
+
+    wz_nunits = 0;
+    leaf_rsp_nv = 0;
+    if (!n64_rdp_mesh_worldz || !DL_MeshRouteOn() || !bake_leaves || !bake_leafvis || !dl_wall_z)
+        return;
+    if (rsp_dlwall_ovl_id == 0)
+        rsp_dlwall_ovl_id = rspq_overlay_register(&rsp_dlwall);
+    if (rsp_dlwall_ovl_id == 0) return;
+    if (!wz_units)
+        wz_units = (wz_rsp_unit_t*)Z_Malloc(sizeof(wz_rsp_unit_t) * DL_WZ_UNITS_MAX, PU_STATIC, NULL);
+    if (!wz_units) return;
+    // Zone-resident DMA staging, same sizing discipline as the leaf path (see
+    // leaf_in_raw's declaration comment for why the zone and why +15 & 16-align).
+    if (2 * bake_numleafverts + DL_LEAF_CLIP_PAD > leaf_buf_cap) {
+        if (leaf_in_raw)  Z_Free(leaf_in_raw);
+        if (leaf_out_raw) Z_Free(leaf_out_raw);
+        leaf_buf_cap = 2 * bake_numleafverts + DL_LEAF_CLIP_PAD;
+        leaf_in_raw  = Z_Malloc(sizeof(rsp_bleaf_in_t)  * leaf_buf_cap + 15, PU_STATIC, &leaf_in_raw);
+        leaf_out_raw = Z_Malloc(sizeof(rsp_bleaf_out_t) * leaf_buf_cap + 15, PU_STATIC, &leaf_out_raw);
+        leaf_in_buf  = leaf_in_raw  ? (rsp_bleaf_in_t*) (((uintptr_t)leaf_in_raw  + 15) & ~(uintptr_t)15) : NULL;
+        leaf_out_buf = leaf_out_raw ? (rsp_bleaf_out_t*)(((uintptr_t)leaf_out_raw + 15) & ~(uintptr_t)15) : NULL;
+    }
+    if (!leaf_in_buf || !leaf_out_buf) { leaf_buf_cap = 0; return; }
+    if (!vb) vb = memalign(16, sizeof *vb);
+    if (!vb) return;
+    vb->viewx = viewx; vb->viewy = viewy; vb->viewz = viewz;
+    vb->vcos = vcos;   vb->vsin = vsin;
+    vb->centerx = centerx; vb->centery = centery; vb->pad0 = 0;
+
+    {
+        float vxf = (float)viewx * (1.0f / 65536.0f), vyf = (float)viewy * (1.0f / 65536.0f);
+        float vcosf = (float)vcos * (1.0f / 65536.0f), vsinf = (float)vsin * (1.0f / 65536.0f);
+        float cxf = (float)centerx, viewzf = (float)viewz * (1.0f / 65536.0f);
+        float EDGEB = (float)(SCREENHEIGHT + 256) - (float)centery;
+        float EDGET = (float)centery + 256.0f;
+        float spx[DL_WZ_MAXV + 8], spy[DL_WZ_MAXV + 8];
+        fixed_t clx[DL_WZ_MAXV + 8], cly[DL_WZ_MAXV + 8];
+        int cap = leaf_buf_cap - (DL_WZ_MAXV + 8);
+
+        for (ss = 0; ss < numsubsectors && nv < cap; ss++)
+        {
+            bake_leaf_t* lf = &bake_leaves[ss];
+            float cd0, cd1;
+            int ms, k, surf;
+            if (!bake_leafvis[ss]) continue;   // Phase-A cull seed; later a PVS/frustum cull
+            if (lf->numverts < 3 || lf->numverts > DL_WZ_MAXV) continue;
+            if (lf->floorpic == skyflatnum && lf->ceilingpic == skyflatnum) continue;
+            ms = DL_WZClipLeafSides(lf->firstvert, lf->numverts, vxf, vyf, vcosf, vsinf, cxf,
+                                    spx, spy);
+            if (ms < 3) continue;
+            cd0 = 1.0e30f; cd1 = -1.0e30f;
+            for (k = 0; k < ms; k++) {
+                float dep = (spx[k] - vxf) * vcosf + (spy[k] - vyf) * vsinf;
+                if (dep < cd0) cd0 = dep;
+                if (dep > cd1) cd1 = dep;
+            }
+
+            for (surf = 0; surf < 2 && nv < cap; surf++)
+            {
+                fixed_t height, phfix, distclamp;
+                float hf, nearz_eff, zlo;
+                int pic = surf ? lf->ceilingpic : lf->floorpic;
+                int band, lightlevel, flatidx;
+                if (pic == skyflatnum) continue;                       // sky stays CPU
+                height = surf ? sectors[lf->sector].ceilingheight
+                              : sectors[lf->sector].floorheight;
+                if (surf ? (height <= viewz) : (height >= viewz)) continue;  // height backface
+                hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                phfix = height - viewz;
+                if (phfix < 0) phfix = -phfix;                         // planeheight (fixed)
+                distclamp = FixedMul(phfix, yslope[surf ? 0 : viewheight - 1]);
+                lightlevel = sectors[lf->sector].lightlevel;
+                flatidx = flattranslation[pic];
+
+                nearz_eff = 6.0f;
+                if (hf < 0.0f) { float d = -hf * cxf / EDGEB; if (d > nearz_eff) nearz_eff = d; }
+                else           { float d =  hf * cxf / EDGET; if (d > nearz_eff) nearz_eff = d; }
+                zlo = (cd0 > nearz_eff) ? cd0 : nearz_eff;
+                if (cd1 <= zlo) continue;
+
+                for (band = 0; band < DL_WZ_NBANDS && nv < cap; band++)
+                {
+                    float zhi = zlo * DL_WZ_BAND_RATIO;
+                    int m, i;
+                    if (zhi >= cd1 || band == DL_WZ_NBANDS - 1) zhi = DL_WZ_FARZ;
+                    m = DL_WZClipBandToFixed(spx, spy, ms, vxf, vyf, vcosf, vsinf,
+                                             zlo, zhi, clx, cly, DL_WZ_MAXV);
+                    if (m >= 3)
+                    {
+                        // band-local 64-texel S/T bias: bounds every chunk's s10.5 span
+                        // (the CPU slice rebiased per band poly the same way).
+                        int umin = 0x7FFFFFFF, vmin = 0x7FFFFFFF, ubias, vbias, base;
+                        for (i = 0; i < m; i++) {
+                            int u = clx[i] >> FRACBITS, v = cly[i] >> FRACBITS;
+                            if (u < umin) umin = u;
+                            if (v < vmin) vmin = v;
+                        }
+                        ubias = umin & ~63;
+                        vbias = vmin & ~63;
+
+                        // Stage as 1+ sub-fans of <= DL_LEAF_EMIT_MAXV verts sharing v0
+                        // (a convex fan splits into convex sub-fans on the apex).
+                        base = 1;
+                        while (base < m - 1 && wz_nunits < DL_WZ_UNITS_MAX)
+                        {
+                            int take = m - base + 1;
+                            int ustart = nv;
+                            wz_rsp_unit_t* u;
+                            if (take > DL_LEAF_EMIT_MAXV) take = DL_LEAF_EMIT_MAXV;
+                            if (nv + take > cap) break;
+                            for (i = -1; i < take - 1; i++)
+                            {
+                                int vi = (i < 0) ? 0 : base + i;
+                                fixed_t wx = clx[vi], wy = cly[vi];
+                                fixed_t depth = FixedMul(wx - viewx, vcos)
+                                              + FixedMul(wy - viewy, vsin);
+                                int lvl = DL_WZLightLevelDist(lightlevel, depth, distclamp);
+                                leaf_in_buf[nv].x = wx;
+                                leaf_in_buf[nv].y = wy;
+                                leaf_in_buf[nv].floorz = height;
+                                leaf_in_buf[nv].shade =
+                                    (int32_t)((lvl < NUMCOLORMAPS) ? dl_prim_lut[lvl]
+                                                                   : dl_unlit_prim);
+                                nv++;
+                            }
+                            u = &wz_units[wz_nunits++];
+                            u->ss    = (uint16_t)ss;
+                            u->surf  = (uint8_t)surf;
+                            u->n     = (uint8_t)take;
+                            u->start = ustart;
+                            u->ub64  = (int16_t)((ubias >> 6) + 512);
+                            u->vb64  = (int16_t)((vbias >> 6) + 512);
+                            u->flat  = (int16_t)flatidx;
+                            u->pad   = 0;
+                            base += take - 2;
+                        }
+                    }
+                    if (zhi == DL_WZ_FARZ) break;
+                    zlo = zhi;
+                }
+            }
+        }
+    }
+    if (nv == 0 || wz_nunits == 0) { wz_nunits = 0; return; }
+
+    data_cache_hit_writeback(vb, sizeof *vb);
+    data_cache_hit_writeback(leaf_in_buf,  (uint32_t)((size_t)nv * sizeof(rsp_bleaf_in_t)));
+    data_cache_hit_writeback(leaf_out_buf, (uint32_t)((size_t)nv * sizeof(rsp_bleaf_out_t)));
+    // QUEUE only, no wait -- the wall batch (or the wall RSP-emit flush's own wait)
+    // drains this transform long before the emit descriptors reference the records.
+    rspq_write(rsp_dlwall_ovl_id, DLWALL_CMD_LEAFBATCH,
+               PhysicalAddr(vb), PhysicalAddr(leaf_in_buf),
+               PhysicalAddr(leaf_out_buf), (uint32_t)nv);
+    leaf_rsp_nv = nv;
+}
+
+// Present time (DL_Flush -> DL_DrawMeshLeaves, Z still enabled). Flat-major walk of
+// the recorded units: bind each flat's TMEM once, then one DLEmitCmd_LeafBatch per
+// flat over its descriptors. Same never-rewinding cursor discipline as the leaf path
+// (each batch owns its region of leaf_desc_buf; DL_WZ_UNITS_MAX == DCAP so a frame
+// can never overrun the cursor mid-flat).
+static void DL_WZRSPEmitFlush(void)
+{
+    int surf, drew = 0, ui, fi, dcur = 0;
+    int nunits = wz_nunits, nv = leaf_rsp_nv;
+    const int DCAP = (int)(sizeof leaf_desc_buf / sizeof leaf_desc_buf[0]);
+    static int flats[256];
+
+    // Consume the pending-work markers (the I_FinishUpdate gate reads wz_nunits;
+    // the next 3D frame's dispatch re-arms them).
+    wz_nunits = 0;
+    leaf_rsp_nv = 0;
+    if (nv == 0 || nunits == 0) return;
+    if (rsp_dlemit_ovl_id == 0)
+        rsp_dlemit_ovl_id = rspq_overlay_register(&rsp_dlemit);
+    if (rsp_dlemit_ovl_id == 0) return;
+
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;
+        tp.t.mask = 5;
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+    }
+    // TEX0*SHADE: per-vertex distance light rides in as gouraud SHADE (StageLeafVtx
+    // reads it from each record's pad word in this build).
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
+    rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFVIEW, (uint32_t)centerx, (uint32_t)centery);
+
+    for (surf = 0; surf < 2; surf++)
+    {
+        int nflat = 0;
+        for (ui = 0; ui < nunits; ui++) {
+            int fl, j, seen;
+            if (wz_units[ui].surf != surf) continue;
+            fl = wz_units[ui].flat;
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
+        }
+
+        for (fi = 0; fi < nflat; fi++)
+        {
+            int   flatidx = flats[fi];
+            byte* block   = DL_FlatBlock(flatidx);
+            int   dstart;
+            if (!block) continue;
+            DL_FlatMarkInFlight(flatidx);
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
+            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);
+
+            dstart = dcur;
+            for (ui = 0; ui < nunits; ui++)
+            {
+                wz_rsp_unit_t* u = &wz_units[ui];
+                bake_leaf_t*   lf;
+                sector_t*      sec;
+                fixed_t        hf16;
+                int            lvl;
+                if (u->surf != surf || u->flat != flatidx) continue;
+                if (dcur >= DCAP) break;
+                lf   = &bake_leaves[u->ss];
+                sec  = &sectors[lf->sector];
+                hf16 = (surf ? sec->ceilingheight : sec->floorheight) - viewz;
+                // Flat sector light as the descriptor fallback -- unused by the
+                // per-vertex-shade ucode, kept so the descriptor stays well-formed.
+                lvl = (255 - sec->lightlevel) >> 3;
+                if (lvl < 0) lvl = 0;
+                if (lvl > NUMCOLORMAPS - 1) lvl = NUMCOLORMAPS - 1;
+                leaf_desc_buf[dcur].rec_addr = PhysicalAddr(&leaf_out_buf[u->start]);
+                leaf_desc_buf[dcur].hf16     = (uint32_t)hf16;
+                leaf_desc_buf[dcur].prim     = dl_prim_lut[lvl];
+                leaf_desc_buf[dcur].packed   = (uint32_t)(u->n & 0x3F)
+                                             | ((uint32_t)(u->ub64 & 0x3FF) << 6)
+                                             | ((uint32_t)(u->vb64 & 0x3FF) << 16);
+                dcur++;
+                drew += u->n - 2;
+            }
+            if (dcur > dstart)
+            {
+                data_cache_hit_writeback(&leaf_desc_buf[dstart],
+                    (uint32_t)((size_t)(dcur - dstart) * sizeof(rsp_leaf_desc_t)));
+                rspq_write(rsp_dlemit_ovl_id, DLEMIT_CMD_LEAFBATCH,
+                           PhysicalAddr(&leaf_desc_buf[dstart]), (uint32_t)(dcur - dstart));
+            }
+            if (dcur >= DCAP) { rspq_wait(); dcur = 0; }
+        }
+    }
+
+    dl_leaf_tris = drew;
+    {
+        static unsigned wz_n = 0;
+        if ((wz_n++ & 511) == 0)
+            debugf("MESH-WORLDZ-RSP: plane tris=%d units=%d (no readback)\n",
+                   dl_leaf_tris, nunits);
+    }
+}
+#endif /* BENCH_FORCE_MESH_WORLDZ_RSP_EMIT */
 
 static void DL_DrawMeshLeaves(void)
 {
@@ -6228,7 +6584,12 @@ static void DL_FlushRSPEmit(void)
 // byte-identical there.
 int DL_RSPEmitPending(void)
 {
-#ifdef BENCH_FORCE_MESH_RSP_EMIT
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+    // World-Z RSP planes are their own pending class: a frame can have visible
+    // floors but zero RSP-emit walls, and an uncounted class skips DL_Flush ->
+    // the 3-frames-stale ghost (see the comment above).
+    return dl_rspemit_pending + wz_nunits;
+#elif defined(BENCH_FORCE_MESH_RSP_EMIT)
     return dl_rspemit_pending;
 #else
     return 0;

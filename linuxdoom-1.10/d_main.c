@@ -2237,6 +2237,9 @@ void D_DoomMain (void)
     extern int n64_rdp_mesh_worldz;
     n64_rdp_mesh_worldz = 1;
     debugf("BENCH: MESH WORLD-Z planes ON (Option 3 Phase A candidate)\n");
+#ifdef BENCH_FORCE_MESH_WORLDZ_RSP_EMIT
+    debugf("BENCH: MESH WORLD-Z RSP-EMIT ON (no-readback plane emit via overlay B)\n");
+#endif
 #endif
 #ifdef BENCH_FORCE_MESH_CULL
     // The mesh's OWN visibility: mark walls by frustum (every wall in a frustum-visible
