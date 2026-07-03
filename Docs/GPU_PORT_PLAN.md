@@ -712,15 +712,18 @@ section records what changed and why, so the history is auditable:
   session unlocks; the lockscreen blocked all display capture tonight).**
 
 ### Phase D design (2026-07-03) — traversal, sky, fuzz, and what blocks it
-Written before implementation; numbers from the 2026-06-24 BSPWALK_PROBE
-(mesh-floors) because the probe build no longer fits in memory (below).
+Numbers measured on the CURRENT mesh-sprites build (BSPWALK_PROBE rerun
+2026-07-03 after the probe frame-cap unblocked the boot; means over 3072
+frames, tail = worst 5%).
 
-**The prize.** Strip-able walk CPU on the current path = `addline_net`
-(874us mean / 3147us tail) + recursion/`R_FindPlane` glue (~745/~1417) +
-`checkbbox` stays (204/583) — roughly **1.6 ms mean / 4.6 ms tail** of pure
-visibility work, plus the whole `seg_rast` clip-array fill that only sky and
-fuzz still consume. `DL_MeshDrawWalls` (36% of bsp_walk) is NOT Phase D's
-target — that is the RSP-emit keystone's lever.
+**The prize.** Strip-able CPU on the current path: `addline_net` **696 us
+mean / 2155 us tail** + `segloop` **1828 us mean** (the clip-array/visplane
+fill that ONLY sky and fuzz still consume) + recursion/`R_FindPlane` glue.
+`checkbbox` (184/468) stays — the traversal keeps the node prune; the
+`R_AddSprites` collect (171/391) stays, called from the traversal instead.
+`DL_MeshDrawWalls` (983 mean, 742 of that the RSP-transform wait) is NOT
+Phase D's target — that is the RSP-emit keystone's lever. Net: roughly
+**2.5+ ms mean** of pure visibility/fill work dies with the walk.
 
 **Traversal.** Replace `R_RenderBSPNode`→`R_AddLine`→solidsegs with a
 frustum-only node walk: keep `R_CheckBBox` node pruning verbatim, visit every
