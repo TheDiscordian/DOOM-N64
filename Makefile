@@ -287,6 +287,12 @@ endif
 ifeq ($(BENCH_MARK_VOID),1)
 CFLAGS += -DBENCH_MARK_VOID=1
 endif
+# BENCH_MARK_FBSCAN=1: at every mark, scan the VI-displayed framebuffer and log a
+# warm-bright-pixel bbox (BENCH_FBSCAN frame=N ...). Host-independent bbox metric
+# for A/Bs when no display capture is possible. Bench-only; no renderer effect.
+ifeq ($(BENCH_MARK_FBSCAN),1)
+CFLAGS += -DBENCH_MARK_FBSCAN=1
+endif
 endif
 endif
 # DL_TRACE=1: one-off diagnostic builds only -- per-present RDP flush/emit

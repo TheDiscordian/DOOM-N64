@@ -795,6 +795,50 @@ void N64Bench_LoopEnd(void)
     {
         debugf("BENCH_MARK frame=%lu\n", bench_frame_count);
 
+#if defined(BENCH_MARK_FBSCAN) && BENCH_MARK_FBSCAN
+        // Displayed-framebuffer bbox scan (BENCH_MARK_FBSCAN=1): wait for the
+        // VI to flip to the just-queued mark frame, then read the buffer the
+        // VI is actually showing (VI_ORIGIN) and log the bounding box of
+        // warm-bright pixels (fireball/explosion colours). Host-independent
+        // stand-in for the screenshot bbox measurement -- works when no
+        // display capture is possible. RGBA16 only (this port's display mode).
+        {
+            uint64_t settle = get_ticks() + TICKS_PER_SECOND / 5;
+            while (get_ticks() < settle)
+                ;   // let the VI flip; same no-VirtualTick freeze as the hold
+        }
+        {
+            // Four equal-height bands, bbox+count each: a union bbox is
+            // dominated by the status bar's warm numerals; banding isolates
+            // view-area defects (e.g. a truncated explosion sprite).
+            uint32_t origin = (*(volatile uint32_t*)0xA4400004u) & 0x00FFFFFFu;
+            volatile uint16_t* fb = (volatile uint16_t*)(0xA0000000u | origin);
+            int vw = (int)display_get_width(), vh = (int)display_get_height();
+            int x, y, band;
+            for (band = 0; band < 4; band++)
+            {
+                int yb0 = band * vh / 4, yb1 = (band + 1) * vh / 4;
+                int n = 0, x0 = 9999, x1 = -1, y0 = 9999, y1 = -1;
+                for (y = yb0; y < yb1; y++)
+                    for (x = 0; x < vw; x++)
+                    {
+                        uint16_t px = fb[y * vw + x];
+                        int r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
+                        if (r >= 23 && g >= 10 && b < 17)
+                        {
+                            n++;
+                            if (x < x0) x0 = x;
+                            if (x > x1) x1 = x;
+                            if (y < y0) y0 = y;
+                            if (y > y1) y1 = y;
+                        }
+                    }
+                debugf("BENCH_FBSCAN frame=%lu band=%d n=%d x=%d..%d y=%d..%d\n",
+                       bench_frame_count, band, n, x0, x1, y0, y1);
+            }
+        }
+#endif
+
         // FREEZE-AT-MARKER: hold ~2 wall-clock seconds before returning to
         // the loop, so the screen keeps showing EXACTLY the marker frame
         // while the host capture loop (grep marker -> grim) fires. Without
