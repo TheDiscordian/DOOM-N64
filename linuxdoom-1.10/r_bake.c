@@ -235,6 +235,8 @@ static double bake_pt_outside_dist (const bake_leaf_t* lf, double px, double py)
     return worst;
 }
 
+static void P_BakeWeldedPlanes (void);   // THE GOAL: welded plane mesh (defined below)
+
 //
 // P_BakeLeafFans -- build the convex floor/ceiling polygon for every subsector and
 // validate it numerically (convexity + every seg endpoint inside-or-on its leaf, which
@@ -294,6 +296,416 @@ static void P_BakeLeafFans (void)
             "nonconvex=%d, seg-outside(>1u)=%d worst=%dunits, vpool %d/%d\n",
             numsubsectors, filled, empty, maxv, nonconvex, segout,
             (int)(worstseg + 0.5), bake_numleafverts, bake_leafvert_cap);
+
+    // THE GOAL (Docs/GPU_PORT_PLAN.md): finish the plane geometry HERE, at level
+    // load -- welded, grid-cut, self-checked. Renders nothing yet (Phase-1 pattern).
+    P_BakeWeldedPlanes ();
+}
+
+// ===========================================================================
+// WELDED plane mesh (Docs/GPU_PORT_PLAN.md §THE GOAL). The geometry is FINISHED
+// here, at level load. Two defects condemned every previous mesh-plane attempt:
+// T-junction cracks (leaf polygons clipped independently never share border
+// vertices) and per-frame cutting seams (view-dependent side/near/band clipping
+// produces edges that differ between neighbours and between frames). Both are
+// killed structurally:
+//   1. WELD -- any leaf-pool vertex lying on another polygon's edge is inserted
+//      into that edge with its EXACT coordinates, so adjacent polygons share
+//      border vertices bit-for-bit.
+//   2. GRID CUT -- each welded polygon is cut ONCE on the fixed BAKE_PM_GRID
+//      world grid. Intersection arithmetic is direction-canonicalized (the
+//      smaller endpoint leads regardless of winding), so the two polygons
+//      sharing an edge compute the bit-identical cut vertex, and the cut
+//      coordinate on the clip axis is snapped exactly onto the grid line.
+// Every piece's texel span is bounded by the grid size via its STATIC 64-aligned
+// ubias/vbias. The runtime must NEVER cut these polygons. Self-checks print at
+// load: T-junction count MUST be 0 -- do not draw from a pool that fails.
+// ===========================================================================
+bake_pmpiece_t* bake_pmpieces     = NULL;
+int             bake_numpmpieces  = 0;
+fixed_t       (*bake_pm_verts)[2] = NULL;
+int             bake_numpmverts   = 0;
+
+#define BAKE_PM_GRID      512           /* cell edge, multiple of 64 (flat period) */
+#define BAKE_PM_MAXV      96            /* welded-polygon vertex cap */
+#define BAKE_PM_WELD_EPS  (1.0 / 16.0)  /* on-edge distance (map units) for a weld */
+#define BAKE_PM_CHK_EPS   (1.0 / 256.0) /* post-bake T-junction detector tolerance */
+
+// Sorted-by-x vertex index (weld + T-junction check acceleration): binary-search
+// the edge's x window, scan only those candidates. Rebuilt per pool it indexes.
+static int* pm_xsort   = NULL;
+static int  pm_xsort_n = 0;
+
+static void pm_xsort_build (fixed_t (*pool)[2], int n)
+{
+    int gap, i, j;
+    pm_xsort_n = n;
+    for (i = 0; i < n; i++) pm_xsort[i] = i;
+    for (gap = n / 2; gap > 0; gap /= 2)            // shell sort: small pools, no libc
+        for (i = gap; i < n; i++)
+            for (j = i - gap; j >= 0
+                 && pool[pm_xsort[j]][0] > pool[pm_xsort[j + gap]][0]; j -= gap)
+            {
+                int t = pm_xsort[j];
+                pm_xsort[j] = pm_xsort[j + gap];
+                pm_xsort[j + gap] = t;
+            }
+}
+
+static int pm_xsort_lower (fixed_t (*pool)[2], fixed_t x0)
+{
+    int lo = 0, hi = pm_xsort_n;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+        if (pool[pm_xsort[mid]][0] < x0) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+// WELD one edge (A,B) of a leaf: append A, then every foreign pool vertex lying
+// strictly inside the segment (within BAKE_PM_WELD_EPS of the line, at least
+// WELD_EPS from both endpoints), in order along the edge, using the vertex's EXACT
+// pool coordinates. B is appended by the next edge's call. Returns the new count.
+static int pm_weld_edge (fixed_t (*pool)[2], int selfstart, int selfend,
+                         fixed_t ax, fixed_t ay, fixed_t bx, fixed_t by,
+                         fixed_t (*w)[2], int wn, int wcap, int* inserted)
+{
+    static int    ins_idx[BAKE_PM_MAXV];
+    static double ins_t[BAKE_PM_MAXV];
+    double  axd = (double)ax, ayd = (double)ay;          // doubles carry FIXED values
+    double  exd = (double)bx - axd, eyd = (double)by - ayd;
+    double  elen2 = exd * exd + eyd * eyd;
+    double  elen  = sqrt (elen2);
+    double  weld_fx = BAKE_PM_WELD_EPS * 65536.0;        // eps in fixed units
+    fixed_t xlo = (ax < bx ? ax : bx) - (fixed_t)(weld_fx + 1.0);
+    fixed_t xhi = (ax > bx ? ax : bx) + (fixed_t)(weld_fx + 1.0);
+    fixed_t ylo = (ay < by ? ay : by) - (fixed_t)(weld_fx + 1.0);
+    fixed_t yhi = (ay > by ? ay : by) + (fixed_t)(weld_fx + 1.0);
+    int     k, q, nins = 0;
+
+    if (wn < wcap) { w[wn][0] = ax; w[wn][1] = ay; wn++; }
+    if (elen2 < 1.0)
+        return wn;                                        // degenerate edge
+
+    for (k = pm_xsort_lower (pool, xlo); k < pm_xsort_n; k++)
+    {
+        int     vi = pm_xsort[k];
+        fixed_t vx = pool[vi][0], vy = pool[vi][1];
+        double  t, ddx, ddy, perp2, along;
+        if (vx > xhi) break;
+        if (vi >= selfstart && vi < selfend) continue;    // own vertex
+        if (vy < ylo || vy > yhi) continue;
+        if ((vx == ax && vy == ay) || (vx == bx && vy == by)) continue;  // endpoint
+        ddx = (double)vx - axd;
+        ddy = (double)vy - ayd;
+        t   = (ddx * exd + ddy * eyd) / elen2;
+        along = t * elen;                                 // fixed-unit distance from A
+        if (along < weld_fx || (elen - along) < weld_fx) continue;   // hugs an endpoint
+        {
+            double px = axd + t * exd - (double)vx;
+            double py = ayd + t * eyd - (double)vy;
+            perp2 = px * px + py * py;
+        }
+        if (perp2 > weld_fx * weld_fx) continue;          // not on the edge
+        for (q = 0; q < nins; q++)                        // dedup identical coords
+            if (pool[ins_idx[q]][0] == vx && pool[ins_idx[q]][1] == vy) break;
+        if (q < nins) continue;
+        if (nins < BAKE_PM_MAXV) { ins_idx[nins] = vi; ins_t[nins] = t; nins++; }
+    }
+    for (k = 1; k < nins; k++)                            // insertion sort by t
+    {
+        int    ii = ins_idx[k];
+        double tt = ins_t[k];
+        for (q = k - 1; q >= 0 && ins_t[q] > tt; q--)
+        {
+            ins_idx[q + 1] = ins_idx[q];
+            ins_t[q + 1]   = ins_t[q];
+        }
+        ins_idx[q + 1] = ii;
+        ins_t[q + 1]   = tt;
+    }
+    for (k = 0; k < nins; k++)
+        if (wn < wcap)
+        {
+            w[wn][0] = pool[ins_idx[k]][0];
+            w[wn][1] = pool[ins_idx[k]][1];
+            wn++;
+            (*inserted)++;
+        }
+    return wn;
+}
+
+// Clip a convex fixed-coord polygon to one axis-aligned half-plane (axis 0 = x,
+// 1 = y; keepLE keeps coord <= bound, else >= bound). The intersection is computed
+// in double from the CANONICALIZED edge (smaller (x,y) endpoint leads, so both
+// windings of a shared edge produce the bit-identical cut vertex), and the clip-axis
+// coordinate is snapped exactly onto the grid line.
+static int pm_clip_axis (fixed_t (*in)[2], int n, int axis, double bound,
+                         int keepLE, fixed_t (*out)[2])
+{
+    fixed_t bfx = (fixed_t)bound;
+    int     i, m = 0;
+    for (i = 0; i < n; i++)
+    {
+        fixed_t ax = in[i][0],           ay = in[i][1];
+        fixed_t bx = in[(i + 1) % n][0], by = in[(i + 1) % n][1];
+        fixed_t ca = axis ? ay : ax,     cb = axis ? by : bx;
+        int inA = keepLE ? (ca <= bfx) : (ca >= bfx);
+        int inB = keepLE ? (cb <= bfx) : (cb >= bfx);
+        if (inA && m < BAKE_PM_MAXV + 6) { out[m][0] = ax; out[m][1] = ay; m++; }
+        if (inA != inB && m < BAKE_PM_MAXV + 6)
+        {
+            fixed_t px = ax, py = ay, qx = bx, qy = by;
+            double  t, oxd, oyd;
+            if (qx < px || (qx == px && qy < py))
+            { px = bx; py = by; qx = ax; qy = ay; }       // canonical direction
+            {
+                double p0 = axis ? (double)py : (double)px;
+                double q0 = axis ? (double)qy : (double)qx;
+                t = (bound - p0) / (q0 - p0);
+            }
+            oxd = (double)px + t * ((double)qx - (double)px);
+            oyd = (double)py + t * ((double)qy - (double)py);
+            if (axis) oyd = bound; else oxd = bound;      // exactly on the grid line
+            out[m][0] = (fixed_t)oxd;
+            out[m][1] = (fixed_t)oyd;
+            m++;
+        }
+    }
+    return m;
+}
+
+// Commit one piece. Two-pass: with bake_pmpieces NULL this is the COUNT pass; both
+// passes run identical geometry so the counts match exactly. Slivers (area below
+// ~1/64 map-unit^2, e.g. on-line keeps along a grid border) are dropped.
+static void pm_store_piece (int ss, const bake_leaf_t* lf, fixed_t (*poly)[2], int n)
+{
+    double area2 = 0.0;
+    int    k;
+    if (n < 3 || n > BAKE_PM_MAXV) return;
+    for (k = 0; k < n; k++)
+    {
+        int j = (k + 1) % n;
+        area2 += (double)poly[k][0] * (double)poly[j][1]
+               - (double)poly[j][0] * (double)poly[k][1];
+    }
+    if (area2 < 0.0) area2 = -area2;                      // 2*area in fixed^2
+    if (area2 < 65536.0 * 65536.0 / 32.0) return;         // < 1/64 unit^2 -> sliver
+    if (bake_pmpieces)
+    {
+        bake_pmpiece_t* p = &bake_pmpieces[bake_numpmpieces];
+        int umin = 0x7FFFFFFF, vmin = 0x7FFFFFFF;
+        p->firstvert  = bake_numpmverts;
+        p->numverts   = (short)n;
+        p->subsector  = (short)ss;
+        p->sector     = lf->sector;
+        p->floorpic   = lf->floorpic;
+        p->ceilingpic = lf->ceilingpic;
+        p->pad        = 0;
+        for (k = 0; k < n; k++)
+        {
+            int u = poly[k][0] >> FRACBITS, v = poly[k][1] >> FRACBITS;
+            if (u < umin) umin = u;
+            if (v < vmin) vmin = v;
+            bake_pm_verts[bake_numpmverts][0] = poly[k][0];
+            bake_pm_verts[bake_numpmverts][1] = poly[k][1];
+            bake_numpmverts++;
+        }
+        p->ubias = umin & ~63;
+        p->vbias = vmin & ~63;
+    }
+    else
+        bake_numpmverts += n;
+    bake_numpmpieces++;
+}
+
+static void P_BakeWeldedPlanes (void)
+{
+    fixed_t (*wpool)[2] = NULL;                           // welded polygons (temp)
+    int*      wstart    = NULL;
+    int*      wcount    = NULL;
+    void*     xsort_raw = NULL;
+    int       wcap, wn = 0, ss, pass, e;
+    int       inserted = 0, weld_overflow = 0, maxwv = 0;
+    int       want_pieces = 0, want_verts = 0;
+
+    bake_pmpieces = NULL; bake_numpmpieces = 0;
+    bake_pm_verts = NULL; bake_numpmverts  = 0;
+    if (numsubsectors <= 0 || !bake_leaves || bake_numleafverts <= 0)
+        return;
+
+    // ---- temp pools (PU_STATIC, freed at the end) ----
+    wcap      = bake_numleafverts * 4 + 1024;
+    wpool     = Z_Malloc (sizeof(fixed_t) * 2 * wcap, PU_STATIC, NULL);
+    wstart    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
+    wcount    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
+    xsort_raw = Z_Malloc (sizeof(int) * (bake_numleafverts > 4 ? bake_numleafverts : 4),
+                          PU_STATIC, NULL);
+    pm_xsort  = (int*)xsort_raw;
+    pm_xsort_build (bake_leaf_verts, bake_numleafverts);
+
+    // ---- 1. WELD every leaf polygon against the whole vertex pool ----
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        const bake_leaf_t* lf = &bake_leaves[ss];
+        int n = lf->numverts, base = wn;
+        wstart[ss] = wn; wcount[ss] = 0;
+        if (n < 3) continue;
+        for (e = 0; e < n; e++)
+        {
+            fixed_t ax = bake_leaf_verts[lf->firstvert + e][0];
+            fixed_t ay = bake_leaf_verts[lf->firstvert + e][1];
+            fixed_t bx = bake_leaf_verts[lf->firstvert + (e + 1) % n][0];
+            fixed_t by = bake_leaf_verts[lf->firstvert + (e + 1) % n][1];
+            wn = pm_weld_edge (bake_leaf_verts, lf->firstvert, lf->firstvert + n,
+                               ax, ay, bx, by, wpool, wn,
+                               (base + BAKE_PM_MAXV < wcap) ? base + BAKE_PM_MAXV : wcap,
+                               &inserted);
+        }
+        wcount[ss] = wn - base;
+        if (wcount[ss] > maxwv) maxwv = wcount[ss];
+        if (wcount[ss] >= BAKE_PM_MAXV) weld_overflow++;
+    }
+
+    // ---- 2. GRID CUT each welded polygon; count then store (exact PU_LEVEL) ----
+    for (pass = 0; pass < 2; pass++)
+    {
+        bake_numpmpieces = 0;
+        bake_numpmverts  = 0;
+        for (ss = 0; ss < numsubsectors; ss++)
+        {
+            static fixed_t pa[BAKE_PM_MAXV + 6][2], pb[BAKE_PM_MAXV + 6][2];
+            static fixed_t pc[BAKE_PM_MAXV + 6][2];
+            const bake_leaf_t* lf = &bake_leaves[ss];
+            fixed_t (*src)[2] = &wpool[wstart[ss]];
+            int  n = wcount[ss];
+            int  k, gx, gy, gx0, gx1, gy0, gy1;
+            int  uminu, umaxu, vminu, vmaxu;
+            if (n < 3 || n > BAKE_PM_MAXV) continue;
+            uminu = vminu = 0x7FFFFFFF; umaxu = vmaxu = -0x7FFFFFFF;
+            for (k = 0; k < n; k++)
+            {
+                int u = src[k][0] >> FRACBITS, v = src[k][1] >> FRACBITS;
+                if (u < uminu) uminu = u;
+                if (u > umaxu) umaxu = u;
+                if (v < vminu) vminu = v;
+                if (v > vmaxu) vmaxu = v;
+            }
+            gx0 = uminu >> 9; gx1 = umaxu >> 9;           // >>9 == floor div 512
+            gy0 = vminu >> 9; gy1 = vmaxu >> 9;
+            if (gx0 == gx1 && gy0 == gy1)
+            {
+                pm_store_piece (ss, lf, src, n);          // already inside one cell
+                continue;
+            }
+            for (gy = gy0; gy <= gy1; gy++)
+            {
+                double ylo = (double)gy * BAKE_PM_GRID * 65536.0;
+                double yhi = ylo + BAKE_PM_GRID * 65536.0;
+                for (gx = gx0; gx <= gx1; gx++)
+                {
+                    double xlo = (double)gx * BAKE_PM_GRID * 65536.0;
+                    double xhi = xlo + BAKE_PM_GRID * 65536.0;
+                    int m;
+                    m = pm_clip_axis (src, n, 0, xlo, 0, pa);   // x >= xlo
+                    if (m < 3) continue;
+                    m = pm_clip_axis (pa, m, 0, xhi, 1, pb);    // x <= xhi
+                    if (m < 3) continue;
+                    m = pm_clip_axis (pb, m, 1, ylo, 0, pc);    // y >= ylo
+                    if (m < 3) continue;
+                    m = pm_clip_axis (pc, m, 1, yhi, 1, pa);    // y <= yhi
+                    if (m < 3) continue;
+                    pm_store_piece (ss, lf, pa, m);
+                }
+            }
+        }
+        if (pass == 0)
+        {
+            want_pieces = bake_numpmpieces;
+            want_verts  = bake_numpmverts;
+            if (want_pieces <= 0) break;
+            bake_pmpieces = Z_Malloc (sizeof(bake_pmpiece_t) * want_pieces, PU_LEVEL, NULL);
+            bake_pm_verts = Z_Malloc (sizeof(fixed_t) * 2 * want_verts, PU_LEVEL, NULL);
+        }
+    }
+
+    // ---- 3. SELF-CHECKS on the final pools (printed every load; TJUNC must be 0) ----
+    {
+        int tjunc = 0, spanmax = 0, maxpv = 0, pi;
+        double chk_fx = BAKE_PM_CHK_EPS * 65536.0;
+        if (bake_numpmverts > 0)
+        {
+            if (bake_numpmverts > bake_numleafverts)
+            {
+                Z_Free (xsort_raw);
+                xsort_raw = Z_Malloc (sizeof(int) * bake_numpmverts, PU_STATIC, NULL);
+                pm_xsort  = (int*)xsort_raw;
+            }
+            pm_xsort_build (bake_pm_verts, bake_numpmverts);
+        }
+        for (pi = 0; pi < bake_numpmpieces; pi++)
+        {
+            const bake_pmpiece_t* p = &bake_pmpieces[pi];
+            int k;
+            if (p->numverts > maxpv) maxpv = p->numverts;
+            for (k = 0; k < p->numverts; k++)
+            {
+                int span_u = (bake_pm_verts[p->firstvert + k][0] >> FRACBITS) - p->ubias;
+                int span_v = (bake_pm_verts[p->firstvert + k][1] >> FRACBITS) - p->vbias;
+                if (span_u > spanmax) spanmax = span_u;
+                if (span_v > spanmax) spanmax = span_v;
+            }
+            for (k = 0; k < p->numverts; k++)
+            {
+                fixed_t ax = bake_pm_verts[p->firstvert + k][0];
+                fixed_t ay = bake_pm_verts[p->firstvert + k][1];
+                fixed_t bx = bake_pm_verts[p->firstvert + (k + 1) % p->numverts][0];
+                fixed_t by = bake_pm_verts[p->firstvert + (k + 1) % p->numverts][1];
+                double  axd = (double)ax, ayd = (double)ay;
+                double  exd = (double)bx - axd, eyd = (double)by - ayd;
+                double  elen2 = exd * exd + eyd * eyd, elen = sqrt (elen2);
+                fixed_t xlo = (ax < bx ? ax : bx) - (fixed_t)(chk_fx + 1.0);
+                fixed_t xhi = (ax > bx ? ax : bx) + (fixed_t)(chk_fx + 1.0);
+                fixed_t ylo = (ay < by ? ay : by) - (fixed_t)(chk_fx + 1.0);
+                fixed_t yhi = (ay > by ? ay : by) + (fixed_t)(chk_fx + 1.0);
+                int     s;
+                if (elen2 < 1.0) continue;
+                for (s = pm_xsort_lower (bake_pm_verts, xlo); s < pm_xsort_n; s++)
+                {
+                    int     vi = pm_xsort[s];
+                    fixed_t vx = bake_pm_verts[vi][0], vy = bake_pm_verts[vi][1];
+                    double  t, ddx, ddy, px, py, along;
+                    if (vx > xhi) break;
+                    if (vy < ylo || vy > yhi) continue;
+                    if (vi >= p->firstvert && vi < p->firstvert + p->numverts) continue;
+                    if ((vx == ax && vy == ay) || (vx == bx && vy == by)) continue;
+                    ddx = (double)vx - axd; ddy = (double)vy - ayd;
+                    t   = (ddx * exd + ddy * eyd) / elen2;
+                    along = t * elen;
+                    if (along < chk_fx || (elen - along) < chk_fx) continue;
+                    px = axd + t * exd - (double)vx;
+                    py = ayd + t * eyd - (double)vy;
+                    if (px * px + py * py <= chk_fx * chk_fx) tjunc++;
+                }
+            }
+        }
+        debugf ("P_BakeWeldedPlanes: pieces=%d verts=%d (want %d/%d) maxv=%d "
+                "weld_ins=%d weld_maxv=%d weld_ovf=%d TJUNC=%d spanmax=%d/%d\n",
+                bake_numpmpieces, bake_numpmverts, want_pieces, want_verts, maxpv,
+                inserted, maxwv, weld_overflow, tjunc, spanmax,
+                BAKE_PM_GRID + 63);
+        if (tjunc != 0)
+            debugf ("P_BakeWeldedPlanes: *** TJUNC=%d NONZERO -- the weld failed; "
+                    "DO NOT draw from this pool ***\n", tjunc);
+    }
+
+    Z_Free (xsort_raw);
+    Z_Free (wcount);
+    Z_Free (wstart);
+    Z_Free (wpool);
+    pm_xsort = NULL;
+    pm_xsort_n = 0;
 }
 
 //

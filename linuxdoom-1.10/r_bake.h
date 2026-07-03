@@ -76,6 +76,35 @@ extern int            bake_numleaves;
 extern fixed_t      (*bake_leaf_verts)[2]; // shared convex-polygon vertex pool (map x,y)
 extern int            bake_numleafverts;
 
+// One piece of the WELDED plane mesh (Docs/GPU_PORT_PLAN.md §THE GOAL): the geometry
+// is FINISHED at level load. Every leaf polygon is first WELDED against its
+// neighbours (any vertex lying on an edge is inserted into that edge with the
+// neighbour's exact coordinates, so adjacent pieces share edge endpoints
+// bit-for-bit -- zero T-junctions), then cut ONCE on the fixed BAKE_PM_GRID world
+// grid with direction-canonicalized intersection arithmetic (both sides of a shared
+// edge compute the identical cut vertex). Each piece carries a STATIC 64-aligned
+// S/T bias; its texel span is bounded by the grid size by construction. The runtime
+// only culls, transforms, and draws -- it never cuts these polygons (per-frame
+// cutting produces neighbour-inconsistent edges = the jagged seams / flicker the
+// user rejected). Z is not stored: heights are read live per frame (doors/lifts).
+typedef struct
+{
+    int     firstvert;  // index into bake_pm_verts
+    short   numverts;   // convex polygon vertex count (>=3)
+    short   subsector;  // owning subsector (per-frame vis via bake_leafvis[ss])
+    short   sector;     // owning sector (live floor/ceiling height + light)
+    short   floorpic;   // flat lump for the floor   (skyflatnum => skip at draw)
+    short   ceilingpic; // flat lump for the ceiling (skyflatnum => skip at draw)
+    short   pad;
+    int     ubias;      // floor(min world-texel x / 64)*64 -- STATIC S period bias
+    int     vbias;      // floor(min world-texel y / 64)*64 -- STATIC T period bias
+} bake_pmpiece_t;
+
+extern bake_pmpiece_t* bake_pmpieces;      // PU_LEVEL, welded+grid-cut plane pieces
+extern int             bake_numpmpieces;
+extern fixed_t       (*bake_pm_verts)[2]; // shared piece vertex pool (map x,y)
+extern int             bake_numpmverts;
+
 // Per-subsector visibility, set during the BSP walk (R_Subsector marks each leaf it
 // reaches) and consumed by DL_MeshDrawLeaves so only visible leaves transform/draw.
 // PU_LEVEL, sized numsubsectors. Reset each frame (R_MeshResetLeafVis).
