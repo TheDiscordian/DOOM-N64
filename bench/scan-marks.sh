@@ -77,7 +77,12 @@ if [ "$booted" -eq 0 ]; then
     exit 3   # trap cleanup EXIT reaps the empty ares window
 fi
 
-GEOM="$(hyprctl clients -j 2>/dev/null | python3 -c "
+# Query the ares window geometry FRESH before every capture: on a tiling WM
+# an active user opening/closing windows RETILES ares mid-run, so a geometry
+# grabbed once at boot goes stale and later grims capture the user's other
+# windows instead of the game (three contaminated capture sets on 2026-07-03).
+ares_geom() {
+    hyprctl clients -j 2>/dev/null | python3 -c "
 import json,sys
 best=None
 for c in json.load(sys.stdin):
@@ -89,7 +94,9 @@ for c in json.load(sys.stdin):
     if cl=='ares' or ic=='ares':
         x,y=c['at']; w,h=c['size']
         if w>200 and h>150: best=f'{x},{y} {w}x{h}'
-print(best or '')")"
+print(best or '')"
+}
+GEOM="$(ares_geom)"
 echo "scan-marks: GEOM=[$GEOM]"
 [ -z "$GEOM" ] && echo "scan-marks: WARNING no ares window found (will grim full screen)" >&2
 
@@ -101,6 +108,7 @@ while [ "$SECONDS" -lt "$end" ]; do
     fr="$(grep -oE 'BENCH_MARK frame=[0-9]+' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+$')"
     if [ -n "$fr" ] && [ "$fr" != "$seen" ]; then
         seen="$fr"; last_new="$SECONDS"
+        GEOM="$(ares_geom)"          # re-query: tiling may have moved/resized ares
         if [ -n "$GEOM" ]; then grim -g "$GEOM" "$OUT/frame-$fr.png" 2>/dev/null
         else grim "$OUT/frame-$fr.png" 2>/dev/null; fi
         n=$(( n + 1 )); echo "scan-marks: captured frame-$fr (n=$n)"
