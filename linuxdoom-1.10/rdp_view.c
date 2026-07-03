@@ -7802,14 +7802,20 @@ void DL_Flush(void)
     if (dl_touched_count > 0)
         I_N64UploadMasterTLUT();
 
-    // Z-only seg silhouettes: written while the walls' z mode is still up, before
-    // anything that z-tests. Self-gates on pmesh + a masked/sprite consumer.
-    DL_DrawZSkirts();
-
     // GPU port Phase 3: draw the baked floor leaf fans here -- WHILE the Z-buffer is
     // still enabled, so the walls just drawn occlude the floors correctly. Same world
     // textured mode (TEX0*PRIM, persp on). Self-gates on DL_MeshRouteOn + a z-image.
     DL_DrawMeshLeaves();
+
+    // Z-only seg silhouettes AFTER the planes, BEFORE masked/sprites. Software
+    // treats the two classes differently below a step edge: the floor beyond a
+    // step-down IS visible under the ledge-edge row (visplanes have their own
+    // column clips), while sprites there are NOT (SIL_BOTTOM). One z-value
+    // can't serve both, but order can: planes never see skirt z (found at
+    // capture frame 768 -- the room floor beyond a doorway step z-failed
+    // against the doorway's bottom skirt and left black wedges); sprites and
+    // masked, drawn after, still get the silhouette occlusion.
+    DL_DrawZSkirts();
 
     // Phase B: masked midtextures, Z-tested against the opaque world just drawn
     // (alpha-compare keys out the transparent texels -- no colour, no Z write).
