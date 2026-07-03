@@ -654,26 +654,59 @@ section records what changed and why, so the history is auditable:
 - **GATE: the user's eye — pending.**
 
 ### Phase C: sprites on Z — built + machine-verified (2026-07-03)
-- `BENCH_FORCE_MESH_SPRITES` (preset `mesh-sprites` = A+B+C, commits
-  `5cdfc4a`..`50fa41e`): vissprites collected at `R_DrawMasked` time (already
-  sorted far→near) into a present-time arena; `DL_DrawSpriteQuads` draws them
-  after the masked pass, Z-tested + Z-written under alpha-compare. World Z
-  resolves occlusion — the drawseg sprite-clip arrays are no longer consumed by
-  regular sprites. Per-patch CI4 blocks (Phase B recipe: post walk, 15 colours +
-  key, halved to <=64x64, one load). Sprites are constant-depth screen-aligned
-  quads: S/T are linear in screen space, so the Y-guard clip is exact. Flat
-  per-sprite light from the vissprite colormap level (fullbright works). Fuzz
-  (MF_SHADOW) + weapon psprites stay software.
-- **Three boot defects found + fixed by the protocol:** missing `m_swap.h`
+- `BENCH_FORCE_MESH_SPRITES` (preset `mesh-sprites` = A+B+C): vissprites
+  collected at `R_DrawMasked` time (already sorted far→near) into a
+  present-time arena; `DL_DrawSpriteQuads` draws them after the masked pass
+  under alpha-compare. Per-patch **CI8 full-fidelity blocks** (`0e4b9ca`):
+  exact PLAYPAL indices at native resolution, transparency key = an index the
+  sprite never uses, private 256-entry master-TLUT copy (tracks palette
+  flashes), T-banded through TMEM at draw. Sprites are constant-depth
+  screen-aligned quads: S/T linear in screen space, Y-guard clip exact. Flat
+  per-sprite light from the vissprite colormap level. Fuzz (MF_SHADOW) +
+  weapon psprites stay software.
+- **Boot defects found + fixed by the protocol:** missing `m_swap.h`
   (SHORT/LONG link failure); the aligned(8) TLUT member vs Z_Malloc's 4-byte
   guarantee (misaligned doubleword store trap — fixed by 8-aligning both cache
   bases, latent in Phase B too); arbitrary sprite widths vs the 8-byte TMEM
-  pitch rule (pitch padded to 16 texels).
-- **Verification:** full demo completes; explosion/monster/pickup sprites render
-  at software's positions and composite through Z; void scan clean (frames 0 +
-  3213 only). Perf 19172/38112 (sprite columns left the CPU; ~neutral overall).
-- **Slice-1 limitations:** large sprites (explosions) visibly chunkier from the
-  half-res blocks; >128px sprites refused to software; colour-translation
-  (multiplayer suits) not wired; fuzz still consumes drawseg clips — Phase D
-  must move or accept it.
-- **GATE: the user's eye — pending.**
+  pitch rule; +28 KB of link-time BSS starving I_InitGraphics' scratch screens
+  (`9b0df43` — renderer caches must live in the zone, not BSS).
+- **The Z policy took five iterations to get right (2026-07-03).** The user
+  caught wrong sprite colours (CI4 15-colour quantization hue-shifted the
+  zombieman — replaced by CI8, verified by pixel values). A blast at capture
+  frame 2816 lost its right half; the defect survived four theories, each
+  disproven by a machine check: sprite z-write holes (`be73c82` — bbox
+  byte-identical), constant z-bias (`13b7315` — byte-identical), PU_CACHE
+  eviction mid-scatter (`af98f9e` — the SPRBLK FNV-1a hash cross-checked
+  against a host WAD decode matched 79/79 pinned AND 78/78 unpinned, so the
+  blocks were never corrupt; the pin stays as defence), and plane z-write
+  (`c391a91` — truncation unchanged with planes z-test-only). The z16 probe
+  then showed the occluder at ~8 map units vs the blast at ~10.6: the camera
+  was hugging an oblique wall. **Software's occlusion is line-based, not
+  ray-based** — `R_DrawSprite` clips against a seg only when the sprite is on
+  the seg's FAR side (`R_PointOnSegSide`), so software draws the blast over
+  the nearer wall pixels and no constant bias can reproduce that. Fix
+  (`2b20b7e`): z-test per sprite — only when a visible line overlaps its
+  columns, is nearer, and has the sprite on its far side. Sprites never
+  z-write (co-located blast pairs resolve by painter order).
+- **Supporting architecture (same date):** planes z-test only, painted
+  back-to-front by height — exact for horizontal planes (`c391a91`); z-only
+  seg silhouette skirts reproduce SIL_BOTTOM/SIL_TOP at the line's depth
+  (`800b112`); masked z-writes explicitly. The z-buffer sprites test against
+  is exactly software's silhouette set: walls + skirts + masked.
+- **Verification (2026-07-03, screen-free under the locked session):**
+  `BENCH_MARK_FBSCAN` banded warm-pixel bbox of the VI-displayed framebuffer +
+  raw z16 probe rows (`be16203`, `800b112`), measured in the ares log. Frame
+  2816 bands 0/1 right edge: software 181/194 (host-measured on the frozen
+  refs), old builds 167/170, fixed build **181/195** with pixel counts
+  matching the no-z-test control. All 36 marks diffed old-vs-new: every
+  changed frame moved TOWARD the software reference (frame 1792's clipped
+  sprite top restored; frame 384's spurious warm pixels gone). Full demo
+  completes; teardown clean on every run.
+- **Slice-1 limitations:** >256-wide sprites refused (none in DOOM1);
+  colour-translation (multiplayer suits) not wired; fuzz still consumes
+  drawseg clips — Phase D must move or accept it; the per-sprite z decision
+  is per-sprite, not per-column, so a sprite simultaneously hugging a near
+  wall AND legitimately clipped by a far-side line keeps the z-test (software
+  would split per column; not observed on E1M1's marks).
+- **GATE: the user's eye — pending (screenshot galleries queued for after the
+  session unlocks; the lockscreen blocked all display capture tonight).**
