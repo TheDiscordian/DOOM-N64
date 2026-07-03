@@ -6030,8 +6030,11 @@ typedef struct {
     float sxlo, sxhi;           // clipped screen-x interval
     float mindepth;             // nearest view depth over that interval
 } dl_soccl_t;
-static dl_soccl_t dl_soccl[1024];
-static int        dl_soccl_count;
+#define DL_SOCCL_MAX 1024
+static dl_soccl_t* dl_soccl;    // [DL_SOCCL_MAX], zone-owned: +28 KB of BSS at
+                                // link time starved I_InitGraphics' scratch
+                                // screen (memory is THAT tight; alloc lazily)
+static int         dl_soccl_count;
 
 // Collect this frame's candidate occluder lines once (view transform + guard
 // clip per marked line); sprites then test against the compact list.
@@ -6044,6 +6047,11 @@ static void DL_SpriteOcclBuild (void)
     dl_soccl_count = 0;
     if (!bake_linevis)
         return;
+    if (!dl_soccl)
+    {
+        void* raw = Z_Malloc(DL_SOCCL_MAX * sizeof(dl_soccl_t) + 7, PU_STATIC, 0);
+        dl_soccl = (dl_soccl_t*)(((uintptr_t)raw + 7) & ~(uintptr_t)7);
+    }
     vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
     vsin = finesine[viewangle >> ANGLETOFINESHIFT];
     vxf = (float)viewx * (1.0f / 65536.0f);
@@ -6062,7 +6070,7 @@ static void DL_SpriteOcclBuild (void)
         dl_soccl_t* oc;
 
         if (!bake_linevis[li]) continue;
-        if (dl_soccl_count >= (int)(sizeof dl_soccl / sizeof dl_soccl[0])) break;
+        if (dl_soccl_count >= DL_SOCCL_MAX) break;
         ln = &lines[li];
         ax = (float)ln->v1->x * (1.0f / 65536.0f);
         ay = (float)ln->v1->y * (1.0f / 65536.0f);
