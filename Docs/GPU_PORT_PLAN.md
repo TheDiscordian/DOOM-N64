@@ -625,3 +625,30 @@ section records what changed and why, so the history is auditable:
   cannot show motion-class defects; the user declined a live run for now — re-offer
   when convenient). ROMs: `/tmp/pmesh-timing.z64`, `/tmp/pmesh-marks2.z64`;
   captures `/tmp/cap/pmesh/`, comparison panels `/tmp/cap/cmp/`.
+
+### Phase B: masked midtextures on Z — built + machine-verified (2026-07-03)
+- `BENCH_FORCE_MESH_MASKED` (preset `mesh-pmesh-masked`, commits `48f1431`..`3ef077b`):
+  baked midtex quads (`P_BakeMidtex`, 13 on E1M1; opening resolves LIVE from both
+  sectors), drawn by `DL_DrawMaskedQuads` after the opaque world — Z-tested +
+  Z-written under RDP alpha-compare. The masked CI4 block cache post-walks the
+  columns, keeps the 15 most frequent opaque colours, reserves index 15 as the
+  TLUT-alpha-0 key: transparent texels write neither colour nor Z, so no sorting.
+  Per-corner scalelight distance light; segment t-interval clips (near/side/Y).
+  Software `R_RenderMaskedSegRange` suppressed; drawsegs remain for sprites.
+- **Two defects found + fixed during the protocol:** (1) CI4 blocks cannot be
+  LOAD_TILE'd directly — first boot crashed the RDP ("4-bit VRAM pointer"); fixed
+  with the wall path's I8-byte-view two-step load (`0a1e6d1`). (2) Grates carry the
+  midtexture on BOTH sidedefs; drawing both quads z-fought a mirrored-S copy over
+  the correct one (grate rendered displaced at frame 512) — fixed by drawing only
+  the viewer-facing side per vanilla's `R_PointOnSide` convention (`3ef077b`).
+- **Verification (agent protocol — NOT the acceptance gate):** full 4117-frame demo
+  completes; frame-512 grate matches software's position/pattern/transparency in
+  the registered zoom; capture sweep shows no new deltas vs the pmesh build beyond
+  sprite sub-states; void scan clean (only frames 0 + 3213). Perf: 19344/38432
+  (+0.6% over `mesh-pmesh` — 13 quads).
+- **Slice-1 limitations (recorded, graceful):** blocks point-sample-halved to
+  <=64x64 (soft grates at close range); >128-wide/tall masked textures refused
+  (none on E1M1); multi-patch masked behaves as vanilla (Medusa-class parity);
+  masked can Z-leak over SOFTWARE-drawn walls (movable-sector exclusions write no
+  Z) — resolved when Phases C/D put everything on Z.
+- **GATE: the user's eye — pending.**
