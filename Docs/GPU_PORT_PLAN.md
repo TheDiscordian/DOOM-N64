@@ -798,3 +798,22 @@ toggles cost pipeline syncs (partition the arena into ON/OFF runs while
 preserving far→near order within each — or accept, sprites are ~20/frame).
 Correctness first was the standing order; none of these levers may regress
 the Phase C fidelity wins.
+
+### Fidelity backlog from the user's full-A/B review (2026-07-03)
+All three classes verified PRE-EXISTING (identical dark-pixel counts in the
+pre-skirt build) — surfaced by the first full uncurated A/B gallery:
+- **Wall↔plane junction seams/dots** — thin black lines/dots where walls meet
+  floors/ceilings (frames 1280, 1664, 1792, 2048, 2176), worst on distant
+  junctions. Rasterization gaps between the wall quads' bottom/top edges and
+  the welded plane polygons (separate primitives, independent edge walks; the
+  bake welds planes to each other, not planes to walls). Candidate fixes:
+  extend wall quads a hair past the junction, or emit junction-sealing
+  fillets in the bake.
+- **Hidden/secret door misses the CI4 damage flash** (frame 2176) — one wall
+  class stays untinted while the world flashes red. Suspect: its texture block
+  skips the lazy DL_RetintSubPalettes path (movable-wall texture cached under
+  a different upload site?).
+- **Global brightness: RDP renders a bit brighter than software** (most
+  frames) — the distance-light curve approximation (scalelight vs the
+  per-vertex gouraud model). Needs a curve-matching pass against software's
+  zlight/scalelight tables.
