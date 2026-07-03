@@ -363,6 +363,39 @@ static int pm_xsort_lower (fixed_t (*pool)[2], fixed_t x0)
     return lo;
 }
 
+// Tight AABB (fixed map units) of a sector over its linedef vertices. The floor's
+// real footprint is inside it; a peripheral BSP leaf's polygon can extend far past
+// it (up to the +/-32768 map bounds, where partition edges have no segs). That
+// overhang is void-side geometry -- trimming to the bbox BEFORE welding drops it
+// (and the thousands of junk grid pieces + the 2^31 grid-bound overflow it caused).
+// Trim lines live in the void or under the map's outer walls, so a trim cut never
+// borders a drawn piece. Returns 0 if the sector has no lines (leave untrimmed).
+static int pm_sector_bbox (int sec, fixed_t* xlo, fixed_t* ylo, fixed_t* xhi, fixed_t* yhi)
+{
+    const sector_t* s;
+    fixed_t lx = 0x7FFFFFFF, ly = 0x7FFFFFFF, hx = -0x7FFFFFFF, hy = -0x7FFFFFFF;
+    int     i, k;
+    if ((unsigned)sec >= (unsigned)numsectors) return 0;
+    s = &sectors[sec];
+    if (s->linecount <= 0 || !s->lines) return 0;
+    for (i = 0; i < s->linecount; i++)
+    {
+        const line_t* ln = s->lines[i];
+        fixed_t vx[2], vy[2];
+        vx[0] = ln->v1->x; vy[0] = ln->v1->y;
+        vx[1] = ln->v2->x; vy[1] = ln->v2->y;
+        for (k = 0; k < 2; k++)
+        {
+            if (vx[k] < lx) lx = vx[k];
+            if (vx[k] > hx) hx = vx[k];
+            if (vy[k] < ly) ly = vy[k];
+            if (vy[k] > hy) hy = vy[k];
+        }
+    }
+    *xlo = lx; *ylo = ly; *xhi = hx; *yhi = hy;
+    return 1;
+}
+
 // WELD one edge (A,B) of a leaf: append A, then every foreign pool vertex lying
 // strictly inside the segment (within BAKE_PM_WELD_EPS of the line, at least
 // WELD_EPS from both endpoints), in order along the edge, using the vertex's EXACT
@@ -444,8 +477,17 @@ static int pm_weld_edge (fixed_t (*pool)[2], int selfstart, int selfend,
 static int pm_clip_axis (fixed_t (*in)[2], int n, int axis, double bound,
                          int keepLE, fixed_t (*out)[2])
 {
-    fixed_t bfx = (fixed_t)bound;
+    // Clamp before converting: a peripheral leaf keeps the +/-32768 map-bounds
+    // corners, so the outermost grid cell's far edge is exactly 2^31 in fixed --
+    // unrepresentable, and the VR4300 FPU TRAPS on the out-of-range double->int
+    // conversion (this was a boot crash). Both sides of a shared edge clamp to
+    // the identical value, so determinism holds.
+    double  bc = bound;
+    fixed_t bfx;
     int     i, m = 0;
+    if (bc >  2147483647.0) bc =  2147483647.0;
+    if (bc < -2147483648.0) bc = -2147483648.0;
+    bfx = (fixed_t)bc;
     for (i = 0; i < n; i++)
     {
         fixed_t ax = in[i][0],           ay = in[i][1];
@@ -463,11 +505,11 @@ static int pm_clip_axis (fixed_t (*in)[2], int n, int axis, double bound,
             {
                 double p0 = axis ? (double)py : (double)px;
                 double q0 = axis ? (double)qy : (double)qx;
-                t = (bound - p0) / (q0 - p0);
+                t = (bc - p0) / (q0 - p0);
             }
             oxd = (double)px + t * ((double)qx - (double)px);
             oyd = (double)py + t * ((double)qy - (double)py);
-            if (axis) oyd = bound; else oxd = bound;      // exactly on the grid line
+            if (axis) oyd = bc; else oxd = bc;            // exactly on the clip line
             out[m][0] = (fixed_t)oxd;
             out[m][1] = (fixed_t)oyd;
             m++;
@@ -522,11 +564,14 @@ static void pm_store_piece (int ss, const bake_leaf_t* lf, fixed_t (*poly)[2], i
 
 static void P_BakeWeldedPlanes (void)
 {
+    fixed_t (*tpool)[2] = NULL;                           // footprint-trimmed polys (temp)
     fixed_t (*wpool)[2] = NULL;                           // welded polygons (temp)
+    int*      tstart    = NULL;
+    int*      tcount    = NULL;
     int*      wstart    = NULL;
     int*      wcount    = NULL;
     void*     xsort_raw = NULL;
-    int       wcap, wn = 0, ss, pass, e;
+    int       tcap, tn = 0, wcap, wn = 0, ss, pass, e;
     int       inserted = 0, weld_overflow = 0, maxwv = 0;
     int       want_pieces = 0, want_verts = 0;
 
@@ -536,29 +581,64 @@ static void P_BakeWeldedPlanes (void)
         return;
 
     // ---- temp pools (PU_STATIC, freed at the end) ----
-    wcap      = bake_numleafverts * 4 + 1024;
+    tcap      = bake_numleafverts + numsubsectors * 8 + 64;
+    wcap      = tcap * 4 + 1024;
+    tpool     = Z_Malloc (sizeof(fixed_t) * 2 * tcap, PU_STATIC, NULL);
+    tstart    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
+    tcount    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
     wpool     = Z_Malloc (sizeof(fixed_t) * 2 * wcap, PU_STATIC, NULL);
     wstart    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
     wcount    = Z_Malloc (sizeof(int) * numsubsectors, PU_STATIC, NULL);
-    xsort_raw = Z_Malloc (sizeof(int) * (bake_numleafverts > 4 ? bake_numleafverts : 4),
-                          PU_STATIC, NULL);
+    xsort_raw = Z_Malloc (sizeof(int) * (tcap > 4 ? tcap : 4), PU_STATIC, NULL);
     pm_xsort  = (int*)xsort_raw;
-    pm_xsort_build (bake_leaf_verts, bake_numleafverts);
 
-    // ---- 1. WELD every leaf polygon against the whole vertex pool ----
+    // ---- 0. TRIM each leaf polygon to its sector's real footprint (kill the
+    //         map-bounds overhang of peripheral leaves before it reaches the weld) ----
     for (ss = 0; ss < numsubsectors; ss++)
     {
+        static fixed_t ta[BAKE_PM_MAXV + 6][2], tb[BAKE_PM_MAXV + 6][2];
         const bake_leaf_t* lf = &bake_leaves[ss];
-        int n = lf->numverts, base = wn;
+        fixed_t bxlo, bylo, bxhi, byhi;
+        int n = lf->numverts, k, m;
+        tstart[ss] = tn; tcount[ss] = 0;
+        if (n < 3 || n > BAKE_PM_MAXV) continue;
+        for (k = 0; k < n; k++)
+        {
+            ta[k][0] = bake_leaf_verts[lf->firstvert + k][0];
+            ta[k][1] = bake_leaf_verts[lf->firstvert + k][1];
+        }
+        m = n;
+        if (pm_sector_bbox (lf->sector, &bxlo, &bylo, &bxhi, &byhi))
+        {
+            m = pm_clip_axis (ta, m, 0, (double)bxlo, 0, tb);              // x >= xlo
+            m = (m >= 3) ? pm_clip_axis (tb, m, 0, (double)bxhi, 1, ta) : 0; // x <= xhi
+            m = (m >= 3) ? pm_clip_axis (ta, m, 1, (double)bylo, 0, tb) : 0; // y >= ylo
+            m = (m >= 3) ? pm_clip_axis (tb, m, 1, (double)byhi, 1, ta) : 0; // y <= yhi
+        }
+        if (m < 3) continue;
+        for (k = 0; k < m && tn < tcap; k++)
+        {
+            tpool[tn][0] = ta[k][0];
+            tpool[tn][1] = ta[k][1];
+            tn++;
+        }
+        tcount[ss] = tn - tstart[ss];
+    }
+    pm_xsort_build (tpool, tn);
+
+    // ---- 1. WELD every trimmed polygon against the whole trimmed vertex pool ----
+    for (ss = 0; ss < numsubsectors; ss++)
+    {
+        int n = tcount[ss], base = wn;
         wstart[ss] = wn; wcount[ss] = 0;
         if (n < 3) continue;
         for (e = 0; e < n; e++)
         {
-            fixed_t ax = bake_leaf_verts[lf->firstvert + e][0];
-            fixed_t ay = bake_leaf_verts[lf->firstvert + e][1];
-            fixed_t bx = bake_leaf_verts[lf->firstvert + (e + 1) % n][0];
-            fixed_t by = bake_leaf_verts[lf->firstvert + (e + 1) % n][1];
-            wn = pm_weld_edge (bake_leaf_verts, lf->firstvert, lf->firstvert + n,
+            fixed_t ax = tpool[tstart[ss] + e][0];
+            fixed_t ay = tpool[tstart[ss] + e][1];
+            fixed_t bx = tpool[tstart[ss] + (e + 1) % n][0];
+            fixed_t by = tpool[tstart[ss] + (e + 1) % n][1];
+            wn = pm_weld_edge (tpool, tstart[ss], tstart[ss] + n,
                                ax, ay, bx, by, wpool, wn,
                                (base + BAKE_PM_MAXV < wcap) ? base + BAKE_PM_MAXV : wcap,
                                &inserted);
@@ -636,7 +716,7 @@ static void P_BakeWeldedPlanes (void)
         double chk_fx = BAKE_PM_CHK_EPS * 65536.0;
         if (bake_numpmverts > 0)
         {
-            if (bake_numpmverts > bake_numleafverts)
+            if (bake_numpmverts > tcap)
             {
                 Z_Free (xsort_raw);
                 xsort_raw = Z_Malloc (sizeof(int) * bake_numpmverts, PU_STATIC, NULL);
@@ -704,6 +784,9 @@ static void P_BakeWeldedPlanes (void)
     Z_Free (wcount);
     Z_Free (wstart);
     Z_Free (wpool);
+    Z_Free (tcount);
+    Z_Free (tstart);
+    Z_Free (tpool);
     pm_xsort = NULL;
     pm_xsort_n = 0;
 }
