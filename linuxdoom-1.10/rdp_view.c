@@ -5096,7 +5096,7 @@ static void DL_DrawPMeshPlanes (void)
 {
     extern fixed_t yslope[SCREENHEIGHT];
     static int vis[4096];
-    static int flats[256];
+    static int viskey[4096];
     fixed_t     vcos, vsin;
     dl_pm_ctx_t cx;
     float KL, KR, viewzf;
@@ -5139,50 +5139,79 @@ static void DL_DrawPMeshPlanes (void)
     }
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);          // texel * gouraud distance light
     rdpq_mode_persp(true);
+    // Z-TEST against the walls, but do NOT Z-WRITE. Software DOOM never
+    // occludes sprites with planes -- only wall-seg silhouettes clip them --
+    // so a plane depth left in the z-buffer wrongly z-kills any sprite pixel
+    // whose ray passes near a ceiling/floor surface (found at capture frame
+    // 2816: a blast's right side vanished under the ceiling's Z). Plane-over-
+    // plane overlap (ledge edges) is resolved by PAINT ORDER instead, which
+    // for horizontal planes is exact: along any ray, floors are hit
+    // higher-first and ceilings lower-first, so height is a total order.
+    rdpq_mode_zbuf(true, false);
 
     for (surf = 0; surf < 2; surf++)
     {
-        int nvis = 0, nflat = 0, vi, fi;
+        int nvis = 0, vi, curflat = -1, badflat = -1;
         for (pi2 = 0; pi2 < bake_numpmpieces; pi2++)
         {
             bake_pmpiece_t* p = &bake_pmpieces[pi2];
             fixed_t height;
-            int pic, fl, j, seen;
+            int pic, hkey;
             if (!bake_leafvis[p->subsector]) continue;    // Phase-A vis seed (BSP walk)
             pic = surf ? sectors[p->sector].ceilingpic : sectors[p->sector].floorpic;
             if (pic == skyflatnum) continue;              // sky stays on the CPU path
             height = surf ? sectors[p->sector].ceilingheight
                           : sectors[p->sector].floorheight;
             if (surf ? (height <= viewz) : (height >= viewz)) continue;  // backface
-            if (nvis < (int)(sizeof vis / sizeof vis[0])) vis[nvis++] = pi2;
-            fl = flattranslation[pic];
-            seen = 0;
-            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
-            if (!seen && nflat < 256) flats[nflat++] = fl;
+            if (nvis >= (int)(sizeof vis / sizeof vis[0])) continue;
+            // Back-to-front paint key: ascending = farthest-hit first (floors
+            // low->high, ceilings high->low). Flat id as the minor key keeps
+            // equal-height pieces batched on one TMEM load.
+            hkey = (int)(height >> FRACBITS);             // [-32768, 32767]
+            hkey = surf ? (32767 - hkey) : (hkey + 32768);
+            viskey[nvis] = (hkey << 12) | (flattranslation[pic] & 0xFFF);
+            vis[nvis++]  = pi2;
         }
 
-        for (fi = 0; fi < nflat; fi++)
-        {
-            int   flatidx = flats[fi];
-            byte* block   = DL_FlatBlock(flatidx);
-            if (!block) continue;
-            DL_FlatMarkInFlight(flatidx);
-            {
-                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
-                rdpq_set_texture_image(&fs);
-            }
-            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);
+        {   // shell sort, keys and piece indices moving together
+            int gap, a, b;
+            for (gap = nvis / 2; gap > 0; gap /= 2)
+                for (a = gap; a < nvis; a++)
+                {
+                    int kk = viskey[a], vv = vis[a];
+                    for (b = a; b >= gap && viskey[b - gap] > kk; b -= gap)
+                    {
+                        viskey[b] = viskey[b - gap];
+                        vis[b]    = vis[b - gap];
+                    }
+                    viskey[b] = kk; vis[b] = vv;
+                }
+        }
 
-            for (vi = 0; vi < nvis; vi++)
-            {
+        for (vi = 0; vi < nvis; vi++)
+        {
                 bake_pmpiece_t* p = &bake_pmpieces[vis[vi]];
                 float   pw[96][2];
                 int     pin[96];
                 fixed_t height, phfix;
                 float   ya, yb, yc, yedge;
-                int     n = p->numverts, k, allin, anynear, pic;
+                int     n = p->numverts, k, allin, anynear, pic, flatidx;
                 pic = surf ? sectors[p->sector].ceilingpic : sectors[p->sector].floorpic;
-                if (flattranslation[pic] != flatidx) continue;
+                flatidx = flattranslation[pic];           // full id, not the 12-bit key
+                if (flatidx == badflat) continue;
+                if (flatidx != curflat)
+                {
+                    byte* block = DL_FlatBlock(flatidx);
+                    if (!block) { badflat = flatidx; continue; }
+                    DL_FlatMarkInFlight(flatidx);
+                    {
+                        surface_t fs = surface_make_linear(block, FMT_CI8,
+                                                           DL_FLAT_W, DL_FLAT_H);
+                        rdpq_set_texture_image(&fs);
+                    }
+                    rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);
+                    curflat = flatidx;
+                }
                 if (n < 3 || n > 96) continue;
                 height = surf ? sectors[p->sector].ceilingheight
                               : sectors[p->sector].floorheight;   // LIVE (doors/lifts)
@@ -5251,7 +5280,6 @@ static void DL_DrawPMeshPlanes (void)
                     if (m < 3) continue;
                     drew += DL_PMEmitPoly(&cx, (const float (*)[2])cb_, m);
                 }
-            }
         }
     }
 
@@ -5487,6 +5515,11 @@ static void DL_DrawMaskedQuads(void)
     // one-time pass state; per-texture TLUT slot 15 + tile bound on switch
     rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
     rdpq_mode_persp(true);
+    // Z-test AND z-write: masked midtex are wall-like -- software clips
+    // sprites against masked segs, so their opaque texels must occlude the
+    // sprite pass (alpha-compare keeps transparent texels out of the z-buffer).
+    // Explicit because the plane pass before this one runs test-only.
+    rdpq_mode_zbuf(true, true);
     rdpq_set_blend_color(RGBA32(0, 0, 0, 128));
     rdpq_mode_alphacompare(128);                // kill key texels (no colour, no Z)
 
