@@ -60,7 +60,15 @@ static uint64_t         bench_virtual_iter;   // render-loop iterations elapsed
 // and renders uncapped (~55 fps), so frame count tops out near 3300. Size the
 // ring generously; frames past the cap are still counted in the histogram/avg
 // but not retained for the tail report (never reached in practice).
+#if defined(BSPWALK_PROBE) || defined(RDPWAIT_PROBE) || defined(PVS_PROBE)
+// Probe builds bloat the frame record (per-frame tail fields) and RDRAM is at
+// the ceiling (2026-07-03: the CI8 sprite cache ate the slack; scratch-screen
+// alloc dies at boot). Trade the last quarter of tail samples for booting at
+// all -- probe runs answer breakdown SHARES, not canonical numbers.
+#define BENCH_MAX_FRAMES    3072
+#else
 #define BENCH_MAX_FRAMES    4096
+#endif
 
 // us above which a frame is treated as a level-load outlier (death/respawn
 // reload), not a render frame: excluded from tail stats, reported separately.

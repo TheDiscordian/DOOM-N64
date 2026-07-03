@@ -710,3 +710,79 @@ section records what changed and why, so the history is auditable:
   would split per column; not observed on E1M1's marks).
 - **GATE: the user's eye — pending (screenshot galleries queued for after the
   session unlocks; the lockscreen blocked all display capture tonight).**
+
+### Phase D design (2026-07-03) — traversal, sky, fuzz, and what blocks it
+Written before implementation; numbers from the 2026-06-24 BSPWALK_PROBE
+(mesh-floors) because the probe build no longer fits in memory (below).
+
+**The prize.** Strip-able walk CPU on the current path = `addline_net`
+(874us mean / 3147us tail) + recursion/`R_FindPlane` glue (~745/~1417) +
+`checkbbox` stays (204/583) — roughly **1.6 ms mean / 4.6 ms tail** of pure
+visibility work, plus the whole `seg_rast` clip-array fill that only sky and
+fuzz still consume. `DL_MeshDrawWalls` (36% of bsp_walk) is NOT Phase D's
+target — that is the RSP-emit keystone's lever.
+
+**Traversal.** Replace `R_RenderBSPNode`→`R_AddLine`→solidsegs with a
+frustum-only node walk: keep `R_CheckBBox` node pruning verbatim, visit every
+surviving subsector front-to-back, and per subsector (a) mark `bake_leafvis`,
+(b) call `R_AddSprites(frontsector)`, (c) per seg with a linedef: facing test
++ frustum overlap → mark `bake_linevis` + set `ML_MAPPED`. No solidsegs, no
+per-seg angle clipping, no drawsegs, no openings, no visplanes. Occlusion is
+entirely the z-buffer's job (walls + skirts + masked — the Phase C
+architecture already assumes exactly this set). Overdraw is the risk the plan
+already flags: conservatively-visible leaves/walls behind walls get drawn and
+z-discarded. The REJECT lever: PVS_PROBE measures how much a sector-granular
+REJECT filter would cull of the frustum-visited set (numbers below when the
+probe fits or the bench array shrinks for a probe run).
+
+**Sky.** With the walk gone there are no sky visplanes — and none are needed:
+draw the sky FIRST as an angle-mapped screen quad with z-test and z-write
+OFF, then let the world paint over it. Sky remains wherever skyflat surfaces
+left holes (pmesh already skips `picnum==skyflatnum`), which is exactly
+DOOM's semantics (sky = background through skyflat holes). Software maps
+column→texture as `(viewangle + xtoviewangle[x]) >> ANGLETOSKYSHIFT`;
+`xtoviewangle` is arctan-shaped, so one quad's linear S would warp the sky —
+split into 16 x-strips with the exact per-edge S and the interpolation error
+drops under a texel. CI8 block for the 256x128 sky patch, T-banded like
+sprites. Its own slice with its own eye gate.
+
+**Fuzz (MF_SHADOW).** The last drawseg consumer. Options: (a) keep software
+fuzz — then `R_StoreWallRange` + clip arrays must survive just for spectres,
+which keeps most of the walk alive and defeats the phase; (b) fuzz on Z —
+draw the sprite quad alpha-keyed with a screen-space dither/decimation
+(fuzzoffset-style column jitter is reproducible in the combiner/blender with
+a noise or checkerboard alpha), z-tested like any sprite. (b) is the design
+choice; it changes fuzz appearance subtly and gets its OWN eye-gated slice
+before the walk dies. Weapon psprites stay software (screen-space, no world
+clip).
+
+**Order of slices.** D1 sky (kills sky visplanes; walk still on) → D2 fuzz on
+Z (kills the last drawseg consumer; walk still on) → D3 the traversal switch
+(`BENCH_FORCE_MESH_WALK`), at which point `R_AddLine`/`R_StoreWallRange`/
+`R_RenderSegLoop`/visplane construction stop being called on mesh builds —
+delete after the eye gate + perf gate pass. Automap and demos must be checked
+on D3 (ML_MAPPED semantics move to the traversal's facing+frustum mark).
+
+**Memory ceiling (found 2026-07-03).** The RDRAM budget is now exactly at the
+edge: +28 KB of BSS killed `I_InitGraphics` scratch-screen allocation (fixed
+by moving the sprite occluder list into the zone, `9b0df43`), and the
+BSPWALK_PROBE build (per-frame probe fields across the ~4.1k-frame bench
+array) no longer boots at all — same scratch-screen death. The CI8 sprite
+cache (`0e4b9ca`) holds every drawn sprite lump at native res + a 512-byte
+TLUT each (~250 KB on the E1M1 demo) with no demote schedule. Levers, in
+order: a sprite-block demote schedule (the wall/flat pattern), probe builds
+shrinking the bench frame array, and auditing the CI8 blocks for lumps drawn
+once (eviction candidates).
+
+**Perf debt from the Phase C correctness architecture (2026-07-03).**
+`mesh-sprites` 21029/44448 vs 19172/38112 before the plane/skirt/line-rule
+changes (baseline `mesh` 17667/32416). Known costs and their levers: the
+height-major plane sort breaks flat batching (re-batch by flat WITHIN equal
+heights — already the minor key; measure how many switches remain), skirt
+quads add RDP fill (gate on lines with an actual live step; skip lines whose
+screen interval is empty), the occluder list rebuilds per frame (rebuild only
+when viewangle/viewx/viewy changed beyond epsilon), and per-sprite zbuf
+toggles cost pipeline syncs (partition the arena into ON/OFF runs while
+preserving far→near order within each — or accept, sprites are ~20/frame).
+Correctness first was the standing order; none of these levers may regress
+the Phase C fidelity wins.
