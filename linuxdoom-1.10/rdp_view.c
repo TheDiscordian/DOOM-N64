@@ -5676,6 +5676,152 @@ int DL_MaskedPending (void)
 }
 
 // ===========================================================================
+// Z-SKIRTS: software's sprite occlusion is the wall-seg SILHOUETTES -- at a
+// two-sided step boundary the seg clips everything below the opening bottom
+// (SIL_BOTTOM) / above the opening top (SIL_TOP) at the SEG's depth, even
+// though no wall pixel is drawn there. With the plane pass no longer writing
+// Z, these quads reproduce that: for every visible two-sided line, write the
+// line's depth (colour untouched) below the opening bottom edge and above the
+// opening top edge. A sprite in front of the line keeps winning (nearer Z); a
+// sprite beyond it loses exactly where software's clip arrays would cut it.
+// Z is constant per column on a vertical line, so the off-edge end of each
+// quad simply extends to the screen guard -- no world-space extent exists.
+// ===========================================================================
+static void DL_DrawZSkirts (void)
+{
+    fixed_t vcos, vsin;
+    float vxf, vyf, vcosf, vsinf, cxf, cyf, viewzf;
+    float KL, KR, ytop_lim, ybot_lim;
+    int   li, drew = 0;
+
+    if (!n64_rdp_mesh_pmesh || !DL_MeshRouteOn() || !bake_linevis || !dl_wall_z)
+        return;
+    if (!(n64_rdp_mesh_masked || n64_rdp_mesh_sprites))
+        return;                                  // nothing z-tests after the planes
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    vxf = (float)viewx * (1.0f / 65536.0f);
+    vyf = (float)viewy * (1.0f / 65536.0f);
+    vcosf = (float)vcos * (1.0f / 65536.0f);
+    vsinf = (float)vsin * (1.0f / 65536.0f);
+    cxf = (float)centerx;
+    cyf = (float)centery;
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+    KL = (cxf + DL_PM_GUARDX) / cxf;
+    KR = ((float)SCREENWIDTH - cxf + DL_PM_GUARDX) / cxf;
+    ytop_lim = -(float)DL_PM_GUARDY;
+    ybot_lim = (float)SCREENHEIGHT + (float)DL_PM_GUARDY;
+
+    // Z-only draw: the blender passes MEMORY through untouched, the z-buffer
+    // takes the skirt depth for pixels that pass the test.
+    rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+    rdpq_mode_persp(false);
+    rdpq_mode_zbuf(true, true);
+    rdpq_mode_alphacompare(0);
+    rdpq_mode_blender(RDPQ_BLENDER((IN_RGB, ZERO, MEMORY_RGB, ONE)));
+
+    for (li = 0; li < numlines; li++)
+    {
+        line_t*   ln;
+        sector_t *sf, *sb;
+        fixed_t   openbot, opentop;
+        float ax, ay, bx, by, dA, dB, lA, lB, t0, t1;
+        float dt0, dt1, lt0, lt1, x0s, x1s, sc0, sc1, z0, z1;
+        float ybe0, ybe1, yte0, yte1;
+
+        if (!bake_linevis[li]) continue;
+        ln = &lines[li];
+        if (!ln->backsector) continue;
+        sf = ln->frontsector; sb = ln->backsector;
+        openbot = (sf->floorheight > sb->floorheight) ? sf->floorheight
+                                                      : sb->floorheight;
+        opentop = (sf->ceilingheight < sb->ceilingheight) ? sf->ceilingheight
+                                                          : sb->ceilingheight;
+        if (opentop <= openbot) continue;        // closed: the walls own it
+
+        ax = (float)ln->v1->x * (1.0f / 65536.0f);
+        ay = (float)ln->v1->y * (1.0f / 65536.0f);
+        bx = (float)ln->v2->x * (1.0f / 65536.0f);
+        by = (float)ln->v2->y * (1.0f / 65536.0f);
+        dA = (ax - vxf) * vcosf + (ay - vyf) * vsinf;
+        dB = (bx - vxf) * vcosf + (by - vyf) * vsinf;
+        lA = (ay - vyf) * vcosf - (ax - vxf) * vsinf;
+        lB = (by - vyf) * vcosf - (bx - vxf) * vsinf;
+
+        // clip the segment's t-interval vs near + side guards (linear in t)
+        t0 = 0.0f; t1 = 1.0f;
+        {
+            float f0, f1, planes[3][2];
+            int   pl2;
+            planes[0][0] = dA - DL_PM_NEARZ;   planes[0][1] = dB - DL_PM_NEARZ;
+            planes[1][0] = KL * dA - lA;       planes[1][1] = KL * dB - lB;
+            planes[2][0] = KR * dA + lA;       planes[2][1] = KR * dB + lB;
+            for (pl2 = 0; pl2 < 3; pl2++)
+            {
+                f0 = planes[pl2][0]; f1 = planes[pl2][1];
+                if (f0 < 0.0f && f1 < 0.0f) { t0 = 1.0f; t1 = 0.0f; break; }
+                if (f0 < 0.0f) { float t = f0 / (f0 - f1); if (t > t0) t0 = t; }
+                if (f1 < 0.0f) { float t = f0 / (f0 - f1); if (t < t1) t1 = t; }
+            }
+        }
+        if (t0 >= t1) continue;
+
+        dt0 = dA + t0 * (dB - dA); dt1 = dA + t1 * (dB - dA);
+        lt0 = lA + t0 * (lB - lA); lt1 = lA + t1 * (lB - lA);
+        sc0 = cxf / dt0;  sc1 = cxf / dt1;
+        x0s = cxf - lt0 * sc0;  x1s = cxf - lt1 * sc1;
+        z0 = DL_WallZ(1.0f / dt0);  z1 = DL_WallZ(1.0f / dt1);
+
+        {
+            float eb = (float)openbot * (1.0f / 65536.0f) - viewzf;
+            float et = (float)opentop * (1.0f / 65536.0f) - viewzf;
+            ybe0 = cyf - eb * sc0;  ybe1 = cyf - eb * sc1;
+            yte0 = cyf - et * sc0;  yte1 = cyf - et * sc1;
+            if (ybe0 < ytop_lim) ybe0 = ytop_lim;
+            if (ybe0 > ybot_lim) ybe0 = ybot_lim;
+            if (ybe1 < ytop_lim) ybe1 = ytop_lim;
+            if (ybe1 > ybot_lim) ybe1 = ybot_lim;
+            if (yte0 < ytop_lim) yte0 = ytop_lim;
+            if (yte0 > ybot_lim) yte0 = ybot_lim;
+            if (yte1 < ytop_lim) yte1 = ytop_lim;
+            if (yte1 > ybot_lim) yte1 = ybot_lim;
+        }
+
+        {
+            float va[3], vb[3], vc[3], vd[3];
+            if (ybe0 < ybot_lim || ybe1 < ybot_lim)   // bottom skirt
+            {
+                va[0] = x0s; va[1] = ybe0;     va[2] = z0;
+                vb[0] = x1s; vb[1] = ybe1;     vb[2] = z1;
+                vc[0] = x0s; vc[1] = ybot_lim; vc[2] = z0;
+                vd[0] = x1s; vd[1] = ybot_lim; vd[2] = z1;
+                rdpq_triangle(&TRIFMT_ZBUF, va, vb, vc);
+                rdpq_triangle(&TRIFMT_ZBUF, vb, vd, vc);
+                drew += 2;
+            }
+            if (yte0 > ytop_lim || yte1 > ytop_lim)   // top skirt
+            {
+                va[0] = x0s; va[1] = ytop_lim; va[2] = z0;
+                vb[0] = x1s; vb[1] = ytop_lim; vb[2] = z1;
+                vc[0] = x0s; vc[1] = yte0;     vc[2] = z0;
+                vd[0] = x1s; vd[1] = yte1;     vd[2] = z1;
+                rdpq_triangle(&TRIFMT_ZBUF, va, vb, vc);
+                rdpq_triangle(&TRIFMT_ZBUF, vb, vd, vc);
+                drew += 2;
+            }
+        }
+    }
+    rdpq_mode_blender(0);
+
+    {
+        static unsigned zs_n = 0;
+        if ((zs_n++ & 511) == 0)
+            debugf("MESH-ZSKIRT: silhouette tris=%d (z-only)\n", drew);
+    }
+}
+
+// ===========================================================================
 // Phase C (GPU_PORT_PLAN): SPRITES on Z. Billboard quads at the vissprite's
 // screen extents, Z-tested against the world, alpha-keyed like the masked pass
 // (per-patch CI4 block, key index 15, TLUT alpha 0). Sprites are constant-depth
@@ -7514,6 +7660,10 @@ void DL_Flush(void)
     // the CI8 sprites/HUD/COPY blit; this is the in-flush synchronous counterpart.
     if (dl_touched_count > 0)
         I_N64UploadMasterTLUT();
+
+    // Z-only seg silhouettes: written while the walls' z mode is still up, before
+    // anything that z-tests. Self-gates on pmesh + a masked/sprite consumer.
+    DL_DrawZSkirts();
 
     // GPU port Phase 3: draw the baked floor leaf fans here -- WHILE the Z-buffer is
     // still enabled, so the walls just drawn occlude the floors correctly. Same world

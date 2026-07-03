@@ -71,6 +71,11 @@ static boolean n64_aux_screen_owned[3];
 // LOAD_TLUT can never see a rewrite, however fast the palette churns.
 static uint16_t doom_tlut_master[256];
 
+// Bench z-probe access (BENCH_MARK_FBSCAN): the mesh z-buffer's base + width,
+// published when the z-image is allocated below. NULL when no z-image exists.
+byte* i_n64_zbuf_base = NULL;
+int   i_n64_zbuf_w    = 0;
+
 // Palette GENERATION: bumped ONLY when I_SetPalette actually rewrites the master
 // (a real palette/flash change -- damage red, pickup, radsuit green, invuln). The
 // CI4 wall pass reads this to re-tint its sub-palettes when the flash changes, so
@@ -1314,6 +1319,8 @@ void I_FinishUpdate(void)
             {
                 byte* al = (byte*)(((uint32_t)(uintptr_t)raw + 63u) & ~63u);
                 dl_zbuf = surface_make_linear(al, FMT_RGBA16, zw, zh);
+                i_n64_zbuf_base = al;            // bench z-probe (BENCH_MARK_FBSCAN)
+                i_n64_zbuf_w    = zw;
             }
             dl_zbuf_ready = (raw != NULL);
             debugf("GPU-PORT zbuf via Z_Malloc %dx%d -> %s\n", zw, zh,

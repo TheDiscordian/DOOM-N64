@@ -837,6 +837,30 @@ void N64Bench_LoopEnd(void)
                        bench_frame_count, band, n, x0, x1, y0, y1);
             }
         }
+        {
+            // Raw z16 probe (same flag): two rows across the view centre. At a
+            // truncated-sprite pixel the value IS the occluder's depth; compared
+            // against a neighbouring drawn pixel it identifies what z-killed it.
+            extern byte* i_n64_zbuf_base;
+            extern int   i_n64_zbuf_w;
+            if (i_n64_zbuf_base)
+            {
+                volatile uint16_t* zb = (volatile uint16_t*)
+                    (0xA0000000u | ((uint32_t)(uintptr_t)i_n64_zbuf_base & 0x1FFFFFFFu));
+                static const int rows[2] = { 60, 80 };
+                int ri, x;
+                for (ri = 0; ri < 2; ri++)
+                {
+                    char lbuf[200];
+                    int  o = sprintf(lbuf, "BENCH_ZPROBE frame=%lu y=%d z=",
+                                     bench_frame_count, rows[ri]);
+                    for (x = 144; x <= 208; x += 4)
+                        o += sprintf(lbuf + o, "%04x,",
+                                     zb[rows[ri] * i_n64_zbuf_w + x]);
+                    debugf("%s\n", lbuf);
+                }
+            }
+        }
 #endif
 
         // FREEZE-AT-MARKER: hold ~2 wall-clock seconds before returning to
