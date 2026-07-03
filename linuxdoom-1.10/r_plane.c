@@ -1608,7 +1608,8 @@ void R_DrawPlanes (void)
 	// visplane -- the mesh leaves are the sole source and the per-frame visplane
 	// tessellation they replace is the CPU cost this targets. Sky stays on the
 	// existing path (mesh leaves skip sky pics).
-	if ((n64_rdp_mesh_floors || n64_rdp_mesh_worldz) && pl->picnum != skyflatnum)
+	if ((n64_rdp_mesh_floors || n64_rdp_mesh_worldz || n64_rdp_mesh_pmesh)
+	    && pl->picnum != skyflatnum)
 	    continue;
 #endif
 

@@ -159,6 +159,15 @@ endif
 ifeq ($(BENCH_FORCE_MESH_WORLDZ),1)
 CFLAGS += -DBENCH_FORCE_MESH_WORLDZ=1
 endif
+#   BENCH_FORCE_MESH_PMESH=1 -> THE GOAL (GPU_PORT_PLAN): draw floors/ceilings from
+#   the WELDED plane mesh baked at level load (P_BakeWeldedPlanes: welded shared
+#   vertices, fixed 512-grid cut, static per-piece S/T bias). Runtime = cull +
+#   transform + per-vertex distance light + CPU rdpq_triangle; per-TRIANGLE
+#   canonical near/side clips only -- the polygons are never re-cut. Suppresses
+#   non-sky poly planes.
+ifeq ($(BENCH_FORCE_MESH_PMESH),1)
+CFLAGS += -DBENCH_FORCE_MESH_PMESH=1
+endif
 #   BENCH_FORCE_MESH_CULL=1 -> the mesh's OWN visibility: mark walls by frustum (every
 #   wall in a frustum-visible subsector) instead of the BSP solidsegs occlusion. Wall-Z
 #   handles overdraw. First step toward replacing the per-seg BSP occlusion walk.

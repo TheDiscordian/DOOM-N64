@@ -2443,6 +2443,8 @@ int n64_rdp_mesh_floors = 0;// BENCH_FORCE_MESH_FLOORS gate -- Phase 3 floor lea
                             // default mesh build keeps the validated wall-only perf.
 int n64_rdp_mesh_worldz = 0;// BENCH_FORCE_MESH_WORLDZ: Option 3 Phase A candidate -- draw
                             // floor/ceiling leaves as opaque Z-tested world geometry.
+int n64_rdp_mesh_pmesh  = 0;// BENCH_FORCE_MESH_PMESH: THE GOAL -- draw the WELDED plane
+                            // mesh (bake_pmpieces); the runtime never cuts the polygons.
 int dl_wall_z       = 0;    // mesh wall pass: draw with the Z-buffer (set in DL_Flush)
 int dl_zbuf_attached = 0;   // set by i_video each frame: 1 iff a z-image is attached
 
@@ -4962,6 +4964,285 @@ static void DL_WZShade4(int level, float out[4])
     out[3] = 1.0f;
 }
 
+// ===========================================================================
+// THE GOAL runtime (Docs/GPU_PORT_PLAN.md §THE GOAL): draw the WELDED plane
+// mesh (bake_pmpieces). Cull + transform + light + draw ONLY -- the baked
+// polygons are never re-cut. A triangle crossing the near/side guard planes is
+// clipped per TRIANGLE in 2D WORLD space: every plane attribute (depth,
+// lateral, S, T) is linear in world XY, so the clip is exact; the clip edges
+// are direction-canonicalized, so the two triangles sharing an edge derive the
+// bit-identical clip vertex and runtime clips cannot crack the welds. No depth
+// bands, no dynamic bias: S/T ride the piece's STATIC baked bias (span bounded
+// by the bake, self-checked TJUNC=0/spanmax at load).
+// ===========================================================================
+#define DL_PM_NEARZ   6.0f     // true near (map units), matches the wall path margin
+#define DL_PM_GUARDX  160.0f   // off-screen slack (px) before the side guard planes
+
+typedef struct {
+    float   vxf, vyf, vcosf, vsinf, cxf, cyf;  // view constants (cyf = centery)
+    float   hf;                                // surface height - viewz (map units)
+    int     ubias, vbias;                      // piece static S/T bias (texels)
+    int     lightlevel;
+    fixed_t distclamp;                         // planeheight*yslope[edge row]
+} dl_pm_ctx_t;
+
+// Distance light from the vertex's own VIEW DEPTH: R_MapPlane's distance =
+// planeheight*yslope[row] IS the view depth of the plane point on that row, so
+// no projection round-trip is needed. distclamp reproduces the screen-edge row
+// clamp of the poly/software path (a vertex projecting past the bottom/top edge
+// lights as if on the edge row; exact for interior vertices via the max()).
+static int DL_PMLightLevel (int lightlevel, fixed_t dist, fixed_t distclamp)
+{
+    extern int extralight;
+    extern lighttable_t* fixedcolormap;
+    int      lnum;
+    unsigned zi;
+    long     lv;
+    if (fixedcolormap) {
+        lv = (fixedcolormap - colormaps) / 256;
+        if (lv < 0) lv = 0;
+        if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+        return (int)lv;
+    }
+    if (dist < distclamp) dist = distclamp;
+    lnum = (lightlevel >> LIGHTSEGSHIFT) + extralight;
+    if (lnum < 0) lnum = 0;
+    if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+    zi = (unsigned)dist >> LIGHTZSHIFT;
+    if (zi >= MAXLIGHTZ) zi = MAXLIGHTZ - 1;
+    lv = (zlight[lnum][zi] - colormaps) / 256;
+    if (lv < 0) lv = 0;
+    if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+    return (int)lv;
+}
+
+// Clip a small world-space polygon to the half-plane a*x + b*y + c <= 0.
+// Canonicalized edges (smaller (x,y) endpoint leads): both triangles sharing an
+// edge compute the identical intersection, so runtime clips preserve the welds.
+static int DL_PMClip (const float (*in)[2], int n, float a, float b, float c,
+                      float (*out)[2])
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++)
+    {
+        float ax = in[i][0],           ay = in[i][1];
+        float bx = in[(i + 1) % n][0], by = in[(i + 1) % n][1];
+        float fa = a * ax + b * ay + c;
+        float fb = a * bx + b * by + c;
+        int   ina = (fa <= 0.0f), inb = (fb <= 0.0f);
+        if (ina && m < 12) { out[m][0] = ax; out[m][1] = ay; m++; }
+        if (ina != inb && m < 12)
+        {
+            float px = ax, py = ay, qx = bx, qy = by, fp, fq, t;
+            if (qx < px || (qx == px && qy < py))
+            { px = bx; py = by; qx = ax; qy = ay; }
+            fp = a * px + b * py + c;
+            fq = a * qx + b * qy + c;
+            t  = fp / (fp - fq);
+            out[m][0] = px + t * (qx - px);
+            out[m][1] = py + t * (qy - py);
+            m++;
+        }
+    }
+    return m;
+}
+
+// Project + light + emit one convex world-space polygon as a fan.
+static int DL_PMEmitPoly (const dl_pm_ctx_t* cx, const float (*poly)[2], int m)
+{
+    static float vx[96][10];   // {X,Y,Z, R,G,B,A, S,T, INV_W}; single-threaded
+    int k, t, drew = 0;
+    if (m < 3 || m > 96) return 0;
+    for (k = 0; k < m; k++)
+    {
+        float dx = poly[k][0] - cx->vxf, dy = poly[k][1] - cx->vyf;
+        float depth = dx * cx->vcosf + dy * cx->vsinf;
+        float lat   = dy * cx->vcosf - dx * cx->vsinf;
+        float invw, sc;
+        int   lvl;
+        if (depth < 1.0f) depth = 1.0f;        // clip guarantees >= NEARZ; safety only
+        invw = 1.0f / depth;
+        sc   = cx->cxf * invw;
+        lvl  = DL_PMLightLevel (cx->lightlevel, (fixed_t)(depth * 65536.0f),
+                                cx->distclamp);
+        DL_WZShade4 (lvl, &vx[k][3]);
+        vx[k][0] = cx->cxf - lat * sc;
+        vx[k][1] = cx->cyf - cx->hf * sc;
+        vx[k][2] = DL_WallZ (invw);
+        vx[k][7] = poly[k][0] - (float)cx->ubias;
+        vx[k][8] = (poly[k][1] - (float)cx->vbias) * 0.5f;   // 64->32 decimated flat
+        vx[k][9] = invw;
+    }
+    for (t = 1; t < m - 1; t++)
+    {
+        rdpq_triangle (&TRIFMT_ZBUF_SHADE_TEX, vx[0], vx[t], vx[t + 1]);
+        drew++;
+    }
+    return drew;
+}
+
+static void DL_DrawPMeshPlanes (void)
+{
+    extern fixed_t yslope[SCREENHEIGHT];
+    static int vis[4096];
+    static int flats[256];
+    fixed_t     vcos, vsin;
+    dl_pm_ctx_t cx;
+    float KL, KR, viewzf;
+    float na, nb, nc, la, lb, lc, ra, rb, rc;   // near/left/right guard half-planes
+    int   surf, pi2, drew = 0;
+
+    if (!n64_rdp_mesh_pmesh || !DL_MeshRouteOn() || !bake_pmpieces || !bake_leafvis
+        || !dl_wall_z)
+        return;
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    cx.vxf   = (float)viewx * (1.0f / 65536.0f);
+    cx.vyf   = (float)viewy * (1.0f / 65536.0f);
+    cx.vcosf = (float)vcos * (1.0f / 65536.0f);
+    cx.vsinf = (float)vsin * (1.0f / 65536.0f);
+    cx.cxf   = (float)centerx;
+    cx.cyf   = (float)centery;
+    viewzf   = (float)viewz * (1.0f / 65536.0f);
+
+    // px = centerx - lat*(centerx/depth): keep px within +/-GUARDX of the screen
+    // <=>  lat <= KL*depth  and  -lat <= KR*depth  (in front of the near plane).
+    KL = (cx.cxf + DL_PM_GUARDX) / cx.cxf;
+    KR = ((float)SCREENWIDTH - cx.cxf + DL_PM_GUARDX) / cx.cxf;
+    na = -cx.vcosf; nb = -cx.vsinf;                       // NEARZ - depth <= 0
+    nc = DL_PM_NEARZ + cx.vcosf * cx.vxf + cx.vsinf * cx.vyf;
+    la = -cx.vsinf - KL * cx.vcosf;                       // lat - KL*depth <= 0
+    lb =  cx.vcosf - KL * cx.vsinf;
+    lc = -(la * cx.vxf + lb * cx.vyf);
+    ra =  cx.vsinf - KR * cx.vcosf;                       // -lat - KR*depth <= 0
+    rb = -cx.vcosf - KR * cx.vsinf;
+    rc = -(ra * cx.vxf + rb * cx.vyf);
+
+    {
+        rdpq_tileparms_t tp;
+        memset(&tp, 0, sizeof(tp));
+        tp.s.mask = 6;
+        tp.t.mask = 5;
+        rdpq_set_tile(TILE0, FMT_CI8, 0, 64, &tp);
+    }
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);          // texel * gouraud distance light
+    rdpq_mode_persp(true);
+
+    for (surf = 0; surf < 2; surf++)
+    {
+        int nvis = 0, nflat = 0, vi, fi;
+        for (pi2 = 0; pi2 < bake_numpmpieces; pi2++)
+        {
+            bake_pmpiece_t* p = &bake_pmpieces[pi2];
+            fixed_t height;
+            int pic, fl, j, seen;
+            if (!bake_leafvis[p->subsector]) continue;    // Phase-A vis seed (BSP walk)
+            pic = surf ? sectors[p->sector].ceilingpic : sectors[p->sector].floorpic;
+            if (pic == skyflatnum) continue;              // sky stays on the CPU path
+            height = surf ? sectors[p->sector].ceilingheight
+                          : sectors[p->sector].floorheight;
+            if (surf ? (height <= viewz) : (height >= viewz)) continue;  // backface
+            if (nvis < (int)(sizeof vis / sizeof vis[0])) vis[nvis++] = pi2;
+            fl = flattranslation[pic];
+            seen = 0;
+            for (j = 0; j < nflat; j++) if (flats[j] == fl) { seen = 1; break; }
+            if (!seen && nflat < 256) flats[nflat++] = fl;
+        }
+
+        for (fi = 0; fi < nflat; fi++)
+        {
+            int   flatidx = flats[fi];
+            byte* block   = DL_FlatBlock(flatidx);
+            if (!block) continue;
+            DL_FlatMarkInFlight(flatidx);
+            {
+                surface_t fs = surface_make_linear(block, FMT_CI8, DL_FLAT_W, DL_FLAT_H);
+                rdpq_set_texture_image(&fs);
+            }
+            rdpq_load_tile(TILE0, 0, 0, DL_FLAT_W, DL_FLAT_H);
+
+            for (vi = 0; vi < nvis; vi++)
+            {
+                bake_pmpiece_t* p = &bake_pmpieces[vis[vi]];
+                float   pw[96][2];
+                int     pin[96];
+                fixed_t height, phfix;
+                int     n = p->numverts, k, allin, anynear, pic;
+                pic = surf ? sectors[p->sector].ceilingpic : sectors[p->sector].floorpic;
+                if (flattranslation[pic] != flatidx) continue;
+                if (n < 3 || n > 96) continue;
+                height = surf ? sectors[p->sector].ceilingheight
+                              : sectors[p->sector].floorheight;   // LIVE (doors/lifts)
+                cx.hf = (float)height * (1.0f / 65536.0f) - viewzf;
+                phfix = height - viewz;
+                if (phfix < 0) phfix = -phfix;
+                cx.distclamp  = FixedMul(phfix, yslope[surf ? 0 : viewheight - 1]);
+                cx.lightlevel = sectors[p->sector].lightlevel;
+                cx.ubias = p->ubias;
+                cx.vbias = p->vbias;
+
+                allin = 1; anynear = 0;
+                for (k = 0; k < n; k++)
+                {
+                    float x = (float)bake_pm_verts[p->firstvert + k][0] * (1.0f / 65536.0f);
+                    float y = (float)bake_pm_verts[p->firstvert + k][1] * (1.0f / 65536.0f);
+                    int in_ = 1;
+                    pw[k][0] = x; pw[k][1] = y;
+                    if (na * x + nb * y + nc > 0.0f) in_ = 0; else anynear = 1;
+                    if (la * x + lb * y + lc > 0.0f) in_ = 0;
+                    if (ra * x + rb * y + rc > 0.0f) in_ = 0;
+                    pin[k] = in_;
+                    if (!in_) allin = 0;
+                }
+                if (!anynear) continue;                   // whole piece behind near
+                if (allin)
+                {
+                    drew += DL_PMEmitPoly(&cx, (const float (*)[2])pw, n);
+                    continue;
+                }
+                // Piece crosses a guard plane: clip per TRIANGLE (fan chords and
+                // border edges alike get canonical, neighbour-identical cuts).
+                for (k = 1; k < n - 1; k++)
+                {
+                    float tri[3][2], ca_[12][2], cb_[12][2];
+                    int m;
+                    tri[0][0] = pw[0][0];     tri[0][1] = pw[0][1];
+                    tri[1][0] = pw[k][0];     tri[1][1] = pw[k][1];
+                    tri[2][0] = pw[k + 1][0]; tri[2][1] = pw[k + 1][1];
+                    if (pin[0] && pin[k] && pin[k + 1])
+                    {
+                        drew += DL_PMEmitPoly(&cx, (const float (*)[2])tri, 3);
+                        continue;
+                    }
+                    m = DL_PMClip((const float (*)[2])tri, 3, na, nb, nc, ca_);
+                    if (m < 3) continue;
+                    m = DL_PMClip((const float (*)[2])ca_, m, la, lb, lc, cb_);
+                    if (m < 3) continue;
+                    m = DL_PMClip((const float (*)[2])cb_, m, ra, rb, rc, ca_);
+                    if (m < 3) continue;
+                    drew += DL_PMEmitPoly(&cx, (const float (*)[2])ca_, m);
+                }
+            }
+        }
+    }
+
+    dl_leaf_tris = drew;
+    {
+        static unsigned pm_n = 0;
+        if ((pm_n++ & 511) == 0)
+            debugf("MESH-PMESH: plane tris=%d (welded static mesh, no runtime cutting)\n",
+                   dl_leaf_tris);
+    }
+}
+
+// Welded-plane work queued this frame -- the I_FinishUpdate render-gate term.
+// Exists in every build (n64_rdp_mesh_pmesh stays 0 unless BENCH_FORCE_MESH_PMESH).
+int DL_PMeshPending (void)
+{
+    return (n64_rdp_mesh_pmesh && bake_leafvis_count > 0) ? 1 : 0;
+}
+
 static void DL_DrawWorldZPlanes(void)
 {
     fixed_t vcos, vsin;
@@ -5621,6 +5902,11 @@ static void DL_DrawMeshLeaves(void)
     static unsigned char* leaf_cull = NULL;     // [numsubsectors]: 1 = skip this frame
     static int            leaf_cull_cap = 0;
 
+    if (n64_rdp_mesh_pmesh)
+    {
+        DL_DrawPMeshPlanes();     // THE GOAL: welded static mesh, no runtime cutting
+        return;
+    }
     if (n64_rdp_mesh_worldz)
     {
         DL_DrawWorldZPlanes();

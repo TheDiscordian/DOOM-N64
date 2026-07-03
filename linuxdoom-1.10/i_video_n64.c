@@ -1353,7 +1353,11 @@ void I_FinishUpdate(void)
     // no door/movable wall and no routed plane in view) reads 0 here and SKIPS both the
     // colour-clear below and DL_Flush -> the 3-frames-ago 16bpp fb shows through the keyed
     // present -> whole-view motion ghost. 0 in non-RSP-emit builds (gate byte-identical).
-    if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount() + DL_RSPEmitPending()) > 0)
+    // DL_PMeshPending(): welded-plane pieces draw inside DL_Flush from the bake pool,
+    // counted by none of the other terms -- a floors-only frame must still colour-clear
+    // + flush or the triple-buffered fb ghosts (same failure class as RSP-emit walls).
+    if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount() + DL_RSPEmitPending()
+                   + DL_PMeshPending()) > 0)
     {
         int vx0 = viewwindowx;
         int vy0 = viewwindowy;

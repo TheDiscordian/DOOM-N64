@@ -1033,14 +1033,21 @@ void R_MeshMarkLine (int lineidx)
 // ceiling leaf fans, mirroring the wall line-vis. Reset before the BSP walk; R_Subsector
 // marks each leaf it reaches so DL_MeshDrawLeaves transforms only visible leaves.
 //
+int bake_leafvis_count = 0;     // marks this frame (welded-plane render-gate term)
+
 void R_MeshResetLeafVis (void)
 {
     if (bake_leafvis)
         memset (bake_leafvis, 0, numsubsectors);
+    bake_leafvis_count = 0;
 }
 
 void R_MeshMarkSubsector (int ssidx)
 {
     if (bake_leafvis && (unsigned)ssidx < (unsigned)numsubsectors)
+    {
+        if (!bake_leafvis[ssidx])
+            bake_leafvis_count++;
         bake_leafvis[ssidx] = 1;
+    }
 }

@@ -109,6 +109,7 @@ extern int             bake_numpmverts;
 // reaches) and consumed by DL_MeshDrawLeaves so only visible leaves transform/draw.
 // PU_LEVEL, sized numsubsectors. Reset each frame (R_MeshResetLeafVis).
 extern byte*          bake_leafvis;
+extern int            bake_leafvis_count;  // marks this frame (I_FinishUpdate gate term)
 
 // Per-linedef visibility, set by the BSP walk (R_StoreWallRange marks a line whose
 // seg survives the solidsegs occlusion) and consumed by DL_MeshDrawWalls so only
