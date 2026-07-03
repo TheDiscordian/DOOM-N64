@@ -652,3 +652,28 @@ section records what changed and why, so the history is auditable:
   masked can Z-leak over SOFTWARE-drawn walls (movable-sector exclusions write no
   Z) — resolved when Phases C/D put everything on Z.
 - **GATE: the user's eye — pending.**
+
+### Phase C: sprites on Z — built + machine-verified (2026-07-03)
+- `BENCH_FORCE_MESH_SPRITES` (preset `mesh-sprites` = A+B+C, commits
+  `5cdfc4a`..`50fa41e`): vissprites collected at `R_DrawMasked` time (already
+  sorted far→near) into a present-time arena; `DL_DrawSpriteQuads` draws them
+  after the masked pass, Z-tested + Z-written under alpha-compare. World Z
+  resolves occlusion — the drawseg sprite-clip arrays are no longer consumed by
+  regular sprites. Per-patch CI4 blocks (Phase B recipe: post walk, 15 colours +
+  key, halved to <=64x64, one load). Sprites are constant-depth screen-aligned
+  quads: S/T are linear in screen space, so the Y-guard clip is exact. Flat
+  per-sprite light from the vissprite colormap level (fullbright works). Fuzz
+  (MF_SHADOW) + weapon psprites stay software.
+- **Three boot defects found + fixed by the protocol:** missing `m_swap.h`
+  (SHORT/LONG link failure); the aligned(8) TLUT member vs Z_Malloc's 4-byte
+  guarantee (misaligned doubleword store trap — fixed by 8-aligning both cache
+  bases, latent in Phase B too); arbitrary sprite widths vs the 8-byte TMEM
+  pitch rule (pitch padded to 16 texels).
+- **Verification:** full demo completes; explosion/monster/pickup sprites render
+  at software's positions and composite through Z; void scan clean (frames 0 +
+  3213 only). Perf 19172/38112 (sprite columns left the CPU; ~neutral overall).
+- **Slice-1 limitations:** large sprites (explosions) visibly chunkier from the
+  half-res blocks; >128px sprites refused to software; colour-translation
+  (multiplayer suits) not wired; fuzz still consumes drawseg clips — Phase D
+  must move or accept it.
+- **GATE: the user's eye — pending.**
