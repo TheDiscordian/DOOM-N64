@@ -5850,6 +5850,7 @@ typedef struct {
     fixed_t startfrac, xiscale; // S at x1 + step (negative = flipped)
     fixed_t scale, texturemid;  // projection scale + top offset (world - viewz)
     float   depth;              // view depth (map units) -> Z
+    float   gx, gy;             // map position (the z-test side predicate)
     uint32_t rgba;              // flat sprite light (colormap level -> prim LUT)
     short   sprlump;            // patch lump - firstspritelump
 } dl_sprite_t;
@@ -6003,9 +6004,129 @@ void DL_SpriteEmit (int sprlump, int x1, int x2, fixed_t startfrac, fixed_t xisc
     s->startfrac = startfrac; s->xiscale = xiscale;
     s->scale = scale; s->texturemid = texturemid;
     s->depth = (float)dfx * (1.0f / 65536.0f);
+    s->gx = (float)gx * (1.0f / 65536.0f);
+    s->gy = (float)gy * (1.0f / 65536.0f);
     s->rgba  = (cmlevel >= 0 && cmlevel < NUMCOLORMAPS) ? dl_prim_lut[cmlevel]
                                                         : dl_unlit_prim;
     s->sprlump = (short)sprlump;
+}
+
+// ---------------------------------------------------------------------------
+// Per-sprite z-test decision: DOOM's occlusion rule is LINE-based, not
+// ray-based. R_DrawSprite clips a sprite against a seg ONLY when the sprite's
+// map position is on the FAR side of the seg's line (R_PointOnSegSide) and
+// the seg is nearer. A camera hugging an oblique wall can have wall PIXELS
+// nearer than a sprite that is on the wall's viewer side -- software draws
+// the sprite over them (capture frame 2816: a barrel blast right of the
+// player lost its right half to that wall's Z; no constant bias can express
+// the predicate). So: z-test a sprite ONLY when some visible line overlaps
+// its columns, is nearer, and has the sprite on its far side. When that
+// holds, the z-buffer (walls + skirts + masked) reproduces software's
+// silhouette clips per pixel; when it doesn't, nothing may occlude the
+// sprite and it draws unclipped, exactly like software.
+// ---------------------------------------------------------------------------
+typedef struct {
+    float x1, y1, x2, y2;       // line endpoints (map units)
+    float sxlo, sxhi;           // clipped screen-x interval
+    float mindepth;             // nearest view depth over that interval
+} dl_soccl_t;
+static dl_soccl_t dl_soccl[1024];
+static int        dl_soccl_count;
+
+// Collect this frame's candidate occluder lines once (view transform + guard
+// clip per marked line); sprites then test against the compact list.
+static void DL_SpriteOcclBuild (void)
+{
+    fixed_t vcos, vsin;
+    float vxf, vyf, vcosf, vsinf, cxf, KL, KR;
+    int   li;
+
+    dl_soccl_count = 0;
+    if (!bake_linevis)
+        return;
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    vxf = (float)viewx * (1.0f / 65536.0f);
+    vyf = (float)viewy * (1.0f / 65536.0f);
+    vcosf = (float)vcos * (1.0f / 65536.0f);
+    vsinf = (float)vsin * (1.0f / 65536.0f);
+    cxf = (float)centerx;
+    KL = (cxf + DL_PM_GUARDX) / cxf;
+    KR = ((float)SCREENWIDTH - cxf + DL_PM_GUARDX) / cxf;
+
+    for (li = 0; li < numlines; li++)
+    {
+        line_t* ln;
+        float ax, ay, bx, by, dA, dB, lA, lB, t0, t1;
+        float dt0, dt1, x0s, x1s;
+        dl_soccl_t* oc;
+
+        if (!bake_linevis[li]) continue;
+        if (dl_soccl_count >= (int)(sizeof dl_soccl / sizeof dl_soccl[0])) break;
+        ln = &lines[li];
+        ax = (float)ln->v1->x * (1.0f / 65536.0f);
+        ay = (float)ln->v1->y * (1.0f / 65536.0f);
+        bx = (float)ln->v2->x * (1.0f / 65536.0f);
+        by = (float)ln->v2->y * (1.0f / 65536.0f);
+        dA = (ax - vxf) * vcosf + (ay - vyf) * vsinf;
+        dB = (bx - vxf) * vcosf + (by - vyf) * vsinf;
+        lA = (ay - vyf) * vcosf - (ax - vxf) * vsinf;
+        lB = (by - vyf) * vcosf - (bx - vxf) * vsinf;
+
+        t0 = 0.0f; t1 = 1.0f;
+        {
+            float f0, f1, planes[3][2];
+            int   pl2;
+            planes[0][0] = dA - DL_PM_NEARZ;   planes[0][1] = dB - DL_PM_NEARZ;
+            planes[1][0] = KL * dA - lA;       planes[1][1] = KL * dB - lB;
+            planes[2][0] = KR * dA + lA;       planes[2][1] = KR * dB + lB;
+            for (pl2 = 0; pl2 < 3; pl2++)
+            {
+                f0 = planes[pl2][0]; f1 = planes[pl2][1];
+                if (f0 < 0.0f && f1 < 0.0f) { t0 = 1.0f; t1 = 0.0f; break; }
+                if (f0 < 0.0f) { float t = f0 / (f0 - f1); if (t > t0) t0 = t; }
+                if (f1 < 0.0f) { float t = f0 / (f0 - f1); if (t < t1) t1 = t; }
+            }
+        }
+        if (t0 >= t1) continue;
+
+        dt0 = dA + t0 * (dB - dA); dt1 = dA + t1 * (dB - dA);
+        x0s = cxf - (lA + t0 * (lB - lA)) * (cxf / dt0);
+        x1s = cxf - (lA + t1 * (lB - lA)) * (cxf / dt1);
+
+        oc = &dl_soccl[dl_soccl_count++];
+        oc->x1 = ax; oc->y1 = ay; oc->x2 = bx; oc->y2 = by;
+        oc->sxlo = (x0s < x1s) ? x0s : x1s;
+        oc->sxhi = (x0s < x1s) ? x1s : x0s;
+        oc->mindepth = (dt0 < dt1) ? dt0 : dt1;
+    }
+}
+
+// 1 = some visible line may legitimately occlude this sprite (z-test it);
+// 0 = software's rule says nothing clips it (draw with the z-test off).
+static int DL_SpriteNeedsZTest (const dl_sprite_t* s)
+{
+    int k;
+    for (k = 0; k < dl_soccl_count; k++)
+    {
+        const dl_soccl_t* oc = &dl_soccl[k];
+        float side;
+        if (oc->mindepth >= s->depth) continue;              // line not nearer
+        if (oc->sxhi < (float)s->x1 || oc->sxlo > (float)(s->x2 + 1))
+            continue;                                        // no column overlap
+        // Same side test as R_PointOnSegSide, sprite vs viewer: occludes only
+        // when they disagree (the sprite is beyond the line).
+        side = (oc->x2 - oc->x1) * (s->gy - oc->y1)
+             - (oc->y2 - oc->y1) * (s->gx - oc->x1);
+        {
+            extern fixed_t viewx, viewy;
+            float vside = (oc->x2 - oc->x1) * ((float)viewy * (1.0f / 65536.0f) - oc->y1)
+                        - (oc->y2 - oc->y1) * ((float)viewx * (1.0f / 65536.0f) - oc->x1);
+            if ((side >= 0.0f) != (vside >= 0.0f))
+                return 1;
+        }
+    }
+    return 0;
 }
 
 // Present-time draw: after the masked pass, Z still enabled. Arena order is
@@ -6023,12 +6144,16 @@ static void DL_DrawSpriteQuads (void)
     rdpq_mode_persp(true);
     rdpq_set_blend_color(RGBA32(0, 0, 0, 128));
     rdpq_mode_alphacompare(128);
-    // Z-TEST against the world, but do NOT Z-WRITE: co-located sprites (an
-    // exploding barrel and its blast share a map spot) sit at EQUAL depth, and
-    // a written Z makes the later, nearer-sorted sprite z-fail into holes. The
-    // far->near painter order already resolves sprite-vs-sprite; nothing draws
-    // after this pass that needs sprite Z.
+    // Never Z-WRITE: co-located sprites (an exploding barrel and its blast
+    // share a map spot) sit at EQUAL depth, and a written Z makes the later,
+    // nearer-sorted sprite z-fail into holes. The far->near painter order
+    // already resolves sprite-vs-sprite; nothing draws after this pass that
+    // needs sprite Z. Z-TEST is decided PER SPRITE (software's line-based
+    // rule -- see DL_SpriteNeedsZTest); ztest_on tracks the current mode.
+    DL_SpriteOcclBuild();
     rdpq_mode_zbuf(true, false);
+    {
+    int ztest_on = 1;
 
     for (i = 0; i < dl_sprite_count; i++)
     {
@@ -6036,8 +6161,15 @@ static void DL_DrawSpriteQuads (void)
         dl_sprblk_t* mb = DL_SpriteBlock(s->sprlump);
         float scf, yt, yb, s0, s1v, t0, t1, invw, zval;
         float vx4[4][10];
-        int c, e;
+        int c, e, want_z;
         if (!mb) continue;
+
+        want_z = DL_SpriteNeedsZTest(s);
+        if (want_z != ztest_on)
+        {
+            rdpq_mode_zbuf(want_z ? true : false, false);
+            ztest_on = want_z;
+        }
 
         if (s->sprlump != curlump)
         {
@@ -6125,6 +6257,7 @@ static void DL_DrawSpriteQuads (void)
                 drew += 2;
             }
         }
+    }
     }
     rdpq_mode_alphacompare(0);
 
