@@ -5772,7 +5772,9 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
     m->mh = th >> m->ts;
     {
         int mwp  = (m->mw + 1) & ~1;            // even texel count for CI4 packing
-        int rowb = ((mwp < 16) ? 16 : mwp) / 2;
+        int rowb = ((mwp + 15) & ~15) / 2;      // pitch padded to 8 bytes (TMEM
+                                                // pitch must be a multiple of 8;
+                                                // sprite widths are arbitrary)
         m->raw = Z_Malloc(rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
         if (!m->raw) { m->block = NULL; return NULL; }
         m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
@@ -5864,7 +5866,7 @@ static void DL_DrawSpriteQuads (void)
         if (s->sprlump != curlump)
         {
             int mwp  = (mb->mw + 1) & ~1;
-            int rowb = ((mwp < 16) ? 16 : mwp) / 2;
+            int rowb = ((mwp + 15) & ~15) / 2;  // padded pitch (matches the block)
             surface_t ms = surface_make_linear(mb->block, FMT_CI8, rowb, mb->mh);
             rdpq_tex_upload_tlut(mb->tlut, DL_MT_KEY * 16, 16);
             {
