@@ -5496,6 +5496,18 @@ static void DL_DrawMaskedQuads(void)
         int   texnum, lnum;
 
         if (!bake_linevis[mt->line]) continue;
+        // Draw only the side FACING the viewer: grates carry the midtexture on
+        // BOTH sidedefs, and the back side's quad has mirrored S -- drawing both
+        // z-fights a displaced copy over the correct one. Vanilla front-side
+        // convention (R_PointOnSide): on this side <=> dx*(vy-y1) - dy*(vx-x1) < 0.
+        {
+            float fdx = (float)(mt->x2 - mt->x1) * (1.0f / 65536.0f);
+            float fdy = (float)(mt->y2 - mt->y1) * (1.0f / 65536.0f);
+            float fvx = (float)viewx * (1.0f / 65536.0f) - (float)mt->x1 * (1.0f / 65536.0f);
+            float fvy = (float)viewy * (1.0f / 65536.0f) - (float)mt->y1 * (1.0f / 65536.0f);
+            if (fdx * fvy - fdy * fvx >= 0.0f)
+                continue;
+        }
         texnum = texturetranslation[mt->texture];
         mb = DL_MaskedBlock(texnum);
         if (!mb) continue;                       // refused -> software drew it? (no:
