@@ -5653,13 +5653,15 @@ int DL_MaskedPending (void)
 // Weapon psprites + fuzz (MF_SHADOW) stay on the software path.
 // ===========================================================================
 typedef struct {
-    void*    raw;
-    byte*    block;             // 8-aligned CI4, rowb bytes/row
-    int      mw, mh;            // stored dims (<=64)
-    int      pw, ph;            // native patch dims
-    uint8_t  ds, ts;            // point-sample halving shifts
-    uint8_t  inited;
-    uint16_t tlut[16] __attribute__((aligned(8)));   // [15] = key (alpha 0)
+    void*     raw;
+    byte*     block;            // 8-aligned CI8, rowb bytes/row, EXACT PLAYPAL indices
+    void*     tlraw;
+    uint16_t* tlut;             // 8-aligned 256-entry master-TLUT copy, [key] alpha 0
+    int       mw, mh;           // native patch dims (full resolution)
+    int       rowb;             // row pitch (bytes, multiple of 8)
+    int       key;              // a PLAYPAL index this sprite never uses (the gaps)
+    uint32_t  palgen;           // palette generation the tlut copy tracks (flashes)
+    uint8_t   inited;
 } dl_sprblk_t;
 static dl_sprblk_t* dl_sprblk;          // [numspritelumps], lazy
 int n64_rdp_mesh_sprites = 0;           // BENCH_FORCE_MESH_SPRITES (d_main.c)
@@ -5676,27 +5678,36 @@ typedef struct {
 static dl_sprite_t dl_sprites[DL_SPR_ARENA];
 static int         dl_sprite_count = 0;
 
-// Build (or fetch) the CI4 block for a sprite patch: identical recipe to the
-// masked midtex blocks (post walk, 15 most frequent colours + nearest-fit, key
-// fill, point-sample halving to <=64x64 = one TMEM load).
+// Rebuild the block's private 256-entry TLUT: a copy of the LIVE master TLUT
+// (so sprites tint with palette flashes) with the key entry's alpha zeroed.
+static void DL_SpriteTLUTRefresh(dl_sprblk_t* m)
+{
+    extern const uint16_t* I_N64MasterTLUT(void);
+    memcpy(m->tlut, I_N64MasterTLUT(), 256 * sizeof(uint16_t));
+    m->tlut[m->key] = 0;                         // alpha 0: the transparency key
+    m->palgen = I_N64PaletteGen();
+    data_cache_hit_writeback(m->tlut, 256 * sizeof(uint16_t));
+}
+
+// Build (or fetch) the CI8 block for a sprite patch: EXACT PLAYPAL indices at
+// full resolution (a 15-colour quantized attempt shifted hues -- a zombie's dark
+// browns nearest-fit onto its blood red; the user caught it). Transparency key =
+// a PLAYPAL index the sprite never uses, alpha-zeroed in the block's private
+// 256-entry TLUT copy. Tall sprites T-band at draw (CI8 loads directly).
 static dl_sprblk_t* DL_SpriteBlock(int sprlump)
 {
     extern int firstspritelump, numspritelumps;
     dl_sprblk_t* m;
     const patch_t* p;
-    const byte* playpal;
-    int  tw, th, col, i, nsub = 0;
-    int  freq[256];
-    uint8_t remap[256];
-    uint8_t pal_idx[16];
+    int  tw, th, col, i;
+    int  used[256];
 
     if (sprlump < 0 || sprlump >= numspritelumps)
         return NULL;
     if (!dl_sprblk)
     {
-        // +7 & ~7: 8-align the struct base for the aligned(8) tlut member
-        // (Z_Malloc guarantees only 4; a 4-aligned base traps on the compiler's
-        // doubleword stores -- this was a boot crash).
+        // +7 & ~7: 8-align the array base (Z_Malloc guarantees only 4; the
+        // compiler may emit doubleword stores for member init).
         void* raw = Z_Malloc(numspritelumps * sizeof(dl_sprblk_t) + 7, PU_STATIC, 0);
         dl_sprblk = (dl_sprblk_t*)(((uintptr_t)raw + 7) & ~(uintptr_t)7);
         memset(dl_sprblk, 0, numspritelumps * sizeof(dl_sprblk_t));
@@ -5707,16 +5718,18 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
     m->inited = 1;
 
     p = (const patch_t*)W_CacheLumpNum(firstspritelump + sprlump, PU_CACHE);
-    playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
-    if (!p || !playpal)
+    if (!p)
         return NULL;
     tw = SHORT(p->width);
     th = SHORT(p->height);
-    if (tw < 1 || tw > 128 || th < 1 || th > 128)
-        return NULL;                            // out of slice-1 bounds
-    m->pw = tw; m->ph = th;
+    if (tw < 1 || tw > 256 || th < 1 || th > 200)
+        return NULL;
+    m->mw = tw;
+    m->mh = th;
+    m->rowb = (tw + 7) & ~7;                     // CI8: 1 byte/texel, 8-byte pitch
 
-    memset(freq, 0, sizeof(freq));
+    // find an index this sprite never uses -> the transparency key
+    memset(used, 0, sizeof(used));
     for (col = 0; col < tw; col++)
     {
         const column_t* c = (const column_t*)((const byte*)p + LONG(p->columnofs[col]));
@@ -5724,86 +5737,41 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
         {
             const byte* src = (const byte*)c + 3;
             for (i = 0; i < c->length; i++)
-                freq[src[i]]++;
+                used[src[i]] = 1;
             c = (const column_t*)((const byte*)c + c->length + 4);
         }
     }
-    memset(remap, 0, sizeof(remap));
-    for (nsub = 0; nsub < 15; nsub++)
-    {
-        int best = -1, bestf = 0;
-        for (i = 0; i < 256; i++)
-            if (freq[i] > bestf) { bestf = freq[i]; best = i; }
-        if (best < 0) break;
-        pal_idx[nsub] = (uint8_t)best;
-        freq[best] = -1;
-        {
-            uint8_t r = gammatable[usegamma][playpal[best*3+0]];
-            uint8_t g = gammatable[usegamma][playpal[best*3+1]];
-            uint8_t b = gammatable[usegamma][playpal[best*3+2]];
-            m->tlut[nsub] = (uint16_t)(((r >> 3) << 11) | ((g >> 3) << 6)
-                                       | ((b >> 3) << 1) | 1);
-        }
-    }
-    if (nsub == 0)
-        return NULL;
-    m->tlut[DL_MT_KEY] = 0;
-    for (i = nsub; i < DL_MT_KEY; i++) m->tlut[i] = m->tlut[0];
-    for (i = 0; i < 256; i++)
-    {
-        int k, bk = 0; long bd = 0x7FFFFFFF;
-        int r = gammatable[usegamma][playpal[i*3+0]];
-        int g = gammatable[usegamma][playpal[i*3+1]];
-        int b = gammatable[usegamma][playpal[i*3+2]];
-        for (k = 0; k < nsub; k++)
-        {
-            int pr = gammatable[usegamma][playpal[pal_idx[k]*3+0]];
-            int pg = gammatable[usegamma][playpal[pal_idx[k]*3+1]];
-            int pb = gammatable[usegamma][playpal[pal_idx[k]*3+2]];
-            long d = (long)(r-pr)*(r-pr) + (long)(g-pg)*(g-pg) + (long)(b-pb)*(b-pb);
-            if (d < bd) { bd = d; bk = k; }
-        }
-        remap[i] = (uint8_t)bk;
-    }
+    m->key = -1;
+    for (i = 255; i >= 0; i--)                   // high indices are rarely used
+        if (!used[i]) { m->key = i; break; }
+    if (m->key < 0)
+        return NULL;                             // sprite uses all 256 (never happens)
 
-    m->ds = (tw > 64) ? 1 : 0;
-    m->ts = (th > 64) ? 1 : 0;
-    m->mw = tw >> m->ds;
-    m->mh = th >> m->ts;
+    m->raw = Z_Malloc(m->rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
+    if (!m->raw) { m->block = NULL; return NULL; }
+    m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
+    memset(m->block, m->key, m->rowb * m->mh);
+    for (col = 0; col < tw; col++)
     {
-        int mwp  = (m->mw + 1) & ~1;            // even texel count for CI4 packing
-        int rowb = ((mwp + 15) & ~15) / 2;      // pitch padded to 8 bytes (TMEM
-                                                // pitch must be a multiple of 8;
-                                                // sprite widths are arbitrary)
-        m->raw = Z_Malloc(rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
-        if (!m->raw) { m->block = NULL; return NULL; }
-        m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
-        memset(m->block, (DL_MT_KEY << 4) | DL_MT_KEY, rowb * m->mh);
-        for (col = 0; col < tw; col += (1 << m->ds))
+        const column_t* c = (const column_t*)((const byte*)p + LONG(p->columnofs[col]));
+        while (c->topdelta != 0xff)
         {
-            const column_t* c = (const column_t*)((const byte*)p + LONG(p->columnofs[col]));
-            int dcol = col >> m->ds;
-            while (c->topdelta != 0xff)
+            const byte* src = (const byte*)c + 3;
+            for (i = 0; i < c->length; i++)
             {
-                const byte* src = (const byte*)c + 3;
-                for (i = 0; i < c->length; i++)
-                {
-                    int row = c->topdelta + i;
-                    if (m->ts && (row & 1)) continue;
-                    row >>= m->ts;
-                    if (row >= m->mh) break;
-                    {
-                        byte* dst = &m->block[row * rowb + (dcol >> 1)];
-                        byte  v   = remap[src[i]];
-                        if (dcol & 1) *dst = (byte)((*dst & 0xF0) | v);
-                        else          *dst = (byte)((*dst & 0x0F) | (v << 4));
-                    }
-                }
-                c = (const column_t*)((const byte*)c + c->length + 4);
+                int row = c->topdelta + i;
+                if (row >= m->mh) break;
+                m->block[row * m->rowb + col] = src[i];
             }
+            c = (const column_t*)((const byte*)c + c->length + 4);
         }
-        data_cache_hit_writeback(m->block, rowb * m->mh);
     }
+    data_cache_hit_writeback(m->block, m->rowb * m->mh);
+
+    m->tlraw = Z_Malloc(256 * sizeof(uint16_t) + 7, PU_STATIC, (void**)&m->tlraw);
+    if (!m->tlraw) { m->block = NULL; return NULL; }
+    m->tlut = (uint16_t*)(((uintptr_t)m->tlraw + 7) & ~(uintptr_t)7);
+    DL_SpriteTLUTRefresh(m);
     return m;
 }
 
@@ -5865,32 +5833,31 @@ static void DL_DrawSpriteQuads (void)
 
         if (s->sprlump != curlump)
         {
-            int mwp  = (mb->mw + 1) & ~1;
-            int rowb = ((mwp + 15) & ~15) / 2;  // padded pitch (matches the block)
-            surface_t ms = surface_make_linear(mb->block, FMT_CI8, rowb, mb->mh);
-            rdpq_tex_upload_tlut(mb->tlut, DL_MT_KEY * 16, 16);
+            surface_t ms;
+            if (mb->palgen != I_N64PaletteGen())
+                DL_SpriteTLUTRefresh(mb);        // track palette flashes
+            ms = surface_make_linear(mb->block, FMT_CI8, mb->rowb, mb->mh);
+            rdpq_tex_upload_tlut(mb->tlut, 0, 256);   // full TLUT: exact colours;
+                                                      // walls/flats re-upload theirs
+                                                      // next frame (stream-ordered)
             {
                 rdpq_tileparms_t tp;
                 memset(&tp, 0, sizeof(tp));
                 tp.s.clamp = true;               // sprites never wrap
                 tp.t.clamp = true;
-                tp.palette = DL_MT_KEY;
-                rdpq_set_tile(TILE1, FMT_I8, 0, rowb, NULL);
-                rdpq_set_tile(TILE0, FMT_CI4, 0, rowb, &tp);
+                rdpq_set_tile(TILE0, FMT_CI8, 0, mb->rowb, &tp);
             }
             rdpq_set_texture_image(&ms);
-            rdpq_load_tile(TILE1, 0, 0, (mwp) / 2, mb->mh);
-            rdpq_set_tile_size(TILE0, 0, 0, mwp, mb->mh);
             curlump = s->sprlump;
         }
 
         scf = (float)s->scale * (1.0f / 65536.0f);
         yt  = cyf - (float)s->texturemid * (1.0f / 65536.0f) * scf;
-        yb  = yt + (float)mb->ph * scf;
+        yb  = yt + (float)mb->mh * scf;
         s0  = (float)s->startfrac * (1.0f / 65536.0f);
         s1v = s0 + (float)(s->x2 - s->x1 + 1) * (float)s->xiscale * (1.0f / 65536.0f);
         t0  = 0.0f;
-        t1  = (float)mb->ph;
+        t1  = (float)mb->mh;
         // screen-space Y guard clip (exact: constant depth => linear T)
         if (yt < -900.0f)
         {
@@ -5906,24 +5873,43 @@ static void DL_DrawSpriteQuads (void)
 
         invw = 1.0f / s->depth;
         zval = DL_WallZ(invw);
-        for (e = 0; e < 2; e++)                  // 0 = left(x1), 1 = right(x2+1)
-            for (c = 0; c < 2; c++)              // 0 = top, 1 = bottom
+        {
+            // T-band the tall CI8 block through TMEM (cap rows/load); each band
+            // is its own LOAD_TILE + quad. Screen y is linear in T, so band
+            // seams are exact. Most sprites are one band.
+            int cap = (DL_TMEM_HALF / mb->rowb);
+            int row0;
+            if (cap < 1) continue;
+            for (row0 = (int)t0; row0 < (int)(t1 + 0.999f); row0 += cap)
             {
-                float* v = vx4[e * 2 + c];
-                v[0] = (float)(e ? s->x2 + 1 : s->x1);
-                v[1] = c ? yb : yt;
-                v[2] = zval;
-                v[3] = (float)((s->rgba >> 24) & 0xFF) * (1.0f / 255.0f);
-                v[4] = (float)((s->rgba >> 16) & 0xFF) * (1.0f / 255.0f);
-                v[5] = (float)((s->rgba >>  8) & 0xFF) * (1.0f / 255.0f);
-                v[6] = 1.0f;
-                v[7] = (e ? s1v : s0) / (float)(1 << mb->ds);
-                v[8] = (c ? t1 : t0) / (float)(1 << mb->ts);
-                v[9] = invw;
+                float bt0 = (t0 > (float)row0) ? t0 : (float)row0;
+                float bt1 = (t1 < (float)(row0 + cap)) ? t1 : (float)(row0 + cap);
+                float by0, by1;
+                if (bt1 <= bt0) continue;
+                rdpq_load_tile(TILE0, 0, row0, mb->mw,
+                               (row0 + cap < mb->mh) ? row0 + cap : mb->mh);
+                by0 = yt + (bt0 - t0) * scf;
+                by1 = yt + (bt1 - t0) * scf;
+                for (e = 0; e < 2; e++)          // 0 = left(x1), 1 = right(x2+1)
+                    for (c = 0; c < 2; c++)      // 0 = band top, 1 = band bottom
+                    {
+                        float* v = vx4[e * 2 + c];
+                        v[0] = (float)(e ? s->x2 + 1 : s->x1);
+                        v[1] = c ? by1 : by0;
+                        v[2] = zval;
+                        v[3] = (float)((s->rgba >> 24) & 0xFF) * (1.0f / 255.0f);
+                        v[4] = (float)((s->rgba >> 16) & 0xFF) * (1.0f / 255.0f);
+                        v[5] = (float)((s->rgba >>  8) & 0xFF) * (1.0f / 255.0f);
+                        v[6] = 1.0f;
+                        v[7] = e ? s1v : s0;
+                        v[8] = c ? bt1 : bt0;
+                        v[9] = invw;
+                    }
+                rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[0], vx4[2], vx4[1]);
+                rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[2], vx4[3], vx4[1]);
+                drew += 2;
             }
-        rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[0], vx4[2], vx4[1]);
-        rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[2], vx4[3], vx4[1]);
-        drew += 2;
+        }
     }
     rdpq_mode_alphacompare(0);
 
