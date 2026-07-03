@@ -81,6 +81,16 @@ byte* I_ZoneBase(int* size)
         mb_used = 2;
 
     *size = mb_used * 1024 * 1024;
+    if (mb_used == 4)
+    {
+        // 3.5 MB, not 4: the flat 4 MB grab left the libdragon heap within
+        // ~1 KB of I_InitGraphics' needs, so kilobyte-scale image growth made
+        // boot a coin flip (three ROMs died at the scratch-screen malloc on
+        // 2026-07-03; the boot probe showed heap largest-block 32 KB against
+        // a 62 KB need -- while the zone sat on 3.4 MB of slack). The probe
+        // line in every boot log keeps both budgets visible.
+        *size -= 512 * 1024;
+    }
 
     if (!zone_base)
     {
