@@ -2256,6 +2256,15 @@ void D_DoomMain (void)
         debugf("BENCH: MESH MASKED midtex ON (Z-tested, alpha-keyed)\n");
     }
 #endif
+#ifdef BENCH_FORCE_MESH_SPRITES
+    // Phase C (GPU_PORT_PLAN): sprites as Z-tested RDP billboards (fuzz + weapon
+    // psprites stay software).
+    {
+        extern int n64_rdp_mesh_sprites;
+        n64_rdp_mesh_sprites = 1;
+        debugf("BENCH: MESH SPRITES ON (Z-tested billboards)\n");
+    }
+#endif
 #ifdef BENCH_FORCE_MESH_CULL
     // The mesh's OWN visibility: mark walls by frustum (every wall in a frustum-visible
     // subsector), not the BSP solidsegs occlusion. Wall-Z handles overdraw. First step

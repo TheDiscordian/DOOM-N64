@@ -1043,18 +1043,38 @@ void R_DrawMasked (void)
 {
     vissprite_t*	spr;
     drawseg_t*		ds;
-	
+
     R_SortVisSprites ();
 
-    if (vissprite_p > vissprites)
+    // Phase C (GPU_PORT_PLAN): sprites as Z-tested RDP billboards. Collect the
+    // sorted (far->near) vissprites for the present-time quad pass instead of
+    // drawing columns; fuzz (MF_SHADOW, colormap==NULL) stays software -- its
+    // drawseg clip arrays still exist until Phase D.
     {
-	// draw all vissprites back to front
-	for (spr = vsprsortedhead.next ;
-	     spr != &vsprsortedhead ;
-	     spr=spr->next)
+	extern int n64_rdp_mesh_sprites;
+	extern void DL_SpriteBegin (void);
+	extern void DL_SpriteEmit (int sprlump, int x1, int x2, fixed_t startfrac,
+				   fixed_t xiscale, fixed_t scale, fixed_t texturemid,
+				   fixed_t gx, fixed_t gy, int cmlevel);
+	if (n64_rdp_mesh_sprites)
+	    DL_SpriteBegin ();
+	if (vissprite_p > vissprites)
 	{
-	    
-	    R_DrawSprite (spr);
+	    for (spr = vsprsortedhead.next ;
+		 spr != &vsprsortedhead ;
+		 spr=spr->next)
+	    {
+		if (n64_rdp_mesh_sprites && spr->colormap
+		    && !(spr->mobjflags & MF_SHADOW))
+		{
+		    DL_SpriteEmit (spr->patch, spr->x1, spr->x2, spr->startfrac,
+				   spr->xiscale, spr->scale, spr->texturemid,
+				   spr->gx, spr->gy,
+				   (int)((spr->colormap - colormaps) / 256));
+		    continue;
+		}
+		R_DrawSprite (spr);
+	    }
 	}
     }
     

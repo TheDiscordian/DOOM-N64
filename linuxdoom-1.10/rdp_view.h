@@ -267,8 +267,14 @@ extern int n64_rdp_mesh_floors; // Phase 3 floor leaves (BENCH_FORCE_MESH_FLOORS
 extern int n64_rdp_mesh_worldz; // Option 3 Phase A: opaque Z-tested world planes
 extern int n64_rdp_mesh_pmesh;  // THE GOAL: welded static plane mesh (no runtime cutting)
 extern int n64_rdp_mesh_masked; // Phase B: midtextures on Z (BENCH_FORCE_MESH_MASKED)
+extern int n64_rdp_mesh_sprites;// Phase C: sprites on Z (BENCH_FORCE_MESH_SPRITES)
 int  DL_PMeshPending(void);     // welded-plane work queued this frame (I_FinishUpdate gate)
 int  DL_MaskedPending(void);    // masked-midtex work queued this frame (same gate)
+int  DL_SpritePending(void);    // sprite-quad work queued this frame (same gate)
+void DL_SpriteBegin(void);      // reset the sprite arena (R_DrawMasked, render time)
+void DL_SpriteEmit(int sprlump, int x1, int x2, fixed_t startfrac, fixed_t xiscale,
+                   fixed_t scale, fixed_t texturemid, fixed_t gx, fixed_t gy,
+                   int cmlevel);
 #ifdef BENCH_FORCE_MESH_RSP
 extern int n64_rdp_mesh_rsp;    // RSP port (BENCH_FORCE_MESH_RSP); Phase 0 = DMA loopback probe only
 #endif

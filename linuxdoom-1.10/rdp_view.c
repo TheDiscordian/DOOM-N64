@@ -44,6 +44,7 @@
 #include "r_state.h"            // viewx/viewangle/centerx/projectiony (mesh transform)
 #include "tables.h"             // finesine/finecosine/ANGLETOFINESHIFT (mesh transform)
 #include "r_bake.h"             // bake_walls / bake_numwalls (GPU port)
+#include "m_swap.h"             // SHORT/LONG (sprite patch headers, Phase C)
 #include <math.h>               // sqrtf (mesh wall length)
 #include "z_zone.h"
 #include "w_wad.h"
@@ -5637,6 +5638,298 @@ int DL_MaskedPending (void)
     return (n64_rdp_mesh_masked && bake_midtexvis_count > 0) ? 1 : 0;
 }
 
+// ===========================================================================
+// Phase C (GPU_PORT_PLAN): SPRITES on Z. Billboard quads at the vissprite's
+// screen extents, Z-tested against the world, alpha-keyed like the masked pass
+// (per-patch CI4 block, key index 15, TLUT alpha 0). Sprites are constant-depth
+// screen-aligned quads, so S/T interpolate LINEARLY in screen space and screen-
+// space clipping is EXACT. Collected at R_DrawMasked time (render) in sorted
+// far->near order, drawn in DL_Flush (present) with Z-write -- nearer sprites
+// win overlaps, the world Z resolves occlusion (no drawseg clip arrays).
+// Weapon psprites + fuzz (MF_SHADOW) stay on the software path.
+// ===========================================================================
+typedef struct {
+    void*    raw;
+    byte*    block;             // 8-aligned CI4, rowb bytes/row
+    int      mw, mh;            // stored dims (<=64)
+    int      pw, ph;            // native patch dims
+    uint8_t  ds, ts;            // point-sample halving shifts
+    uint8_t  inited;
+    uint16_t tlut[16] __attribute__((aligned(8)));   // [15] = key (alpha 0)
+} dl_sprblk_t;
+static dl_sprblk_t* dl_sprblk;          // [numspritelumps], lazy
+int n64_rdp_mesh_sprites = 0;           // BENCH_FORCE_MESH_SPRITES (d_main.c)
+
+typedef struct {
+    int     x1, x2;             // screen column extent (already view-clamped)
+    fixed_t startfrac, xiscale; // S at x1 + step (negative = flipped)
+    fixed_t scale, texturemid;  // projection scale + top offset (world - viewz)
+    float   depth;              // view depth (map units) -> Z
+    uint32_t rgba;              // flat sprite light (colormap level -> prim LUT)
+    short   sprlump;            // patch lump - firstspritelump
+} dl_sprite_t;
+#define DL_SPR_ARENA 128
+static dl_sprite_t dl_sprites[DL_SPR_ARENA];
+static int         dl_sprite_count = 0;
+
+// Build (or fetch) the CI4 block for a sprite patch: identical recipe to the
+// masked midtex blocks (post walk, 15 most frequent colours + nearest-fit, key
+// fill, point-sample halving to <=64x64 = one TMEM load).
+static dl_sprblk_t* DL_SpriteBlock(int sprlump)
+{
+    extern int firstspritelump, numspritelumps;
+    dl_sprblk_t* m;
+    const patch_t* p;
+    const byte* playpal;
+    int  tw, th, col, i, nsub = 0;
+    int  freq[256];
+    uint8_t remap[256];
+    uint8_t pal_idx[16];
+
+    if (sprlump < 0 || sprlump >= numspritelumps)
+        return NULL;
+    if (!dl_sprblk)
+    {
+        dl_sprblk = (dl_sprblk_t*)Z_Malloc(numspritelumps * sizeof(dl_sprblk_t), PU_STATIC, 0);
+        memset(dl_sprblk, 0, numspritelumps * sizeof(dl_sprblk_t));
+    }
+    m = &dl_sprblk[sprlump];
+    if (m->inited)
+        return m->block ? m : NULL;
+    m->inited = 1;
+
+    p = (const patch_t*)W_CacheLumpNum(firstspritelump + sprlump, PU_CACHE);
+    playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
+    if (!p || !playpal)
+        return NULL;
+    tw = SHORT(p->width);
+    th = SHORT(p->height);
+    if (tw < 1 || tw > 128 || th < 1 || th > 128)
+        return NULL;                            // out of slice-1 bounds
+    m->pw = tw; m->ph = th;
+
+    memset(freq, 0, sizeof(freq));
+    for (col = 0; col < tw; col++)
+    {
+        const column_t* c = (const column_t*)((const byte*)p + LONG(p->columnofs[col]));
+        while (c->topdelta != 0xff)
+        {
+            const byte* src = (const byte*)c + 3;
+            for (i = 0; i < c->length; i++)
+                freq[src[i]]++;
+            c = (const column_t*)((const byte*)c + c->length + 4);
+        }
+    }
+    memset(remap, 0, sizeof(remap));
+    for (nsub = 0; nsub < 15; nsub++)
+    {
+        int best = -1, bestf = 0;
+        for (i = 0; i < 256; i++)
+            if (freq[i] > bestf) { bestf = freq[i]; best = i; }
+        if (best < 0) break;
+        pal_idx[nsub] = (uint8_t)best;
+        freq[best] = -1;
+        {
+            uint8_t r = gammatable[usegamma][playpal[best*3+0]];
+            uint8_t g = gammatable[usegamma][playpal[best*3+1]];
+            uint8_t b = gammatable[usegamma][playpal[best*3+2]];
+            m->tlut[nsub] = (uint16_t)(((r >> 3) << 11) | ((g >> 3) << 6)
+                                       | ((b >> 3) << 1) | 1);
+        }
+    }
+    if (nsub == 0)
+        return NULL;
+    m->tlut[DL_MT_KEY] = 0;
+    for (i = nsub; i < DL_MT_KEY; i++) m->tlut[i] = m->tlut[0];
+    for (i = 0; i < 256; i++)
+    {
+        int k, bk = 0; long bd = 0x7FFFFFFF;
+        int r = gammatable[usegamma][playpal[i*3+0]];
+        int g = gammatable[usegamma][playpal[i*3+1]];
+        int b = gammatable[usegamma][playpal[i*3+2]];
+        for (k = 0; k < nsub; k++)
+        {
+            int pr = gammatable[usegamma][playpal[pal_idx[k]*3+0]];
+            int pg = gammatable[usegamma][playpal[pal_idx[k]*3+1]];
+            int pb = gammatable[usegamma][playpal[pal_idx[k]*3+2]];
+            long d = (long)(r-pr)*(r-pr) + (long)(g-pg)*(g-pg) + (long)(b-pb)*(b-pb);
+            if (d < bd) { bd = d; bk = k; }
+        }
+        remap[i] = (uint8_t)bk;
+    }
+
+    m->ds = (tw > 64) ? 1 : 0;
+    m->ts = (th > 64) ? 1 : 0;
+    m->mw = tw >> m->ds;
+    m->mh = th >> m->ts;
+    {
+        int mwp  = (m->mw + 1) & ~1;            // even texel count for CI4 packing
+        int rowb = ((mwp < 16) ? 16 : mwp) / 2;
+        m->raw = Z_Malloc(rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
+        if (!m->raw) { m->block = NULL; return NULL; }
+        m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
+        memset(m->block, (DL_MT_KEY << 4) | DL_MT_KEY, rowb * m->mh);
+        for (col = 0; col < tw; col += (1 << m->ds))
+        {
+            const column_t* c = (const column_t*)((const byte*)p + LONG(p->columnofs[col]));
+            int dcol = col >> m->ds;
+            while (c->topdelta != 0xff)
+            {
+                const byte* src = (const byte*)c + 3;
+                for (i = 0; i < c->length; i++)
+                {
+                    int row = c->topdelta + i;
+                    if (m->ts && (row & 1)) continue;
+                    row >>= m->ts;
+                    if (row >= m->mh) break;
+                    {
+                        byte* dst = &m->block[row * rowb + (dcol >> 1)];
+                        byte  v   = remap[src[i]];
+                        if (dcol & 1) *dst = (byte)((*dst & 0xF0) | v);
+                        else          *dst = (byte)((*dst & 0x0F) | (v << 4));
+                    }
+                }
+                c = (const column_t*)((const byte*)c + c->length + 4);
+            }
+        }
+        data_cache_hit_writeback(m->block, rowb * m->mh);
+    }
+    return m;
+}
+
+// Collector -- called from R_DrawMasked (render time) per vissprite, in sorted
+// far->near order. Records everything the present-time quad needs.
+void DL_SpriteBegin (void)
+{
+    dl_sprite_count = 0;
+}
+
+void DL_SpriteEmit (int sprlump, int x1, int x2, fixed_t startfrac, fixed_t xiscale,
+                    fixed_t scale, fixed_t texturemid, fixed_t gx, fixed_t gy,
+                    int cmlevel)
+{
+    dl_sprite_t* s;
+    fixed_t vcos, vsin, tx, ty, dfx;
+    if (!n64_rdp_mesh_sprites || dl_sprite_count >= DL_SPR_ARENA)
+        return;
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    tx = gx - viewx; ty = gy - viewy;
+    dfx = FixedMul(tx, vcos) + FixedMul(ty, vsin);
+    if (dfx < (fixed_t)(2 << FRACBITS))
+        return;                                  // behind / at the near plane
+    s = &dl_sprites[dl_sprite_count++];
+    s->x1 = x1; s->x2 = x2;
+    s->startfrac = startfrac; s->xiscale = xiscale;
+    s->scale = scale; s->texturemid = texturemid;
+    s->depth = (float)dfx * (1.0f / 65536.0f);
+    s->rgba  = (cmlevel >= 0 && cmlevel < NUMCOLORMAPS) ? dl_prim_lut[cmlevel]
+                                                        : dl_unlit_prim;
+    s->sprlump = (short)sprlump;
+}
+
+// Present-time draw: after the masked pass, Z still enabled. Arena order is
+// far->near (the vissprite sort), so Z-write + painter order resolve overlaps.
+static void DL_DrawSpriteQuads (void)
+{
+    int i, drew = 0, curlump = -1;
+    float cyf;
+
+    if (!n64_rdp_mesh_sprites || dl_sprite_count <= 0 || !dl_wall_z)
+        return;
+
+    cyf = (float)centery;
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
+    rdpq_mode_persp(true);
+    rdpq_set_blend_color(RGBA32(0, 0, 0, 128));
+    rdpq_mode_alphacompare(128);
+
+    for (i = 0; i < dl_sprite_count; i++)
+    {
+        const dl_sprite_t* s = &dl_sprites[i];
+        dl_sprblk_t* mb = DL_SpriteBlock(s->sprlump);
+        float scf, yt, yb, s0, s1v, t0, t1, invw, zval;
+        float vx4[4][10];
+        int c, e;
+        if (!mb) continue;
+
+        if (s->sprlump != curlump)
+        {
+            int mwp  = (mb->mw + 1) & ~1;
+            int rowb = ((mwp < 16) ? 16 : mwp) / 2;
+            surface_t ms = surface_make_linear(mb->block, FMT_CI8, rowb, mb->mh);
+            rdpq_tex_upload_tlut(mb->tlut, DL_MT_KEY * 16, 16);
+            {
+                rdpq_tileparms_t tp;
+                memset(&tp, 0, sizeof(tp));
+                tp.s.clamp = true;               // sprites never wrap
+                tp.t.clamp = true;
+                tp.palette = DL_MT_KEY;
+                rdpq_set_tile(TILE1, FMT_I8, 0, rowb, NULL);
+                rdpq_set_tile(TILE0, FMT_CI4, 0, rowb, &tp);
+            }
+            rdpq_set_texture_image(&ms);
+            rdpq_load_tile(TILE1, 0, 0, (mwp) / 2, mb->mh);
+            rdpq_set_tile_size(TILE0, 0, 0, mwp, mb->mh);
+            curlump = s->sprlump;
+        }
+
+        scf = (float)s->scale * (1.0f / 65536.0f);
+        yt  = cyf - (float)s->texturemid * (1.0f / 65536.0f) * scf;
+        yb  = yt + (float)mb->ph * scf;
+        s0  = (float)s->startfrac * (1.0f / 65536.0f);
+        s1v = s0 + (float)(s->x2 - s->x1 + 1) * (float)s->xiscale * (1.0f / 65536.0f);
+        t0  = 0.0f;
+        t1  = (float)mb->ph;
+        // screen-space Y guard clip (exact: constant depth => linear T)
+        if (yt < -900.0f)
+        {
+            t0 += (-900.0f - yt) / scf;
+            yt = -900.0f;
+        }
+        if (yb > (float)SCREENHEIGHT + 900.0f)
+        {
+            t1 -= (yb - ((float)SCREENHEIGHT + 900.0f)) / scf;
+            yb = (float)SCREENHEIGHT + 900.0f;
+        }
+        if (yb <= yt || t1 <= t0) continue;
+
+        invw = 1.0f / s->depth;
+        zval = DL_WallZ(invw);
+        for (e = 0; e < 2; e++)                  // 0 = left(x1), 1 = right(x2+1)
+            for (c = 0; c < 2; c++)              // 0 = top, 1 = bottom
+            {
+                float* v = vx4[e * 2 + c];
+                v[0] = (float)(e ? s->x2 + 1 : s->x1);
+                v[1] = c ? yb : yt;
+                v[2] = zval;
+                v[3] = (float)((s->rgba >> 24) & 0xFF) * (1.0f / 255.0f);
+                v[4] = (float)((s->rgba >> 16) & 0xFF) * (1.0f / 255.0f);
+                v[5] = (float)((s->rgba >>  8) & 0xFF) * (1.0f / 255.0f);
+                v[6] = 1.0f;
+                v[7] = (e ? s1v : s0) / (float)(1 << mb->ds);
+                v[8] = (c ? t1 : t0) / (float)(1 << mb->ts);
+                v[9] = invw;
+            }
+        rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[0], vx4[2], vx4[1]);
+        rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[2], vx4[3], vx4[1]);
+        drew += 2;
+    }
+    rdpq_mode_alphacompare(0);
+
+    {
+        static unsigned sp_n = 0;
+        if ((sp_n++ & 511) == 0)
+            debugf("MESH-SPRITES: sprite tris=%d (Z-tested billboards)\n", drew);
+    }
+}
+
+// Sprite work queued this frame (I_FinishUpdate render-gate term).
+int DL_SpritePending (void)
+{
+    return (n64_rdp_mesh_sprites && dl_sprite_count > 0) ? 1 : 0;
+}
+
 static void DL_DrawWorldZPlanes(void)
 {
     fixed_t vcos, vsin;
@@ -7165,6 +7458,9 @@ void DL_Flush(void)
     // Phase B: masked midtextures, Z-tested against the opaque world just drawn
     // (alpha-compare keys out the transparent texels -- no colour, no Z write).
     DL_DrawMaskedQuads();
+
+    // Phase C: sprites as Z-tested billboards, far->near with Z-write.
+    DL_DrawSpriteQuads();
 
     // Walls done -- the planes/spans below draw WITHOUT the Z-buffer.
     if (dl_wall_z)
