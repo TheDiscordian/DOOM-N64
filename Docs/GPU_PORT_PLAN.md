@@ -734,9 +734,18 @@ per-seg angle clipping, no drawsegs, no openings, no visplanes. Occlusion is
 entirely the z-buffer's job (walls + skirts + masked — the Phase C
 architecture already assumes exactly this set). Overdraw is the risk the plan
 already flags: conservatively-visible leaves/walls behind walls get drawn and
-z-discarded. The REJECT lever: PVS_PROBE measures how much a sector-granular
-REJECT filter would cull of the frustum-visited set (numbers below when the
-probe fits or the bench array shrinks for a probe run).
+z-discarded. **MEASURED (PVS_PROBE, 2026-07-03, current build): the walk
+visits only ~9 subsectors/frame mean — solidsegs prunes E1M1 brutally — and
+REJECT would cull 0.8% mean / 4.1% tail of even that. Two conclusions: REJECT
+is useless as a Phase D filter, and a frustum-ONLY traversal balloons the
+visited set (E1M1 has 237 subsectors; a view cone passes tens), multiplying
+the per-visit CPU (mesh wall emit, pmesh pieces, sprite collect) that
+currently scales with ~9.** D3 therefore needs a real PVS: a baked
+per-subsector potentially-visible-set (computed at level load from portal
+windows, DOOM 64's model — fits the bake-everything architecture), so the
+traversal visits PVS∩frustum, not frustum. Without it the walk strip can
+easily cost more emit CPU than the 2.5 ms it saves — the exact "culling too
+loose" regression the plan warns about.
 
 **Sky.** With the walk gone there are no sky visplanes — and none are needed:
 draw the sky FIRST as an angle-mapped screen quad with z-test and z-write
