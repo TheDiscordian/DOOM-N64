@@ -5714,12 +5714,18 @@ static void DL_DrawZSkirts (void)
     ybot_lim = (float)SCREENHEIGHT + (float)DL_PM_GUARDY;
 
     // Z-only draw: the blender passes MEMORY through untouched, the z-buffer
-    // takes the skirt depth for pixels that pass the test.
+    // takes the skirt depth for pixels that pass the test. COVERAGE must be
+    // SAVEd too: the blender preserves colour, but the default CLAMP coverage
+    // write stacks the skirt's coverage onto the walls' already-full pixels,
+    // and the VI's AA filter renders the overflow as a darkened region the
+    // shape of the clamped quad (the user caught a grey triangle mid-wall at
+    // capture frame 256; the no-skirt A/B pinned it to this pass).
     rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
     rdpq_mode_persp(false);
     rdpq_mode_zbuf(true, true);
     rdpq_mode_alphacompare(0);
     rdpq_mode_blender(RDPQ_BLENDER((IN_RGB, ZERO, MEMORY_RGB, ONE)));
+    rdpq_change_other_modes_raw(SOM_COVERAGE_DEST_MASK, SOM_COVERAGE_DEST_SAVE);
 
     for (li = 0; li < numlines; li++)
     {
@@ -5813,6 +5819,7 @@ static void DL_DrawZSkirts (void)
         }
     }
     rdpq_mode_blender(0);
+    rdpq_change_other_modes_raw(SOM_COVERAGE_DEST_MASK, SOM_COVERAGE_DEST_CLAMP);
 
     {
         static unsigned zs_n = 0;
