@@ -5317,7 +5317,11 @@ static dl_masked_t* DL_MaskedBlock(int texnum)
         return NULL;
     if (!dl_masked)
     {
-        dl_masked = (dl_masked_t*)Z_Malloc(numtextures * sizeof(dl_masked_t), PU_STATIC, 0);
+        // +7 & ~7: the embedded aligned(8) tlut member needs an 8-aligned struct
+        // base, but Z_Malloc guarantees only 4 (the compiler emits doubleword
+        // stores for it -- a 4-aligned base traps with a misaligned write).
+        void* raw = Z_Malloc(numtextures * sizeof(dl_masked_t) + 7, PU_STATIC, 0);
+        dl_masked = (dl_masked_t*)(((uintptr_t)raw + 7) & ~(uintptr_t)7);
         memset(dl_masked, 0, numtextures * sizeof(dl_masked_t));
     }
     m = &dl_masked[texnum];
@@ -5690,7 +5694,11 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
         return NULL;
     if (!dl_sprblk)
     {
-        dl_sprblk = (dl_sprblk_t*)Z_Malloc(numspritelumps * sizeof(dl_sprblk_t), PU_STATIC, 0);
+        // +7 & ~7: 8-align the struct base for the aligned(8) tlut member
+        // (Z_Malloc guarantees only 4; a 4-aligned base traps on the compiler's
+        // doubleword stores -- this was a boot crash).
+        void* raw = Z_Malloc(numspritelumps * sizeof(dl_sprblk_t) + 7, PU_STATIC, 0);
+        dl_sprblk = (dl_sprblk_t*)(((uintptr_t)raw + 7) & ~(uintptr_t)7);
         memset(dl_sprblk, 0, numspritelumps * sizeof(dl_sprblk_t));
     }
     m = &dl_sprblk[sprlump];
