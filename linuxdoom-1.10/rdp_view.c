@@ -5782,6 +5782,18 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
     if (!m->tlraw) { m->block = NULL; Z_ChangeTag(p, PU_CACHE); return NULL; }
     m->tlut = (uint16_t*)(((uintptr_t)m->tlraw + 7) & ~(uintptr_t)7);
     DL_SpriteTLUTRefresh(m);
+#if N64_BENCH_MARKS
+    {
+        // Block-integrity hash for a host cross-check: FNV-1a over the whole
+        // scattered CI8 block. A PU_CACHE eviction mid-scatter (the bug the
+        // pin above closes) shows up as a mismatch vs the WAD-decoded truth.
+        uint32_t bh = 2166136261u;
+        int bn = m->rowb * m->mh;
+        for (i = 0; i < bn; i++) { bh ^= m->block[i]; bh *= 16777619u; }
+        debugf("SPRBLK lump=%d w=%d h=%d rowb=%d key=%d fnv=%08x\n",
+               sprlump, m->mw, m->mh, m->rowb, m->key, (unsigned)bh);
+    }
+#endif
     Z_ChangeTag(p, PU_CACHE);                    // un-pin the source patch
     return m;
 }
@@ -5811,22 +5823,6 @@ void DL_SpriteEmit (int sprlump, int x1, int x2, fixed_t startfrac, fixed_t xisc
     s->x1 = x1; s->x2 = x2;
     s->startfrac = startfrac; s->xiscale = xiscale;
     s->scale = scale; s->texturemid = texturemid;
-#ifdef N64_BENCH
-    {
-        // TEMP diagnostic (wide sprites = explosions): dump the emit inputs to
-        // pin the frame-2816 horizontal clip. Remove once diagnosed.
-        static int wide_logged = 0;
-        if (x2 - x1 > 100 && wide_logged < 40)
-        {
-            wide_logged++;
-            debugf("SPR-WIDE lump=%d x1=%d x2=%d sf=%d.%03d xis=%d.%03d sc=%d.%03d\n",
-                   sprlump, x1, x2,
-                   (int)(startfrac >> 16), (int)(((startfrac & 0xFFFF) * 1000) >> 16),
-                   (int)(xiscale >> 16), (int)(((xiscale & 0xFFFF) * 1000) >> 16),
-                   (int)(scale >> 16), (int)(((scale & 0xFFFF) * 1000) >> 16));
-        }
-    }
-#endif
     s->depth = (float)dfx * (1.0f / 65536.0f);
     s->rgba  = (cmlevel >= 0 && cmlevel < NUMCOLORMAPS) ? dl_prim_lut[cmlevel]
                                                         : dl_unlit_prim;
