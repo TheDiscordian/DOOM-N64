@@ -5894,7 +5894,14 @@ static void DL_DrawSpriteQuads (void)
         if (yb <= yt || t1 <= t0) continue;
 
         invw = 1.0f / s->depth;
-        zval = DL_WallZ(invw);
+        // Z from a toward-camera BIASED depth: a rocket blast erupts AT the wall
+        // it hit, so the sprite's centre depth ~equals the wall's -- an unbiased
+        // '<' test clips half the blast into the wall (found at capture frame
+        // 2816). Software's per-column drawseg optics give sprites the marginal
+        // win; an 8% + 2-unit bias reproduces that without breaking real
+        // occlusion (a monster a step behind a pillar stays hidden).
+        zval = DL_WallZ(1.0f / (s->depth * 0.92f - 2.0f > 1.0f
+                                ? s->depth * 0.92f - 2.0f : 1.0f));
         {
             // T-band the tall CI8 block through TMEM (cap rows/load); each band
             // is its own LOAD_TILE + quad. Screen y is linear in T, so band
