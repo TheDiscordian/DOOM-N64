@@ -2080,6 +2080,23 @@ void I_InitGraphics(void)
         screens[i + 1] = NULL;
     }
 
+    {
+        // Boot heap probe: the zone grab (I_ZoneBase, 4 MB) leaves the
+        // libdragon heap within ~1 KB of this function's needs -- image-size
+        // noise flips boot/death. Print the largest allocatable block and the
+        // zone's slack so the budget stays measurable in every boot log.
+        extern int Z_FreeMemory(void);
+        size_t probe = 1024 * 1024;
+        void*  pb;
+        while (probe >= 1024 && !(pb = malloc(probe)))
+            probe >>= 1;
+        if (probe >= 1024)
+            free(pb);
+        debugf("I_InitGraphics: heap largest-block ~%u KB, zone free %d KB, "
+               "aux need 3x%u KB\n", (unsigned)(probe / 1024),
+               Z_FreeMemory() / 1024, (unsigned)(aux_size / 1024));
+    }
+
     n64_aux_screens[0] = (byte*)malloc(aux_size);
     if (!n64_aux_screens[0])
         I_Error("I_InitGraphics: failed to allocate scratch screen 1");
