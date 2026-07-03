@@ -620,5 +620,8 @@ section records what changed and why, so the history is auditable:
   RDP point-sampling blockiness as on the accepted mesh walls.
 - **Perf:** `mesh-pmesh` 19227/37472 vs `mesh` 17667/32416 (+8.8% avg / +15.6% p95)
   -- CPU triangle emit, no culling levers yet; correctness first, per this plan.
-- **GATE: the user's eye.** ROMs: `/tmp/pmesh-timing.z64`, `/tmp/pmesh-marks2.z64`;
+- **GATE: the user's eye — STILLS PASSED (2026-07-03, "it's looking good" on the
+  zoomed capture panels).** The LIVE-MOTION check remains open (frozen captures
+  cannot show motion-class defects; the user declined a live run for now — re-offer
+  when convenient). ROMs: `/tmp/pmesh-timing.z64`, `/tmp/pmesh-marks2.z64`;
   captures `/tmp/cap/pmesh/`, comparison panels `/tmp/cap/cmp/`.
