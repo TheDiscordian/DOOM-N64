@@ -597,3 +597,28 @@ section records what changed and why, so the history is auditable:
    CPU emit first; no RSP anywhere near planes until the user's eye passes the CPU
    image.
 3. **Gate:** the user looks at it. Not a luminance table. Then Phases B/C/D as above.
+
+### Welded bake: built + machine-verified, awaiting the user's eye (2026-07-03)
+- **Stage 1 (bake, `5670167`+`9f2cb3e`):** `P_BakeWeldedPlanes` -- footprint trim,
+  weld, 512-grid cut, exact PU_LEVEL pools. E1M1: pieces=367 verts=1748 maxv=10
+  weld_ins=238 **TJUNC=0** spanmax=512/575. First boot trapped the FPU (2^31 grid
+  bound on map-edge overhang) -- fixed by clamping + trimming leaves to the sector
+  footprint before welding. Bake is load-time only (mesh bench unchanged).
+- **Stage 2 (runtime, `46cfb7f`+`a676e60`):** `DL_DrawPMeshPlanes` behind
+  `BENCH_FORCE_MESH_PMESH` (preset `mesh-pmesh`). Cull + transform + per-vertex
+  distance light + CPU emit; per-TRIANGLE canonical world-space clips (near, two
+  side guards, and a per-surface VERTICAL guard -- first capture review found
+  giant dark screen smears from |sy| overflowing the RDP's s11.2 edge-Y on
+  near-clipped verts under tall ceilings; the fourth clip plane fixed it,
+  re-verified gone at frames 896/4096).
+- **Verification run (agent protocol -- NOT the acceptance gate):** full 4117-frame
+  demo boots and completes; 36-frame capture sweep vs the frozen software refs
+  reviewed zoomed (floors, ceilings, junctions): no cracks, no seams, no smears,
+  no missing surfaces. `BENCH_VOID_SCAN` demo-wide: only known-benign frames 0 and
+  3213 (wipe). Residual notes: far-ceiling light reads slightly brighter than
+  software in dark distant areas (mild; same class as the RDP walls' look);
+  RDP point-sampling blockiness as on the accepted mesh walls.
+- **Perf:** `mesh-pmesh` 19227/37472 vs `mesh` 17667/32416 (+8.8% avg / +15.6% p95)
+  -- CPU triangle emit, no culling levers yet; correctness first, per this plan.
+- **GATE: the user's eye.** ROMs: `/tmp/pmesh-timing.z64`, `/tmp/pmesh-marks2.z64`;
+  captures `/tmp/cap/pmesh/`, comparison panels `/tmp/cap/cmp/`.
