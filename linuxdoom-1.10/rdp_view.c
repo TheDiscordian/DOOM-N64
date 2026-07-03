@@ -5821,6 +5821,12 @@ static void DL_DrawSpriteQuads (void)
     rdpq_mode_persp(true);
     rdpq_set_blend_color(RGBA32(0, 0, 0, 128));
     rdpq_mode_alphacompare(128);
+    // Z-TEST against the world, but do NOT Z-WRITE: co-located sprites (an
+    // exploding barrel and its blast share a map spot) sit at EQUAL depth, and
+    // a written Z makes the later, nearer-sorted sprite z-fail into holes. The
+    // far->near painter order already resolves sprite-vs-sprite; nothing draws
+    // after this pass that needs sprite Z.
+    rdpq_mode_zbuf(true, false);
 
     for (i = 0; i < dl_sprite_count; i++)
     {
