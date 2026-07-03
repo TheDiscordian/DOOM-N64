@@ -5698,7 +5698,7 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
 {
     extern int firstspritelump, numspritelumps;
     dl_sprblk_t* m;
-    const patch_t* p;
+    patch_t* p;   // non-const: Z_ChangeTag un-pins it through Z_ChangeTag2(void*)
     int  tw, th, col, i;
     int  used[256];
 
@@ -5717,13 +5717,20 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
         return m->block ? m : NULL;
     m->inited = 1;
 
-    p = (const patch_t*)W_CacheLumpNum(firstspritelump + sprlump, PU_CACHE);
+    // PIN the patch for the whole build: the Z_Mallocs below (block + TLUT) can
+    // EVICT a PU_CACHE lump, and this function holds the pointer across them --
+    // the scatter then walks freed memory (the frame-2816 blast lost its right
+    // half to exactly this; deterministic because the allocation sequence is).
+    p = (patch_t*)W_CacheLumpNum(firstspritelump + sprlump, PU_STATIC);
     if (!p)
         return NULL;
     tw = SHORT(p->width);
     th = SHORT(p->height);
     if (tw < 1 || tw > 256 || th < 1 || th > 200)
+    {
+        Z_ChangeTag(p, PU_CACHE);
         return NULL;
+    }
     m->mw = tw;
     m->mh = th;
     m->rowb = (tw + 7) & ~7;                     // CI8: 1 byte/texel, 8-byte pitch
@@ -5745,10 +5752,13 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
     for (i = 255; i >= 0; i--)                   // high indices are rarely used
         if (!used[i]) { m->key = i; break; }
     if (m->key < 0)
+    {
+        Z_ChangeTag(p, PU_CACHE);
         return NULL;                             // sprite uses all 256 (never happens)
+    }
 
     m->raw = Z_Malloc(m->rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
-    if (!m->raw) { m->block = NULL; return NULL; }
+    if (!m->raw) { m->block = NULL; Z_ChangeTag(p, PU_CACHE); return NULL; }
     m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
     memset(m->block, m->key, m->rowb * m->mh);
     for (col = 0; col < tw; col++)
@@ -5769,9 +5779,10 @@ static dl_sprblk_t* DL_SpriteBlock(int sprlump)
     data_cache_hit_writeback(m->block, m->rowb * m->mh);
 
     m->tlraw = Z_Malloc(256 * sizeof(uint16_t) + 7, PU_STATIC, (void**)&m->tlraw);
-    if (!m->tlraw) { m->block = NULL; return NULL; }
+    if (!m->tlraw) { m->block = NULL; Z_ChangeTag(p, PU_CACHE); return NULL; }
     m->tlut = (uint16_t*)(((uintptr_t)m->tlraw + 7) & ~(uintptr_t)7);
     DL_SpriteTLUTRefresh(m);
+    Z_ChangeTag(p, PU_CACHE);                    // un-pin the source patch
     return m;
 }
 
