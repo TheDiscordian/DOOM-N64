@@ -236,6 +236,7 @@ static double bake_pt_outside_dist (const bake_leaf_t* lf, double px, double py)
 }
 
 static void P_BakeWeldedPlanes (void);   // THE GOAL: welded plane mesh (defined below)
+static void P_BakeMidtex (void);         // Phase B: two-sided midtex quads (defined below)
 
 //
 // P_BakeLeafFans -- build the convex floor/ceiling polygon for every subsector and
@@ -1006,6 +1007,80 @@ void P_BakeWorldMesh (void)
 
     // Floor/ceiling convex leaf polygons (Phase 3 foundation; render wiring is next).
     P_BakeLeafFans ();
+
+    // Phase B: two-sided midtexture quads (masked textures on Z).
+    P_BakeMidtex ();
+}
+
+// ===========================================================================
+// Phase B bake: one quad per two-sided sidedef with a midtexture. Geometry +
+// pegging are static; the opening (max of the two floors .. min of the two
+// ceilings) is resolved LIVE at draw so doors/lifts move under the grate.
+// ===========================================================================
+bake_midtex_t* bake_midtex          = NULL;
+int            bake_nummidtex       = 0;
+byte*          bake_line_midtex     = NULL;
+int            bake_midtexvis_count = 0;
+
+static void P_BakeMidtex (void)
+{
+    int i, s, pass, want = 0;
+
+    bake_midtex = NULL; bake_nummidtex = 0; bake_line_midtex = NULL;
+    if (numlines <= 0)
+        return;
+    bake_line_midtex = Z_Malloc (numlines, PU_LEVEL, NULL);
+    memset (bake_line_midtex, 0, numlines);
+
+    for (pass = 0; pass < 2; pass++)
+    {
+        bake_nummidtex = 0;
+        for (i = 0; i < numlines; i++)
+        {
+            const line_t* ln = &lines[i];
+            if (!(ln->flags & ML_TWOSIDED) || ln->sidenum[1] < 0)
+                continue;
+            for (s = 0; s < 2; s++)
+            {
+                const side_t*   sd = &sides[ln->sidenum[s]];
+                sector_t*       fs = (s == 0) ? ln->frontsector : ln->backsector;
+                sector_t*       bs = (s == 0) ? ln->backsector  : ln->frontsector;
+                bake_midtex_t*  m;
+                double          dx, dy;
+                if (sd->midtexture <= 0 || !fs || !bs)
+                    continue;
+                if (pass == 0) { bake_nummidtex++; continue; }
+                m = &bake_midtex[bake_nummidtex++];
+                // this side's v1->v2 (the back side sees the line reversed)
+                if (s == 0) { m->x1 = ln->v1->x; m->y1 = ln->v1->y;
+                              m->x2 = ln->v2->x; m->y2 = ln->v2->y; }
+                else        { m->x1 = ln->v2->x; m->y1 = ln->v2->y;
+                              m->x2 = ln->v1->x; m->y2 = ln->v1->y; }
+                m->front_sec  = (int16_t)(fs - sectors);
+                m->back_sec   = (int16_t)(bs - sectors);
+                m->texture    = sd->midtexture;
+                m->line       = (short)i;
+                m->pegbottom  = (ln->flags & ML_DONTPEGBOTTOM) ? 1 : 0;
+                m->horizontal = (ln->v1->y == ln->v2->y) ? 1 : 0;
+                m->vertical   = (ln->v1->x == ln->v2->x) ? 1 : 0;
+                m->pad        = 0;
+                m->rowoffset     = sd->rowoffset;
+                m->textureoffset = sd->textureoffset;
+                dx = (double)(ln->v2->x - ln->v1->x) * (1.0 / 65536.0);
+                dy = (double)(ln->v2->y - ln->v1->y) * (1.0 / 65536.0);
+                m->slen = (fixed_t)(sqrt (dx * dx + dy * dy) * 65536.0);
+                bake_line_midtex[i] = 1;
+            }
+        }
+        if (pass == 0)
+        {
+            want = bake_nummidtex;
+            if (want <= 0) return;
+            bake_midtex = Z_Malloc (sizeof(bake_midtex_t) * want, PU_LEVEL, NULL);
+        }
+    }
+    debugf ("P_BakeMidtex: baked %d midtex quads (of %d linedefs)\n",
+            bake_nummidtex, numlines);
 }
 
 //
@@ -1016,6 +1091,7 @@ void R_MeshResetVis (void)
 {
     if (bake_linevis)
         memset (bake_linevis, 0, bake_numlines);
+    bake_midtexvis_count = 0;
 }
 
 //
@@ -1025,7 +1101,11 @@ void R_MeshResetVis (void)
 void R_MeshMarkLine (int lineidx)
 {
     if (bake_linevis && (unsigned)lineidx < (unsigned)bake_numlines)
+    {
+        if (!bake_linevis[lineidx] && bake_line_midtex && bake_line_midtex[lineidx])
+            bake_midtexvis_count++;              // masked render-gate term
         bake_linevis[lineidx] = 1;
+    }
 }
 
 //

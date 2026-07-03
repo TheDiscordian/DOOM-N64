@@ -5270,6 +5270,354 @@ int DL_PMeshPending (void)
     return (n64_rdp_mesh_pmesh && bake_leafvis_count > 0) ? 1 : 0;
 }
 
+// ===========================================================================
+// Phase B (GPU_PORT_PLAN): two-sided MIDTEXTURES on Z. Baked quads
+// (bake_midtex), live opening from the two sectors, Z-tested against the
+// opaque world with binary transparency: the masked CI4 block reserves index
+// 15 as the KEY (TLUT alpha 0) and the pass draws with RDP alpha-compare, so
+// transparent texels write neither colour nor Z -- order-free vs the world and
+// vs each other. Removes one of the two drawseg consumers (sprites remain).
+// ===========================================================================
+#define DL_MT_KEY 15    // reserved CI4 index for transparent texels (TLUT alpha 0)
+
+// Masked texture cache: separate from dl_rowmajor (walls assume SOLID columns;
+// masked columns are POST runs with gaps). Few masked textures per level, so
+// blocks stay PU_STATIC for the level (no demote machinery). Stored dims are
+// point-sample-halved to <=64x64 CI4 = 2 KB -> ONE TMEM load; heights need no
+// wrap (midtex never tile vertically -> t clamp), widths are pow2 (s wrap).
+typedef struct {
+    void*    raw;
+    byte*    block;             // 8-aligned CI4, mw/2 bytes per row
+    int      mw, mh;            // stored dims (<=64)
+    uint8_t  ds, ts;            // point-sample halving shifts from native dims
+    uint8_t  inited, nsub;
+    uint16_t tlut[16] __attribute__((aligned(8)));   // [15] = 0x0000 key; the
+                                // buffer PERSISTS (async LOAD_TLUT reads it by
+                                // physical address long after we return)
+} dl_masked_t;
+static dl_masked_t* dl_masked;          // [numtextures], lazy
+int n64_rdp_mesh_masked = 0;            // BENCH_FORCE_MESH_MASKED (d_main.c)
+
+// Build (or fetch) the masked CI4 block for a texture. Post-walks each column
+// (the r_segs masked pattern: R_GetColumn - 3 -> column_t), histograms only
+// OPAQUE texels, keeps the 15 most frequent PLAYPAL colours (nearest-fit for
+// the rest), fills gaps with DL_MT_KEY. NULL on refusal (caller keeps software).
+static dl_masked_t* DL_MaskedBlock(int texnum)
+{
+    dl_masked_t* m;
+    const byte*  playpal;
+    int  tw, th, col, i;
+    int  freq[256];
+    uint8_t remap[256];
+    uint8_t pal_idx[16];
+    int  nsub = 0;
+
+    if (texnum < 0 || texnum >= numtextures)
+        return NULL;
+    if (!dl_masked)
+    {
+        dl_masked = (dl_masked_t*)Z_Malloc(numtextures * sizeof(dl_masked_t), PU_STATIC, 0);
+        memset(dl_masked, 0, numtextures * sizeof(dl_masked_t));
+    }
+    m = &dl_masked[texnum];
+    if (m->inited)
+        return m->block ? m : NULL;
+    m->inited = 1;
+
+    tw = texturewidthmask[texnum] + 1;
+    th = textureheight[texnum] >> FRACBITS;
+    playpal = (const byte*)W_CacheLumpName("PLAYPAL", PU_CACHE);
+    if (!playpal || tw < 8 || tw > 128 || th < 1 || th > 128)
+        return NULL;                            // out of slice-1 bounds -> software
+
+    // ---- opaque-texel histogram via post walk ----
+    memset(freq, 0, sizeof(freq));
+    for (col = 0; col < tw; col++)
+    {
+        const column_t* c = (const column_t*)((const byte*)R_GetColumn(texnum, col) - 3);
+        while (c->topdelta != 0xff)
+        {
+            const byte* src = (const byte*)c + 3;
+            for (i = 0; i < c->length; i++)
+                freq[src[i]]++;
+            c = (const column_t*)((const byte*)c + c->length + 4);
+        }
+    }
+    // 15 most frequent colours become the sub-palette; the rest nearest-fit.
+    memset(remap, 0, sizeof(remap));
+    for (nsub = 0; nsub < 15; nsub++)
+    {
+        int best = -1, bestf = 0;
+        for (i = 0; i < 256; i++)
+            if (freq[i] > bestf) { bestf = freq[i]; best = i; }
+        if (best < 0) break;
+        pal_idx[nsub] = (uint8_t)best;
+        freq[best] = -1;                        // consumed
+        {
+            uint8_t r = gammatable[usegamma][playpal[best*3+0]];
+            uint8_t g = gammatable[usegamma][playpal[best*3+1]];
+            uint8_t b = gammatable[usegamma][playpal[best*3+2]];
+            m->tlut[nsub] = (uint16_t)(((r >> 3) << 11) | ((g >> 3) << 6)
+                                       | ((b >> 3) << 1) | 1);
+        }
+    }
+    if (nsub == 0)
+        return NULL;
+    m->nsub = (uint8_t)nsub;
+    m->tlut[DL_MT_KEY] = 0;                     // alpha 0: the key
+    for (i = nsub; i < DL_MT_KEY; i++) m->tlut[i] = m->tlut[0];
+    for (i = 0; i < 256; i++)                   // nearest-fit remap (gamma RGB)
+    {
+        int k, bk = 0; long bd = 0x7FFFFFFF;
+        int r = gammatable[usegamma][playpal[i*3+0]];
+        int g = gammatable[usegamma][playpal[i*3+1]];
+        int b = gammatable[usegamma][playpal[i*3+2]];
+        for (k = 0; k < nsub; k++)
+        {
+            int pr = gammatable[usegamma][playpal[pal_idx[k]*3+0]];
+            int pg = gammatable[usegamma][playpal[pal_idx[k]*3+1]];
+            int pb = gammatable[usegamma][playpal[pal_idx[k]*3+2]];
+            long d = (long)(r-pr)*(r-pr) + (long)(g-pg)*(g-pg) + (long)(b-pb)*(b-pb);
+            if (d < bd) { bd = d; bk = k; }
+        }
+        remap[i] = (uint8_t)bk;
+    }
+
+    // ---- CI4 block: key-filled, point-sample halved to <=64x64 ----
+    m->ds = (tw > 64) ? 1 : 0;
+    m->ts = (th > 64) ? 1 : 0;
+    m->mw = tw >> m->ds;
+    m->mh = th >> m->ts;
+    {
+        int rowb = m->mw / 2;                   // CI4: 2 texels/byte
+        m->raw = Z_Malloc(rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
+        if (!m->raw) { m->block = NULL; return NULL; }
+        m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
+        memset(m->block, (DL_MT_KEY << 4) | DL_MT_KEY, rowb * m->mh);
+        for (col = 0; col < tw; col += (1 << m->ds))
+        {
+            const column_t* c = (const column_t*)((const byte*)R_GetColumn(texnum, col) - 3);
+            int dcol = col >> m->ds;
+            while (c->topdelta != 0xff)
+            {
+                const byte* src = (const byte*)c + 3;
+                for (i = 0; i < c->length; i++)
+                {
+                    int row = c->topdelta + i;
+                    if (m->ts && (row & 1)) continue;
+                    row >>= m->ts;
+                    if (row >= m->mh) break;
+                    {
+                        byte* dst = &m->block[row * rowb + (dcol >> 1)];
+                        byte  v   = remap[src[i]];
+                        if (dcol & 1) *dst = (byte)((*dst & 0xF0) | v);
+                        else          *dst = (byte)((*dst & 0x0F) | (v << 4));
+                    }
+                }
+                c = (const column_t*)((const byte*)c + c->length + 4);
+            }
+        }
+        data_cache_hit_writeback(m->block, rowb * m->mh);
+    }
+    return m;
+}
+
+// Per-corner wall distance light -> packed RGBA (mirrors software's
+// walllights[spryscale >> LIGHTSCALESHIFT] with the horizontal/vertical tweak
+// already folded into lnum). scale = centerx/depth, as software's spryscale.
+static uint32_t DL_MTShade(int lnum, float sc)
+{
+    extern lighttable_t* fixedcolormap;
+    extern lighttable_t* scalelight[LIGHTLEVELS][MAXLIGHTSCALE];
+    int idx, lv;
+    if (fixedcolormap)
+    {
+        lv = (int)((fixedcolormap - colormaps) / 256);
+        if (lv < 0) lv = 0;
+        if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+        return dl_prim_lut[lv];
+    }
+    if (lnum < 0) lnum = 0;
+    if (lnum >= LIGHTLEVELS) lnum = LIGHTLEVELS - 1;
+    idx = (int)(sc * 16.0f);                    // (sc<<16) >> LIGHTSCALESHIFT(12)
+    if (idx < 0) idx = 0;
+    if (idx >= MAXLIGHTSCALE) idx = MAXLIGHTSCALE - 1;
+    lv = (int)((scalelight[lnum][idx] - colormaps) / 256);
+    if (lv < 0) lv = 0;
+    if (lv > NUMCOLORMAPS - 1) lv = NUMCOLORMAPS - 1;
+    return dl_prim_lut[lv];
+}
+
+// Draw the visible baked midtex quads. Z-test + Z-write with alpha-compare
+// (key texels write nothing). Called from DL_Flush AFTER the opaque world,
+// while the Z-buffer is still enabled.
+static void DL_DrawMaskedQuads(void)
+{
+    extern int extralight;
+    fixed_t vcos, vsin;
+    float vxf, vyf, vcosf, vsinf, cxf, cyf, viewzf, edge_min;
+    float KL, KR;
+    int   i, drew = 0, curtex = -1;
+
+    if (!n64_rdp_mesh_masked || !DL_MeshRouteOn() || !bake_midtex || !bake_linevis
+        || !dl_wall_z || bake_midtexvis_count <= 0)
+        return;
+
+    vcos = finecosine[viewangle >> ANGLETOFINESHIFT];
+    vsin = finesine[viewangle >> ANGLETOFINESHIFT];
+    vxf = (float)viewx * (1.0f / 65536.0f);
+    vyf = (float)viewy * (1.0f / 65536.0f);
+    vcosf = (float)vcos * (1.0f / 65536.0f);
+    vsinf = (float)vsin * (1.0f / 65536.0f);
+    cxf = (float)centerx;
+    cyf = (float)centery;
+    viewzf = (float)viewz * (1.0f / 65536.0f);
+    KL = (cxf + DL_PM_GUARDX) / cxf;
+    KR = ((float)SCREENWIDTH - cxf + DL_PM_GUARDX) / cxf;
+    edge_min = ((cyf < (float)SCREENHEIGHT - cyf) ? cyf : (float)SCREENHEIGHT - cyf)
+             + DL_PM_GUARDY;
+
+    // one-time pass state; per-texture TLUT slot 15 + tile bound on switch
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_SHADE);
+    rdpq_mode_persp(true);
+    rdpq_set_blend_color(RGBA32(0, 0, 0, 128));
+    rdpq_mode_alphacompare(128);                // kill key texels (no colour, no Z)
+
+    for (i = 0; i < bake_nummidtex; i++)
+    {
+        const bake_midtex_t* mt = &bake_midtex[i];
+        dl_masked_t* mb;
+        sector_t *fs, *bs;
+        fixed_t opz_bot, opz_top, texmid, texh;
+        float ax, ay, bx, by, dA, dB, lA, lB, sA, sB;
+        float ztopf, zbotf, hfw, near_eff, t0, t1;
+        int   texnum, lnum;
+
+        if (!bake_linevis[mt->line]) continue;
+        texnum = texturetranslation[mt->texture];
+        mb = DL_MaskedBlock(texnum);
+        if (!mb) continue;                       // refused -> software drew it? (no:
+                                                 // suppression is global; refusals are
+                                                 // out-of-bounds textures, logged once)
+        fs = &sectors[mt->front_sec];
+        bs = &sectors[mt->back_sec];
+        opz_bot = (fs->floorheight  > bs->floorheight)  ? fs->floorheight  : bs->floorheight;
+        opz_top = (fs->ceilingheight < bs->ceilingheight) ? fs->ceilingheight : bs->ceilingheight;
+        texh = textureheight[texnum];
+        texmid = mt->pegbottom ? (opz_bot + texh) : opz_top;
+        texmid += mt->rowoffset;
+        // drawn extent = opening intersected with the single texture run
+        if (texmid < opz_top) opz_top = texmid;
+        if (texmid - texh > opz_bot) opz_bot = texmid - texh;
+        if (opz_top <= opz_bot) continue;
+
+        ax = (float)mt->x1 * (1.0f / 65536.0f); ay = (float)mt->y1 * (1.0f / 65536.0f);
+        bx = (float)mt->x2 * (1.0f / 65536.0f); by = (float)mt->y2 * (1.0f / 65536.0f);
+        dA = (ax - vxf) * vcosf + (ay - vyf) * vsinf;
+        dB = (bx - vxf) * vcosf + (by - vyf) * vsinf;
+        lA = (ay - vyf) * vcosf - (ax - vxf) * vsinf;
+        lB = (by - vyf) * vcosf - (bx - vxf) * vsinf;
+        sA = (float)mt->textureoffset * (1.0f / 65536.0f);
+        sB = sA + (float)mt->slen * (1.0f / 65536.0f);
+        ztopf = (float)opz_top * (1.0f / 65536.0f) - viewzf;
+        zbotf = (float)opz_bot * (1.0f / 65536.0f) - viewzf;
+        hfw = (ztopf > -zbotf) ? ztopf : -zbotf;          // worst |height - eye|
+        if (hfw < 0.0f) hfw = 0.0f;
+        near_eff = DL_PM_NEARZ;
+        if (hfw * cxf / edge_min > near_eff) near_eff = hfw * cxf / edge_min;
+
+        // clip the SEGMENT's t-interval against near + the two side guards
+        // (depth and lat are linear in t; S lerps with t)
+        t0 = 0.0f; t1 = 1.0f;
+        {
+            float f0, f1, planes[3][2];
+            int   pl2;
+            planes[0][0] = dA - near_eff;      planes[0][1] = dB - near_eff;
+            planes[1][0] = KL * dA - lA;       planes[1][1] = KL * dB - lB;
+            planes[2][0] = KR * dA + lA;       planes[2][1] = KR * dB + lB;
+            for (pl2 = 0; pl2 < 3; pl2++)
+            {
+                f0 = planes[pl2][0]; f1 = planes[pl2][1];
+                if (f0 < 0.0f && f1 < 0.0f) { t0 = 1.0f; t1 = 0.0f; break; }
+                if (f0 < 0.0f) { float t = f0 / (f0 - f1); if (t > t0) t0 = t; }
+                if (f1 < 0.0f) { float t = f0 / (f0 - f1); if (t < t1) t1 = t; }
+            }
+        }
+        if (t0 >= t1) continue;
+
+        if (texnum != curtex)                    // bind block + TLUT on switch
+        {
+            surface_t ms = surface_make_linear(mb->block, FMT_CI4, mb->mw, mb->mh);
+            rdpq_tex_upload_tlut(mb->tlut, DL_MT_KEY * 16, 16);
+            {
+                rdpq_tileparms_t tp;
+                memset(&tp, 0, sizeof(tp));
+                tp.palette = DL_MT_KEY;          // CI4 palette slot 15 (pass-owned)
+                tp.s.mask  = 0; tp.t.mask = 0;   // wrap via block period; T never tiles
+                {
+                    int msk = 0, w2 = mb->mw;
+                    while (w2 > 1) { msk++; w2 >>= 1; }
+                    tp.s.mask = msk;
+                }
+                rdpq_set_tile(TILE0, FMT_CI4, 0, mb->mw / 2, &tp);
+            }
+            rdpq_set_texture_image(&ms);
+            rdpq_load_tile(TILE0, 0, 0, mb->mw, mb->mh);
+            curtex = texnum;
+        }
+
+        {
+            float vx4[4][10];
+            float dt0 = dA + t0 * (dB - dA), dt1 = dA + t1 * (dB - dA);
+            float lt0 = lA + t0 * (lB - lA), lt1 = lA + t1 * (lB - lA);
+            float st0 = sA + t0 * (sB - sA), st1 = sA + t1 * (sB - sA);
+            float tmf = (float)texmid * (1.0f / 65536.0f) - viewzf;
+            float ttop = (tmf - ztopf), tbot = (tmf - zbotf);   // texel rows
+            int   c, e;
+            lnum = (fs->lightlevel >> LIGHTSEGSHIFT) + extralight
+                 - (mt->horizontal ? 1 : 0) + (mt->vertical ? 1 : 0);
+            for (e = 0; e < 2; e++)              // corner columns: 0 = t0, 1 = t1
+            {
+                float d = e ? dt1 : dt0, l = e ? lt1 : lt0, s = e ? st1 : st0;
+                float invw = 1.0f / d, sc = cxf * invw;
+                uint32_t rgba = DL_MTShade(lnum, sc);
+                for (c = 0; c < 2; c++)          // 0 = top, 1 = bottom
+                {
+                    float* v = vx4[e * 2 + c];
+                    float  z = c ? zbotf : ztopf;
+                    v[0] = cxf - l * sc;
+                    v[1] = cyf - z * sc;
+                    v[2] = DL_WallZ(invw);
+                    v[3] = (float)((rgba >> 24) & 0xFF) * (1.0f / 255.0f);
+                    v[4] = (float)((rgba >> 16) & 0xFF) * (1.0f / 255.0f);
+                    v[5] = (float)((rgba >>  8) & 0xFF) * (1.0f / 255.0f);
+                    v[6] = 1.0f;
+                    v[7] = s / (float)(1 << mb->ds);
+                    v[8] = (c ? tbot : ttop) / (float)(1 << mb->ts);
+                    v[9] = invw;
+                }
+            }
+            // quad = (A-top, B-top, A-bot) + (B-top, B-bot, A-bot)
+            rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[0], vx4[2], vx4[1]);
+            rdpq_triangle(&TRIFMT_ZBUF_SHADE_TEX, vx4[2], vx4[3], vx4[1]);
+            drew += 2;
+        }
+    }
+    rdpq_mode_alphacompare(0);                   // restore for the overlay path
+
+    {
+        static unsigned mt_n = 0;
+        if ((mt_n++ & 511) == 0)
+            debugf("MESH-MASKED: midtex tris=%d (alpha-compare on Z)\n", drew);
+    }
+}
+
+// Masked work queued this frame (I_FinishUpdate render-gate term).
+int DL_MaskedPending (void)
+{
+    return (n64_rdp_mesh_masked && bake_midtexvis_count > 0) ? 1 : 0;
+}
+
 static void DL_DrawWorldZPlanes(void)
 {
     fixed_t vcos, vsin;
@@ -6794,6 +7142,10 @@ void DL_Flush(void)
     // still enabled, so the walls just drawn occlude the floors correctly. Same world
     // textured mode (TEX0*PRIM, persp on). Self-gates on DL_MeshRouteOn + a z-image.
     DL_DrawMeshLeaves();
+
+    // Phase B: masked midtextures, Z-tested against the opaque world just drawn
+    // (alpha-compare keys out the transparent texels -- no colour, no Z write).
+    DL_DrawMaskedQuads();
 
     // Walls done -- the planes/spans below draw WITHOUT the Z-buffer.
     if (dl_wall_z)

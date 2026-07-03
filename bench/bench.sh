@@ -39,6 +39,7 @@ preset_flags() {
         mesh-cull)      echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_CULL=1" ;;  # mesh's own frustum visibility vs BSP solidsegs
         mesh-worldz)    echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_WORLDZ=1" ;;# Option 3 Phase A: opaque Z-tested world planes
         mesh-pmesh)     echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_PMESH=1" ;; # THE GOAL: welded static plane mesh (no runtime cutting)
+        mesh-pmesh-masked) echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_PMESH=1 BENCH_FORCE_MESH_MASKED=1" ;; # + Phase B: midtex on Z (alpha-keyed)
         mesh-floors)    echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_FLOORS=1" ;;# + baked floor/ceiling leaf fans (CPU leaf transform)
         mesh-leaf-rsp)  echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_FLOORS=1 BENCH_FORCE_MESH_LEAF_RSP=1" ;; # + leaf transform on the RSP (Phase 4)
         mesh-rsp-emit)  echo "BENCH_FORCE_MESH=1 BENCH_FORCE_MESH_RSP_EMIT=1" ;; # KEYSTONE: RSP transforms AND emits the wall RDP tris (no batch_out readback)
@@ -46,7 +47,7 @@ preset_flags() {
     esac
 }
 
-PRESET_LIST="software rdp planes-only walls-only mesh mesh-cpu mesh-cull mesh-worldz mesh-pmesh mesh-floors mesh-leaf-rsp mesh-rsp-emit"
+PRESET_LIST="software rdp planes-only walls-only mesh mesh-cpu mesh-cull mesh-worldz mesh-pmesh mesh-pmesh-masked mesh-floors mesh-leaf-rsp mesh-rsp-emit"
 
 usage() {
     echo "usage: bench/bench.sh <preset> [<preset> ...]   (or --list)" >&2

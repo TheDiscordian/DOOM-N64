@@ -105,6 +105,33 @@ extern int             bake_numpmpieces;
 extern fixed_t       (*bake_pm_verts)[2]; // shared piece vertex pool (map x,y)
 extern int             bake_numpmverts;
 
+// One baked two-sided MIDTEXTURE quad (Phase B: masked textures on Z). Geometry
+// and pegging are baked; the OPENING is resolved live per frame from the two
+// sector references (max of the floors .. min of the ceilings -- doors/lifts
+// move), exactly mirroring R_RenderMaskedSegRange's dc_texturemid derivation.
+// Midtextures never tile vertically (a single run of posts), so the drawn quad
+// is the opening intersected with [texturemid - textureheight, texturemid].
+typedef struct
+{
+    fixed_t x1, y1, x2, y2;    // line endpoints in this SIDE's v1->v2 order
+    int16_t front_sec;         // this side's sector (light + h/v light tweak)
+    int16_t back_sec;          // the other side (opening = both sectors, live)
+    short   texture;           // sidedef midtexture (texturetranslation at draw)
+    short   line;              // owning linedef (per-frame vis via bake_linevis)
+    uint8_t pegbottom;         // ML_DONTPEGBOTTOM (texturemid anchors to floors)
+    uint8_t horizontal;        // v1.y==v2.y (software's lightnum-1 tweak)
+    uint8_t vertical;          // v1.x==v2.x (software's lightnum+1 tweak)
+    uint8_t pad;
+    fixed_t rowoffset;         // sidedef rowoffset (16.16)
+    fixed_t textureoffset;     // sidedef textureoffset = S at v1 (16.16 texels)
+    fixed_t slen;              // wall length (16.16 texels); S at v2 = off + slen
+} bake_midtex_t;
+
+extern bake_midtex_t* bake_midtex;         // PU_LEVEL, one per two-sided midtex side
+extern int            bake_nummidtex;
+extern byte*          bake_line_midtex;    // [numlines] 1 = line has baked midtex
+extern int            bake_midtexvis_count;// marked midtex lines this frame (gate)
+
 // Per-subsector visibility, set during the BSP walk (R_Subsector marks each leaf it
 // reaches) and consumed by DL_MeshDrawLeaves so only visible leaves transform/draw.
 // PU_LEVEL, sized numsubsectors. Reset each frame (R_MeshResetLeafVis).

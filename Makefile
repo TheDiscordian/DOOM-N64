@@ -168,6 +168,13 @@ endif
 ifeq ($(BENCH_FORCE_MESH_PMESH),1)
 CFLAGS += -DBENCH_FORCE_MESH_PMESH=1
 endif
+#   BENCH_FORCE_MESH_MASKED=1 -> Phase B (GPU_PORT_PLAN): two-sided midtextures as
+#   RDP quads, Z-tested against the opaque world with alpha-compare transparency
+#   (masked CI4 block reserves index 15 as the TLUT alpha-0 key). Software
+#   R_RenderMaskedSegRange is suppressed; drawsegs remain for sprite clipping.
+ifeq ($(BENCH_FORCE_MESH_MASKED),1)
+CFLAGS += -DBENCH_FORCE_MESH_MASKED=1
+endif
 #   BENCH_FORCE_MESH_CULL=1 -> the mesh's OWN visibility: mark walls by frustum (every
 #   wall in a frustum-visible subsector) instead of the BSP solidsegs occlusion. Wall-Z
 #   handles overdraw. First step toward replacing the per-seg BSP occlusion walk.

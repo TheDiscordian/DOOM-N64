@@ -122,7 +122,16 @@ R_RenderMaskedSegRange
     column_t*	col;
     int		lightnum;
     int		texnum;
-    
+
+    // Phase B (GPU_PORT_PLAN): midtextures draw on the RDP (DL_DrawMaskedQuads,
+    // Z-tested + alpha-keyed). The drawsegs and their clip arrays still exist --
+    // sprites keep consuming them until Phase C.
+    {
+        extern int n64_rdp_mesh_masked;
+        if (n64_rdp_mesh_masked)
+            return;
+    }
+
     // Calculate light table.
     // Use different light tables
     //   for horizontal / vertical / diagonal. Diagonal?

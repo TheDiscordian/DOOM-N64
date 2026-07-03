@@ -266,7 +266,9 @@ extern int n64_rdp_mesh_cull;   // BENCH_FORCE_MESH_CULL: mesh's own frustum wal
 extern int n64_rdp_mesh_floors; // Phase 3 floor leaves (BENCH_FORCE_MESH_FLOORS); OFF = perf loss
 extern int n64_rdp_mesh_worldz; // Option 3 Phase A: opaque Z-tested world planes
 extern int n64_rdp_mesh_pmesh;  // THE GOAL: welded static plane mesh (no runtime cutting)
+extern int n64_rdp_mesh_masked; // Phase B: midtextures on Z (BENCH_FORCE_MESH_MASKED)
 int  DL_PMeshPending(void);     // welded-plane work queued this frame (I_FinishUpdate gate)
+int  DL_MaskedPending(void);    // masked-midtex work queued this frame (same gate)
 #ifdef BENCH_FORCE_MESH_RSP
 extern int n64_rdp_mesh_rsp;    // RSP port (BENCH_FORCE_MESH_RSP); Phase 0 = DMA loopback probe only
 #endif

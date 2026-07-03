@@ -1357,7 +1357,7 @@ void I_FinishUpdate(void)
     // counted by none of the other terms -- a floors-only frame must still colour-clear
     // + flush or the triple-buffered fb ghosts (same failure class as RSP-emit walls).
     if (rdp_on && (DL_Count() + DL_SpanCount() + DL_PolyCount() + DL_RSPEmitPending()
-                   + DL_PMeshPending()) > 0)
+                   + DL_PMeshPending() + DL_MaskedPending()) > 0)
     {
         int vx0 = viewwindowx;
         int vy0 = viewwindowy;

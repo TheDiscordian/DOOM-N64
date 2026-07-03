@@ -2247,6 +2247,15 @@ void D_DoomMain (void)
         debugf("BENCH: MESH WELDED-PLANES ON (static welded mesh, no runtime cutting)\n");
     }
 #endif
+#ifdef BENCH_FORCE_MESH_MASKED
+    // Phase B (GPU_PORT_PLAN): two-sided midtextures on the RDP, Z-tested with
+    // alpha-compare transparency; software R_RenderMaskedSegRange suppressed.
+    {
+        extern int n64_rdp_mesh_masked;
+        n64_rdp_mesh_masked = 1;
+        debugf("BENCH: MESH MASKED midtex ON (Z-tested, alpha-keyed)\n");
+    }
+#endif
 #ifdef BENCH_FORCE_MESH_CULL
     // The mesh's OWN visibility: mark walls by frustum (every wall in a frustum-visible
     // subsector), not the BSP solidsegs occlusion. Wall-Z handles overdraw. First step
