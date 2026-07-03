@@ -4977,6 +4977,16 @@ static void DL_WZShade4(int level, float out[4])
 // ===========================================================================
 #define DL_PM_NEARZ   6.0f     // true near (map units), matches the wall path margin
 #define DL_PM_GUARDX  160.0f   // off-screen slack (px) before the side guard planes
+#define DL_PM_GUARDY  800.0f   // off-screen slack (px) before the vertical guard plane:
+                               // sy = centery - hf*centerx/depth grows without bound as
+                               // depth -> NEARZ under a tall ceiling / above a deep floor,
+                               // and the RDP edge-walker Y field is s11.2 (~+/-2047) -- an
+                               // unbounded vertex corrupts the triangle into a giant
+                               // screen-covering smear (PAST_BUGS: "Y is not safe").
+                               // sy is linear in world XY per surface height, so the bound
+                               // is one more canonical world-space clip plane (weld-safe:
+                               // same-height neighbours share the identical plane;
+                               // different-height neighbours are separated by step walls).
 
 typedef struct {
     float   vxf, vyf, vcosf, vsinf, cxf, cyf;  // view constants (cyf = centery)
@@ -5168,6 +5178,7 @@ static void DL_DrawPMeshPlanes (void)
                 float   pw[96][2];
                 int     pin[96];
                 fixed_t height, phfix;
+                float   ya, yb, yc, yedge;
                 int     n = p->numverts, k, allin, anynear, pic;
                 pic = surf ? sectors[p->sector].ceilingpic : sectors[p->sector].floorpic;
                 if (flattranslation[pic] != flatidx) continue;
@@ -5182,6 +5193,19 @@ static void DL_DrawPMeshPlanes (void)
                 cx.ubias = p->ubias;
                 cx.vbias = p->vbias;
 
+                // Vertical guard plane (per surface height): bound sy before the RDP
+                // edge-walker Y field can overflow. Ceilings (hf>0) rise toward the
+                // TOP edge, floors (hf<0) toward the BOTTOM edge:
+                //   ceiling: hf*centerx <= (centery+GUARDY)*depth
+                //   floor : -hf*centerx <= (SCREENHEIGHT-centery+GUARDY)*depth
+                // Both are (const - EDGE*depth) <= 0 -- linear in world XY.
+                yedge = surf ? (cx.cyf + DL_PM_GUARDY)
+                             : ((float)SCREENHEIGHT - cx.cyf + DL_PM_GUARDY);
+                ya = -yedge * cx.vcosf;
+                yb = -yedge * cx.vsinf;
+                yc = (surf ? cx.hf : -cx.hf) * cx.cxf
+                   + yedge * (cx.vcosf * cx.vxf + cx.vsinf * cx.vyf);
+
                 allin = 1; anynear = 0;
                 for (k = 0; k < n; k++)
                 {
@@ -5192,6 +5216,7 @@ static void DL_DrawPMeshPlanes (void)
                     if (na * x + nb * y + nc > 0.0f) in_ = 0; else anynear = 1;
                     if (la * x + lb * y + lc > 0.0f) in_ = 0;
                     if (ra * x + rb * y + rc > 0.0f) in_ = 0;
+                    if (ya * x + yb * y + yc > 0.0f) in_ = 0;
                     pin[k] = in_;
                     if (!in_) allin = 0;
                 }
@@ -5221,7 +5246,9 @@ static void DL_DrawPMeshPlanes (void)
                     if (m < 3) continue;
                     m = DL_PMClip((const float (*)[2])cb_, m, ra, rb, rc, ca_);
                     if (m < 3) continue;
-                    drew += DL_PMEmitPoly(&cx, (const float (*)[2])ca_, m);
+                    m = DL_PMClip((const float (*)[2])ca_, m, ya, yb, yc, cb_);
+                    if (m < 3) continue;
+                    drew += DL_PMEmitPoly(&cx, (const float (*)[2])cb_, m);
                 }
             }
         }
