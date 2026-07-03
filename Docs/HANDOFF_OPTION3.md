@@ -96,6 +96,14 @@ CI4 damage-flash / fixedcolormap per surface, back-to-front sort where blending 
 - **The gate is the user's eye at the edges** (seams inside floors, band lines,
   wall junctions, stability in motion). No metric passes a build — the world-Z slice
   passed every metric below and still failed review (jagged edges, 2026-07-02).
+- **Evidence for the user = EVERY mark frame as a FULL-frame A/B pair (RDP |
+  software), in frame order, no zooms, no curation** (stated three times by
+  2026-07-03; a curated top-5 + region zooms missed defects twice — the user's
+  eye found the frame-768 seam wedges in a full pair after the assistant's
+  picks skipped it). Zoomed crops are for the assistant's OWN diagnosis only,
+  never the review deliverable. Machine sweeps run BOTH metrics: warm-pixel
+  bands (bright defects) AND the dark-vs-lit structural count vs a baseline
+  set (`darksweep`-style; black wedges are invisible to the warm metric).
 - `BENCH_VOID_SCAN` is a WEAK oracle — only catches ≥40% black. The
   **region-luminance A/B** (same-geometry `BENCH_MARKS` captures of candidate + poly
   baseline + frozen software ref at `~/.local/share/doom-n64-bench/ref-sw-frozen/`
