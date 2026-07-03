@@ -5389,7 +5389,9 @@ static dl_masked_t* DL_MaskedBlock(int texnum)
     m->mw = tw >> m->ds;
     m->mh = th >> m->ts;
     {
-        int rowb = m->mw / 2;                   // CI4: 2 texels/byte
+        // CI4: 2 texels/byte; pad narrow rows to 8 bytes (LOAD_TILE row alignment,
+        // same padding rule as the wall block path)
+        int rowb = ((m->mw < 16) ? 16 : m->mw) / 2;
         m->raw = Z_Malloc(rowb * m->mh + 7, PU_STATIC, (void**)&m->raw);
         if (!m->raw) { m->block = NULL; return NULL; }
         m->block = (byte*)(((uintptr_t)m->raw + 7) & ~(uintptr_t)7);
@@ -5547,22 +5549,27 @@ static void DL_DrawMaskedQuads(void)
 
         if (texnum != curtex)                    // bind block + TLUT on switch
         {
-            surface_t ms = surface_make_linear(mb->block, FMT_CI4, mb->mw, mb->mh);
+            // CI4 cannot be LOAD_TILE'd directly: load through an I8 byte view
+            // at HALF the S width (TILE1), draw through the CI4 tile with the
+            // palette (TILE0) sized to the full texel extents -- the same
+            // two-step the wall CI4 path uses (libdragon texload_tile_4bpp).
+            int rowb = ((mb->mw < 16) ? 16 : mb->mw) / 2;
+            surface_t ms = surface_make_linear(mb->block, FMT_CI8, rowb, mb->mh);
             rdpq_tex_upload_tlut(mb->tlut, DL_MT_KEY * 16, 16);
             {
                 rdpq_tileparms_t tp;
+                int msk = 0, w2 = mb->mw;
                 memset(&tp, 0, sizeof(tp));
+                while (w2 > 1) { msk++; w2 >>= 1; }
+                tp.s.mask  = msk;                // S wraps by block period
+                tp.t.clamp = true;               // T never tiles (single post run)
                 tp.palette = DL_MT_KEY;          // CI4 palette slot 15 (pass-owned)
-                tp.s.mask  = 0; tp.t.mask = 0;   // wrap via block period; T never tiles
-                {
-                    int msk = 0, w2 = mb->mw;
-                    while (w2 > 1) { msk++; w2 >>= 1; }
-                    tp.s.mask = msk;
-                }
-                rdpq_set_tile(TILE0, FMT_CI4, 0, mb->mw / 2, &tp);
+                rdpq_set_tile(TILE1, FMT_I8, 0, rowb, NULL);   // load tile
+                rdpq_set_tile(TILE0, FMT_CI4, 0, rowb, &tp);   // draw tile
             }
             rdpq_set_texture_image(&ms);
-            rdpq_load_tile(TILE0, 0, 0, mb->mw, mb->mh);
+            rdpq_load_tile(TILE1, 0, 0, mb->mw / 2, mb->mh);
+            rdpq_set_tile_size(TILE0, 0, 0, mb->mw, mb->mh);
             curtex = texnum;
         }
 
